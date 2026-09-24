@@ -53,7 +53,41 @@ public class QueryBuilderObsStore extends QueryBuilder {
     }
 
     public String createDataIndexQuery() {
-        return "CREATE INDEX "+this.getStoreTableName()+"_data_idx on "+this.getStoreTableName()+" USING GIN("+RESULT+")";
+        return "CREATE INDEX IF NOT EXISTS "+this.getStoreTableName()+"_data_idx on "+this.getStoreTableName()+" USING GIN("+RESULT+")";
+    }
+
+    public String createResultPathOpsIndexQuery() {
+        return "CREATE INDEX IF NOT EXISTS "+this.getStoreTableName()+"_result_path_ops_idx on "+
+                this.getStoreTableName()+" USING GIN("+RESULT+" jsonb_path_ops)";
+    }
+
+    public String createOccupancyCountIndexQuery() {
+        return createNumericResultIndexQuery("occupancyCount", "occupancy_count");
+    }
+
+    public String createMaxGammaIndexQuery() {
+        return createNumericResultIndexQuery("maxGamma", "max_gamma");
+    }
+
+    public String createMaxNeutronIndexQuery() {
+        return createNumericResultIndexQuery("maxNeutron", "max_neutron");
+    }
+
+    public String[] createEventFilterIndexQueries() {
+        return new String[]{
+                createResultPathOpsIndexQuery(),
+                createOccupancyCountIndexQuery(),
+                createMaxGammaIndexQuery(),
+                createMaxNeutronIndexQuery()
+        };
+    }
+
+    private String createNumericResultIndexQuery(String propertyName, String indexName) {
+        String jsonValue = RESULT+"->>'"+propertyName+"'";
+        String jsonProperty = RESULT+"->'"+propertyName+"'";
+        return "CREATE INDEX IF NOT EXISTS "+this.getStoreTableName()+"_result_"+indexName+"_idx on "+
+                this.getStoreTableName()+" ("+DATASTREAM_ID+", (("+jsonValue+")::numeric)) "+
+                "WHERE jsonb_typeof("+jsonProperty+") = 'number'";
     }
 
     public String createDataStreamIndexQuery() {

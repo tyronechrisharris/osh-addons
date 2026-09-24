@@ -27,6 +27,8 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 
+import java.util.Arrays;
+
 public class TestParameterizedQueryBuilder {
     private static final String INJECTION = "camera') OR 1=1 --";
 
@@ -98,6 +100,22 @@ public class TestParameterizedQueryBuilder {
         assertSqlDoesNotContainInjection(query);
         assertTrue(query.sql().contains("result @> ?::jsonb"));
         assertTrue(query.parameters().get(0).toString().contains(INJECTION));
+    }
+
+    @Test
+    public void testObsEventFilterIndexesMatchGeneratedPredicates() {
+        QueryBuilderObsStore builder = new QueryBuilderObsStore("obs");
+        String indexes = String.join("\n", builder.createEventFilterIndexQueries());
+
+        assertTrue(indexes.contains("USING GIN(result jsonb_path_ops)"));
+        assertTrue(indexes.contains("(dataStreamID, ((result->>'occupancyCount')::numeric))"));
+        assertTrue(indexes.contains("(dataStreamID, ((result->>'maxGamma')::numeric))"));
+        assertTrue(indexes.contains("(dataStreamID, ((result->>'maxNeutron')::numeric))"));
+        assertTrue(indexes.contains("WHERE jsonb_typeof(result->'occupancyCount') = 'number'"));
+        assertTrue(indexes.contains("WHERE jsonb_typeof(result->'maxGamma') = 'number'"));
+        assertTrue(indexes.contains("WHERE jsonb_typeof(result->'maxNeutron') = 'number'"));
+        assertTrue(Arrays.stream(builder.createEventFilterIndexQueries())
+                .allMatch(query -> query.startsWith("CREATE INDEX IF NOT EXISTS")));
     }
 
     private void assertSqlDoesNotContainInjection(ParameterizedQuery query) {

@@ -84,8 +84,17 @@ public class PostgisObsStoreImpl extends PostgisStore<QueryBuilderObsStore> impl
     @Override
     protected void init(String url, String dbName, String login, String password, String[] initScripts) {
         super.init(url, dbName, login, password, initScripts);
+        ensureEventFilterIndexes();
         this.dataStreamStore = new PostgisDataStreamStoreImpl(this, url, dbName, login, password, idScope, idProviderType, false);
         queryBuilder.linkTo(dataStreamStore);
+    }
+
+    private void ensureEventFilterIndexes() {
+        try (Connection connection = this.connectionManager.getConnection()) {
+            PostgisUtils.executeQueries(connection, queryBuilder.createEventFilterIndexQueries());
+        } catch (SQLException e) {
+            throw new RuntimeException("Cannot create observation event filter indexes", e);
+        }
     }
 
     @Override
