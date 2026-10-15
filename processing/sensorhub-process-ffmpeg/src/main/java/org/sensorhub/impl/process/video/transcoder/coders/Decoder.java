@@ -35,9 +35,9 @@ public class Decoder extends Coder<AVPacket, AVFrame> {
 
     // Get compressed packet, send to decoder
     @Override
-    protected void sendInPacket() {
-        inPacket = inPackets.poll();
-        if (inPacket == null) {
+    protected void sendInPacket(AVPacket packet) {
+        inPacket = packet;
+        if (packet == null) {
             return;
         }
         try {

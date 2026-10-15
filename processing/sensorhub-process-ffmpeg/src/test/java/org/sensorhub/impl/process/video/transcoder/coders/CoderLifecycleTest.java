@@ -4,7 +4,7 @@ import org.bytedeco.ffmpeg.avcodec.AVPacket;
 import org.junit.Test;
 
 import java.util.HashMap;
-import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.BlockingQueue;
 
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertArrayEquals;
@@ -30,8 +30,8 @@ public class CoderLifecycleTest {
     public void crossThreadQueuesUseAtomicOwnershipTransfers() {
         StubCoder coder = new StubCoder();
 
-        assertTrue(coder.inPackets instanceof ConcurrentLinkedQueue);
-        assertTrue(coder.getOutQueue() instanceof ConcurrentLinkedQueue);
+        assertTrue(coder.inPackets instanceof BlockingQueue);
+        assertTrue(coder.getOutQueue() instanceof BlockingQueue);
     }
 
     @Test
@@ -73,7 +73,7 @@ public class CoderLifecycleTest {
         @Override protected void deallocateOutputPacket(AVPacket packet) {}
         @Override protected void deallocateOutQueue() { outPackets.clear(); }
         @Override protected void initContext() {}
-        @Override protected void sendInPacket() {}
+        @Override protected void sendInPacket(AVPacket packet) {}
         @Override protected void receiveOutPacket() {}
         @Override protected void flush() {
             if (delayedOutput != null) {

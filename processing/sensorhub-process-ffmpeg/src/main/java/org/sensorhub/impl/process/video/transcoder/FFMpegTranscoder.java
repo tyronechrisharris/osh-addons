@@ -39,9 +39,14 @@ import org.vast.swe.SWEHelper;
 import org.vast.swe.helper.RasterHelper;
 
 import javax.annotation.Nullable;
-import java.nio.ByteBuffer;
 import java.util.*;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Consumer;
 
 import static org.bytedeco.ffmpeg.global.avcodec.*;
 import static org.bytedeco.ffmpeg.global.avutil.*;
@@ -59,6 +64,8 @@ import static org.bytedeco.ffmpeg.global.swscale.*;
 public class FFMpegTranscoder extends ExecutableProcessImpl
 {
     private static final Logger logger = LoggerFactory.getLogger(FFMpegTranscoder.class);
+    private static final long PIPELINE_JOIN_TIMEOUT_MILLIS = 10_000L;
+    private static final long OUTPUT_WAIT_MILLIS = 100L;
 
 	public static final OSHProcessInfo INFO = new OSHProcessInfo("video:FFMpegTranscoder", "FFMPEG Video Transcoder", null, FFMpegTranscoder.class);
 
@@ -75,9 +82,16 @@ public class FFMpegTranscoder extends ExecutableProcessImpl
 
     List<Coder<?, ?>> videoProcs;
     AVByteFormatter<Pointer> inputFormatter, outputFormatter;
-    ArrayDeque<Pointer> inputPackets;
-    ArrayDeque<Pointer> outputPackets;
+    BlockingQueue<Pointer> inputPackets;
+    BlockingQueue<Pointer> outputPackets;
     Thread outputThread;
+    private Coder<?, ?> finalCoder;
+    private final Object pipelineStateLock = new Object();
+    private final AtomicReference<Throwable> pipelineFailure = new AtomicReference<>();
+    private boolean acceptingInput;
+    private boolean stopInProgress;
+    private boolean processStopRequested;
+    private AtomicBoolean outputRun = new AtomicBoolean(false);
 
     HashMap<String, Integer> decOptions = new HashMap<>();
     HashMap<String, Integer> encOptions = new HashMap<>();
@@ -160,77 +174,257 @@ public class FFMpegTranscoder extends ExecutableProcessImpl
      * Initializes all encoder/decoder/swscaler objects. These objects are added to the {@link FFMpegTranscoder#videoProcs}
      * queue in the order they should process the incoming data. At most, the flow will be Decoder -> SWScale -> Encoder.
      */
-    private void initCoders() {
-        try {
-            stopProcessThreads();
-        } catch (Exception e){
-            logger.error("Transcoder could not stop process threads during re-init.", e);
+    void initCoders() {
+        if (isRunning.get()) {
+            try {
+                stopProcessThreads();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException("Interrupted while reinitializing transcoder", e);
+            }
         }
-        if (videoProcs != null) {
-            videoProcs.clear();
-        }
-        videoProcs = new ArrayList<>();
+
+        List<Coder<?, ?>> coders = new ArrayList<>();
 
         if (!isUncompressed(inCodec)) {
-            videoProcs.add(new Decoder(inCodec.ffmpegId, decOptions));
+            coders.add(new Decoder(inCodec.ffmpegId, decOptions));
         }
-        if (width != outWidth || height != outHeight || (isUncompressed(inCodec) && isUncompressed(outCodec))) {
-            int inFmt = isUncompressed(inCodec) ? inCodec.ffmpegId : AV_PIX_FMT_YUV420P;
-            int outFmt = isUncompressed(outCodec) ? outCodec.ffmpegId : AV_PIX_FMT_YUV420P;
-            videoProcs.add(new SwScaler(inFmt, outFmt, width, height, outWidth, outHeight));
+        int inFmt = isUncompressed(inCodec) ? inCodec.ffmpegId : AV_PIX_FMT_YUV420P;
+        int outFmt = isUncompressed(outCodec) ? outCodec.ffmpegId : AV_PIX_FMT_YUV420P;
+        if (width != outWidth || height != outHeight || inFmt != outFmt
+                || (isUncompressed(inCodec) && isUncompressed(outCodec))) {
+            coders.add(new SwScaler(inFmt, outFmt, width, height, outWidth, outHeight));
         }
         if (!isUncompressed(outCodec)) {
-            videoProcs.add(new Encoder(outCodec.ffmpegId, encOptions));
+            coders.add(new Encoder(outCodec.ffmpegId, encOptions));
         }
 
-        inputPackets = new ArrayDeque<>();
-        if (videoProcs.get(0) != null) {
-            videoProcs.get(0).setInQueue(inputPackets);
+        wireCoders(coders);
+    }
+
+    /**
+     * Connects codec stages with blocking ownership-transfer queues. Kept separate from codec
+     * selection so the same wiring and lifecycle can be exercised without native codecs in tests.
+     */
+    void wireCoders(List<Coder<?, ?>> coders) {
+        if (coders == null || coders.isEmpty()) {
+            throw new IllegalStateException("Transcoder requires at least one codec or scaler stage");
         }
+        synchronized (pipelineStateLock) {
+            if (isRunning.get() || hasLivePipelineThreads()) {
+                throw new IllegalStateException(
+                        "Cannot replace a transcoder pipeline while its generation is active");
+            }
+        }
+
+        videoProcs = new ArrayList<>(coders);
+        inputPackets = new LinkedBlockingQueue<>();
+        videoProcs.get(0).setInQueue(inputPackets);
         for (int i = 1; i < videoProcs.size(); i++) {
             videoProcs.get(i).setInQueue(videoProcs.get(i - 1).getOutQueue());
         }
-        try {
-            outputPackets = (ArrayDeque<Pointer>) videoProcs.get(videoProcs.size() - 1).getOutQueue();
-        } catch (Exception e) {
-            logger.warn("No processes running on video input. Check codec/resolution settings.", e);
-            outputPackets = inputPackets;
+
+        finalCoder = videoProcs.get(videoProcs.size() - 1);
+        outputPackets = asPointerQueue(finalCoder.getOutQueue());
+        for (Coder<?, ?> coder : videoProcs) {
+            coder.setFailureHandler(this::recordPipelineFailure);
         }
+        pipelineFailure.set(null);
+        outputThread = null;
     }
 
     /**
      * Invoked during the first call to {@link FFMpegTranscoder#execute()} (when {@link FFMpegTranscoder#isRunning} is false).
      * Start all {@link Coder} thread objects stored in {@link FFMpegTranscoder#videoProcs}.
      */
-    private void startProcessThreads() {
-        doRun.set(true);
-        if (videoProcs == null || videoProcs.isEmpty() || videoProcs.get(0).getState() != Thread.State.NEW) {
-            initCoders();
-        }
+    void startProcessThreads() {
+        synchronized (pipelineStateLock) {
+            if (processStopRequested) {
+                throw new IllegalStateException(
+                        "Transcoder process is stopped; call start() before executing again");
+            }
+            if (isRunning.get()) {
+                if (acceptingInput && !stopInProgress) {
+                    return;
+                }
+                throw new IllegalStateException(
+                        "Previous transcoder pipeline has not terminated; restart is blocked");
+            }
+            if (hasLivePipelineThreads()) {
+                isRunning.set(true);
+                acceptingInput = false;
+                throw new IllegalStateException(
+                        "Previous transcoder threads are still alive; restart is blocked");
+            }
+            if (videoProcs == null || videoProcs.isEmpty()
+                    || videoProcs.get(0).getState() != Thread.State.NEW) {
+                initCoders();
+            }
 
-        for (Thread process : videoProcs) {
-            process.start();
+            doRun.set(true);
+            pipelineFailure.set(null);
+            outputRun = new AtomicBoolean(true);
+            BlockingQueue<Pointer> generationOutput = outputPackets;
+            Coder<?, ?> generationFinalCoder = finalCoder;
+            List<Coder<?, ?>> generationCoders = List.copyOf(videoProcs);
+            AtomicBoolean generationRun = outputRun;
+            outputThread = new Thread(
+                    () -> outputProcess(generationOutput, generationFinalCoder,
+                            generationCoders, generationRun),
+                    "ffmpeg-transcoder-output");
+            isRunning.set(true);
+            acceptingInput = true;
+            try {
+                outputThread.start();
+                for (Coder<?, ?> process : videoProcs) {
+                    process.start();
+                }
+            } catch (Throwable t) {
+                recordPipelineFailure(t);
+                if (t instanceof RuntimeException) {
+                    throw (RuntimeException)t;
+                }
+                if (t instanceof Error) {
+                    throw (Error)t;
+                }
+                throw new IllegalStateException("Could not start transcoder pipeline", t);
+            }
         }
-        outputThread.start();
-
-        isRunning.set(true);
     }
 
     /**
      * Invoked on process stop and init.
      * Stop all {@link Coder} thread objects stored in {@link FFMpegTranscoder#videoProcs}.
      */
-    private void stopProcessThreads() throws InterruptedException {
-        doRun.set(false); //TODO These atomic booleans may be entirely unnecessary, remove
-        if (videoProcs != null) {
-            for (Thread thread : videoProcs) {
-                thread.interrupt();
-                thread.join();
+    void stopProcessThreads() throws InterruptedException {
+        List<Coder<?, ?>> generationCoders;
+        Thread generationOutputThread;
+        BlockingQueue<Pointer> generationInput;
+        BlockingQueue<Pointer> generationOutput;
+        Coder<?, ?> generationFinalCoder;
+        AtomicBoolean generationRun;
+
+        synchronized (pipelineStateLock) {
+            while (stopInProgress) {
+                pipelineStateLock.wait();
+            }
+            if (!isRunning.get()) {
+                if (hasLivePipelineThreads()) {
+                    isRunning.set(true);
+                    throw new IllegalStateException(
+                            "Transcoder threads are still alive; restart remains blocked");
+                }
+                return;
+            }
+            // Close input before any worker observes end-of-input. execute() takes this same lock,
+            // so a frame is either queued before shutdown starts (and drained) or rejected.
+            acceptingInput = false;
+            stopInProgress = true;
+            generationCoders = List.copyOf(videoProcs);
+            generationOutputThread = outputThread;
+            generationInput = inputPackets;
+            generationOutput = outputPackets;
+            generationFinalCoder = finalCoder;
+            generationRun = outputRun;
+        }
+
+        Throwable failure = pipelineFailure.get();
+        boolean stopTimedOut = false;
+        boolean fullyTerminated = false;
+        long joinTimeoutMillis = pipelineJoinTimeoutMillis();
+        try {
+            if (failure == null) {
+                // Each stage must finish only after its upstream producer has stopped. This
+                // preserves delayed output and prevents downstream end-of-stream from racing an
+                // upstream flush.
+                for (Coder<?, ?> coder : generationCoders) {
+                    coder.finishInput();
+                    if (!joinWithin(coder, joinTimeoutMillis)) {
+                        stopTimedOut = true;
+                        failure = new IllegalStateException(
+                                coder.getClass().getSimpleName() + " did not finish within "
+                                        + joinTimeoutMillis + " ms");
+                        recordPipelineFailure(failure);
+                        break;
+                    }
+                    if (coder.getFailure() != null) {
+                        failure = coder.getFailure();
+                        recordPipelineFailure(failure);
+                        break;
+                    }
+                    if (!coder.isOutputComplete()) {
+                        failure = new IllegalStateException(
+                                coder.getClass().getSimpleName()
+                                        + " stopped before completing output");
+                        recordPipelineFailure(failure);
+                        break;
+                    }
+                }
+            }
+
+            if (failure == null && generationOutputThread != null
+                    && !joinWithin(generationOutputThread, joinTimeoutMillis)) {
+                stopTimedOut = true;
+                failure = new IllegalStateException(
+                        "Transcoder output did not drain within " + joinTimeoutMillis + " ms");
+                recordPipelineFailure(failure);
+            }
+
+            generationRun.set(false);
+            doRun.set(false);
+            if (failure != null) {
+                cancelWorkers(generationCoders);
+            }
+
+            joinWorkersAfterCancellation(generationCoders, joinTimeoutMillis);
+            if (generationOutputThread != null && generationOutputThread.isAlive()) {
+                generationOutputThread.interrupt();
+                generationOutputThread.join(joinTimeoutMillis);
+            }
+
+            fullyTerminated = allTerminated(generationCoders, generationOutputThread);
+            if (!fullyTerminated) {
+                IllegalStateException stuckFailure = new IllegalStateException(
+                        "Transcoder threads did not terminate; restart is blocked",
+                        failure);
+                recordPipelineFailure(stuckFailure);
+                throw stuckFailure;
+            }
+
+            drainUnconsumedQueues(generationInput, generationOutput, generationFinalCoder);
+            synchronized (pipelineStateLock) {
+                isRunning.set(false);
+            }
+
+            if (stopTimedOut) {
+                throw new IllegalStateException(
+                        "Transcoder shutdown timed out; all threads were eventually cancelled",
+                        failure);
+            }
+        } catch (InterruptedException e) {
+            generationRun.set(false);
+            doRun.set(false);
+            cancelWorkers(generationCoders);
+            if (generationOutputThread != null) {
+                generationOutputThread.interrupt();
+            }
+            throw e;
+        } finally {
+            synchronized (pipelineStateLock) {
+                if (!fullyTerminated) {
+                    // Keep the generation owned and non-restartable until a later stop verifies
+                    // that every old thread is dead.
+                    isRunning.set(true);
+                    acceptingInput = false;
+                }
+                stopInProgress = false;
+                pipelineStateLock.notifyAll();
             }
         }
-        outputThread.interrupt();
-        outputThread.join();
-        isRunning.set(false);
+    }
+
+    protected long pipelineJoinTimeoutMillis() {
+        return PIPELINE_JOIN_TIMEOUT_MILLIS;
     }
 
 
@@ -265,15 +459,52 @@ public class FFMpegTranscoder extends ExecutableProcessImpl
     }
 
     @Override
-    public void stop() {
+    public synchronized void stop() {
+        // Prevent an execution already in flight from recreating the native pipeline after the
+        // base executor is cancelled. The flag remains set until an explicit process start.
+        synchronized (pipelineStateLock) {
+            processStopRequested = true;
+            acceptingInput = false;
+        }
+        // Quiesce the base execution loop before stopping its asynchronously owned codec stages.
+        // This must happen even when native pipeline teardown later times out or fails.
+        super.stop();
+
         if (isRunning.get()) {
             try {
                 stopProcessThreads();
             } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
                 logger.warn("Interrupted while stopping process threads");
+                abortPipeline();
+                throw new IllegalStateException("Interrupted while stopping transcoder pipeline", e);
             }
         }
-        super.stop();
+    }
+
+    @Override
+    public synchronized void start(ExecutorService threadPool, Consumer<Throwable> onError)
+            throws ProcessException {
+        boolean restoreStoppedBoundary;
+        synchronized (pipelineStateLock) {
+            restoreStoppedBoundary = processStopRequested;
+            processStopRequested = false;
+        }
+        try {
+            super.start(threadPool, onError);
+        } catch (ProcessException | RuntimeException | Error e) {
+            // Executor submission can fail after the base class marks itself started. Restore both
+            // halves of the stopped boundary so a failed explicit start cannot authorize a stale
+            // execution left behind by the previous generation.
+            super.stop();
+            synchronized (pipelineStateLock) {
+                processStopRequested = restoreStoppedBoundary;
+                if (restoreStoppedBoundary) {
+                    acceptingInput = false;
+                }
+            }
+            throw e;
+        }
     }
 
     /**
@@ -321,8 +552,25 @@ public class FFMpegTranscoder extends ExecutableProcessImpl
     @Override
     public void init() throws ProcessException
     {
-        doRun.set(true);
-        isRunning.set(false);
+        if (isRunning.get()) {
+            try {
+                stopProcessThreads();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new ProcessException("Interrupted while reinitializing transcoder", e);
+            } catch (IllegalStateException e) {
+                throw new ProcessException("Could not stop active transcoder during re-init", e);
+            }
+        }
+        synchronized (pipelineStateLock) {
+            if (hasLivePipelineThreads()) {
+                isRunning.set(true);
+                acceptingInput = false;
+                throw new ProcessException(
+                        "Previous transcoder threads are still alive; re-init is blocked");
+            }
+            doRun.set(true);
+        }
 
         // init decoder according to configured codec
         // TODO: Automatically detect input codec from compression in data struct?
@@ -337,7 +585,6 @@ public class FFMpegTranscoder extends ExecutableProcessImpl
 
             // processThreads are always running, passing available data from decoder to encoder and encoder to output
             initCoders();
-            outputThread = new Thread(this::outputProcess);
 
             inputFormatter = getFormatter(inCodec, width, height);
             outputFormatter = getFormatter(outCodec, outWidth, outHeight);
@@ -508,11 +755,29 @@ public class FFMpegTranscoder extends ExecutableProcessImpl
             startProcessThreads();
         }
 
-        inputPackets.add(
-                inputFormatter.convertInput(
-                        ((DataBlockCompressed)imgIn.getData()).getUnderlyingObject().clone()
-                ));
+        throwIfPipelineFailed();
+        Pointer packet = inputFormatter.convertInput(
+                ((DataBlockCompressed)imgIn.getData()).getUnderlyingObject().clone());
+        boolean enqueued = false;
+        try {
+            enqueueInputPacket(packet);
+            enqueued = true;
+        } finally {
+            if (!enqueued) {
+                releaseInputPacket(packet);
+            }
+        }
 
+    }
+
+    void enqueueInputPacket(Pointer packet) throws ProcessException {
+        synchronized (pipelineStateLock) {
+            throwIfPipelineFailed();
+            if (!isRunning.get() || !acceptingInput) {
+                throw new ProcessException("Transcoder pipeline is not accepting input");
+            }
+            inputPackets.add(packet);
+        }
     }
 
     /**
@@ -520,25 +785,184 @@ public class FFMpegTranscoder extends ExecutableProcessImpl
      * in the {@link FFMpegTranscoder#videoProcs} queue, converts the struct to bytes, and publishes the data.
      * @see FFMpegTranscoder#publishFrameData(byte[])
      */
-    private void outputProcess() {
-        while (doRun.get() && !Thread.currentThread().isInterrupted()) {
-            while (outputPackets == null || outputPackets.isEmpty()) {
-                if (Thread.currentThread().isInterrupted()) {
+    private void outputProcess(BlockingQueue<Pointer> generationOutput,
+            Coder<?, ?> generationFinalCoder, List<Coder<?, ?>> generationCoders,
+            AtomicBoolean generationRun) {
+        try {
+            while (generationRun.get() && !Thread.currentThread().isInterrupted()) {
+                Throwable workerFailure = findWorkerFailure(generationCoders);
+                if (workerFailure != null) {
+                    recordPipelineFailure(workerFailure);
                     return;
                 }
-                Thread.onSpinWait();
-            }
-            if (outputPackets != null && !outputPackets.isEmpty()) {
-                for (var packet : outputPackets) {
-                    if (Thread.currentThread().isInterrupted()) {
-                        return;
+
+                Pointer packet = generationOutput.poll(OUTPUT_WAIT_MILLIS, TimeUnit.MILLISECONDS);
+                if (packet != null) {
+                    try {
+                        publishOutputPacket(packet);
+                    } finally {
+                        releaseFinalOutput(generationFinalCoder, packet);
                     }
-                    publishFrameData(outputFormatter.convertOutput(outputPackets.poll()));
-                    //frameData = null;
-                    //packet = null;
+                    continue;
+                }
+
+                if (generationFinalCoder != null && generationFinalCoder.isOutputComplete()
+                        && generationOutput.isEmpty()) {
+                    return;
+                }
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            if (generationRun.get()) {
+                recordPipelineFailure(e);
+            }
+        } catch (Throwable t) {
+            recordPipelineFailure(t);
+        }
+    }
+
+    /** Converts and publishes one final-stage packet. Tests override this at the native boundary. */
+    protected void publishOutputPacket(Pointer packet) {
+        publishFrameData(outputFormatter.convertOutput(packet));
+    }
+
+    void throwIfPipelineFailed() throws ProcessException {
+        Throwable failure = pipelineFailure.get();
+        if (failure != null) {
+            throw new ProcessException("FFmpeg transcoder pipeline failed", failure);
+        }
+    }
+
+    private void recordPipelineFailure(Throwable failure) {
+        if (failure == null) {
+            return;
+        }
+
+        boolean firstFailure;
+        synchronized (pipelineStateLock) {
+            firstFailure = pipelineFailure.compareAndSet(null, failure);
+            doRun.set(false);
+            outputRun.set(false);
+            acceptingInput = false;
+        }
+        if (!firstFailure) {
+            return;
+        }
+
+        cancelWorkers();
+        Thread publisher = outputThread;
+        if (publisher != null && publisher != Thread.currentThread()) {
+            publisher.interrupt();
+        }
+        logger.error("FFmpeg transcoder pipeline failed", failure);
+    }
+
+    private Throwable findWorkerFailure(List<Coder<?, ?>> coders) {
+        if (coders != null) {
+            for (Coder<?, ?> coder : coders) {
+                if (coder.getFailure() != null) {
+                    return coder.getFailure();
                 }
             }
         }
+        return pipelineFailure.get();
+    }
+
+    private void cancelWorkers() {
+        cancelWorkers(videoProcs);
+    }
+
+    private void cancelWorkers(List<Coder<?, ?>> coders) {
+        if (coders != null) {
+            for (Coder<?, ?> coder : coders) {
+                coder.cancel();
+            }
+        }
+    }
+
+    private void abortPipeline() {
+        synchronized (pipelineStateLock) {
+            acceptingInput = false;
+            doRun.set(false);
+            outputRun.set(false);
+        }
+        cancelWorkers();
+        if (outputThread != null) {
+            outputThread.interrupt();
+        }
+    }
+
+    private void joinWorkersAfterCancellation(List<Coder<?, ?>> coders, long timeoutMillis)
+            throws InterruptedException {
+        if (coders == null) {
+            return;
+        }
+        for (Coder<?, ?> coder : coders) {
+            if (coder.isAlive() && !joinWithin(coder, timeoutMillis)) {
+                logger.error("{} did not stop after cancellation", coder.getClass().getSimpleName());
+            }
+        }
+    }
+
+    private boolean joinWithin(Thread thread, long timeoutMillis) throws InterruptedException {
+        thread.join(timeoutMillis);
+        return !thread.isAlive();
+    }
+
+    private boolean allTerminated(List<Coder<?, ?>> coders, Thread publisher) {
+        if (publisher != null && publisher.isAlive()) {
+            return false;
+        }
+        for (Coder<?, ?> coder : coders) {
+            if (coder.isAlive()) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private boolean hasLivePipelineThreads() {
+        return !allTerminated(videoProcs != null ? videoProcs : Collections.emptyList(),
+                outputThread);
+    }
+
+    private void drainUnconsumedQueues(BlockingQueue<Pointer> generationInput,
+            BlockingQueue<Pointer> generationOutput, Coder<?, ?> generationFinalCoder) {
+        Pointer packet;
+        if (generationInput != null) {
+            while ((packet = generationInput.poll()) != null) {
+                releaseInputPacket(packet);
+            }
+        }
+        if (generationOutput != null) {
+            while ((packet = generationOutput.poll()) != null) {
+                releaseFinalOutput(generationFinalCoder, packet);
+            }
+        }
+    }
+
+    private void releaseInputPacket(Pointer packet) {
+        if (packet == null) {
+            return;
+        }
+        if (isUncompressed(inCodec)) {
+            av_frame_free((AVFrame)packet);
+        } else {
+            av_packet_free((AVPacket)packet);
+        }
+    }
+
+    private void releaseFinalOutput(Coder<?, ?> generationFinalCoder, Pointer packet) {
+        if (packet != null && generationFinalCoder != null) {
+            generationFinalCoder.releaseOutput(packet);
+        }
+    }
+
+    @SuppressWarnings({"rawtypes", "unchecked"})
+    private static BlockingQueue<Pointer> asPointerQueue(BlockingQueue<?> queue) {
+        // Every concrete coder is constrained to AVPacket/AVFrame at construction. This adapter
+        // erases only the stage-specific subtype while preserving the single shared queue object.
+        return (BlockingQueue)queue;
     }
 
     @Override
@@ -549,29 +973,36 @@ public class FFMpegTranscoder extends ExecutableProcessImpl
     }
 
     @Override
-    public void dispose()
+    public synchronized void dispose()
     {
-        super.dispose();
+        Throwable failure = null;
+        try {
+            // stop() first gates stale executions, cancels the base Future, and then tears down
+            // the native generation. Do not duplicate a weaker lifecycle path here.
+            stop();
+        } catch (Throwable t) {
+            failure = t;
+        }
 
-        doRun.set(false);
-
-        if (videoProcs != null) {
-            for (Thread t : videoProcs) {
-                t.interrupt();
-                try {
-                    t.join();
-                } catch (InterruptedException e) {
-                    logger.error("Error waiting for process thread {} to finish", t.getName());
-                }
+        try {
+            // The base disposed state must be recorded even when native teardown timed out.
+            super.dispose();
+        } catch (Throwable t) {
+            if (failure == null) {
+                failure = t;
+            } else {
+                failure.addSuppressed(t);
             }
         }
-        if (outputThread != null) {
-            outputThread.interrupt();
-            try {
-                outputThread.join();
-            } catch (InterruptedException e) {
-                logger.error("Error waiting for process thread {} to finish", outputThread.getName());
-            }
+
+        if (failure instanceof RuntimeException) {
+            throw (RuntimeException)failure;
+        }
+        if (failure instanceof Error) {
+            throw (Error)failure;
+        }
+        if (failure != null) {
+            throw new IllegalStateException("Could not dispose transcoder pipeline", failure);
         }
     }
 }

@@ -4,28 +4,32 @@ import static org.bytedeco.ffmpeg.global.avutil.*;
 
 import java.util.HashMap;
 import java.util.Objects;
-import java.util.Queue;
-import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.locks.LockSupport;
+import java.util.function.Consumer;
 
 import static org.bytedeco.ffmpeg.global.avcodec.*;
 
 import org.bytedeco.ffmpeg.avcodec.AVCodecContext;
 import org.bytedeco.ffmpeg.avcodec.AVPacket;
 import org.bytedeco.ffmpeg.avutil.AVFrame;
+import org.bytedeco.javacpp.Pointer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-public abstract class Coder<I, O> extends Thread {
+public abstract class Coder<I extends Pointer, O extends Pointer> extends Thread {
 
     protected static final Logger logger = LoggerFactory.getLogger(Coder.class);
 
     int codecId;
     private static final int MAX_QUEUE_SIZE = 500;
     protected AVCodecContext codec_ctx;
-    protected Queue<I> inPackets; // ONLY allow the main loop to poll
-    protected final Queue<O> outPackets; // ONLY allow the main loop to add
+    private static final long INPUT_WAIT_MILLIS = 100L;
+
+    protected BlockingQueue<I> inPackets; // ONLY allow the main loop to poll
+    protected final BlockingQueue<O> outPackets; // ONLY allow the main loop to add
     protected I inPacket;
     protected O outPacket;
     //volatile boolean isProcessing = false; // Set to true at the start of the loop, false at the end
@@ -38,22 +42,27 @@ public abstract class Coder<I, O> extends Thread {
     private volatile Throwable failure;
     private final AtomicBoolean endOfInput = new AtomicBoolean(false);
     private volatile boolean outputComplete;
+    private volatile Consumer<Throwable> failureHandler = ignored -> { };
 
     public AtomicBoolean doRun = new AtomicBoolean(true);
 
     public Coder(int codecId, Class<I> inputClass, Class<O> outputClass, HashMap<String, Integer> options) {
         super();
 
-        assert inputClass == AVPacket.class || inputClass == AVFrame.class;
-        assert outputClass == AVPacket.class || outputClass == AVFrame.class;
-        assert options != null;
+        if (inputClass != AVPacket.class && inputClass != AVFrame.class) {
+            throw new IllegalArgumentException("Coder input must be AVPacket or AVFrame");
+        }
+        if (outputClass != AVPacket.class && outputClass != AVFrame.class) {
+            throw new IllegalArgumentException("Coder output must be AVPacket or AVFrame");
+        }
+        Objects.requireNonNull(options, "options");
 
         this.codecId = codecId;
-        // These queues cross thread boundaries. ArrayDeque is not safe for a codec worker and its
-        // producer/consumer to mutate concurrently, and corruption here also loses native packet
-        // ownership. ConcurrentLinkedQueue makes every poll an atomic ownership transfer.
-        this.inPackets = new ConcurrentLinkedQueue<>();
-        this.outPackets = new ConcurrentLinkedQueue<>();
+        // These queues cross thread boundaries. Polling is the native-object ownership transfer;
+        // a blocking queue makes that transfer atomic and lets an idle codec sleep instead of
+        // consuming an entire CPU core while it waits for the next frame.
+        this.inPackets = new LinkedBlockingQueue<>();
+        this.outPackets = new LinkedBlockingQueue<>();
         this.inputClass = inputClass;
         this.outputClass = outputClass;
         this.options = options;
@@ -63,7 +72,7 @@ public abstract class Coder<I, O> extends Thread {
      * Gets reference to output queue. Typically used as the input queue for another {@link Coder}.
      * @return Output queue containing either {@link AVPacket}s or {@link AVFrame}s.
      */
-    public Queue<O> getOutQueue() {
+    public BlockingQueue<O> getOutQueue() {
         return outPackets;
     }
 
@@ -78,7 +87,6 @@ public abstract class Coder<I, O> extends Thread {
      */
     public void finishInput() {
         endOfInput.set(true);
-        LockSupport.unpark(this);
     }
 
     /** Returns true after end-of-input has been flushed through the codec. */
@@ -86,13 +94,31 @@ public abstract class Coder<I, O> extends Thread {
         return outputComplete;
     }
 
+    /** Requests an immediate shutdown. Queued native objects are released by worker cleanup. */
+    public void cancel() {
+        doRun.set(false);
+        interrupt();
+    }
+
+    /** Installs the owner callback used to surface asynchronous worker failures. */
+    public void setFailureHandler(Consumer<Throwable> failureHandler) {
+        this.failureHandler = Objects.requireNonNull(failureHandler, "failureHandler");
+    }
+
+    /** Releases one output after the downstream consumer has taken ownership of it. */
+    public final void releaseOutput(Pointer packet) {
+        if (packet != null) {
+            deallocateOutputPacket(outputClass.cast(packet));
+        }
+    }
+
     /**
      * Sets input queue.
      * @param inPackets Typically the output queue of another {@link Coder}, containing either
      *                  {@link AVPacket}s or {@link AVFrame}s.
      */
-    public void setInQueue(Queue <?> inPackets) {
-        this.inPackets = (Queue<I>) Objects.requireNonNull(inPackets, "inPackets");
+    public void setInQueue(BlockingQueue<?> inPackets) {
+        this.inPackets = (BlockingQueue<I>) Objects.requireNonNull(inPackets, "inPackets");
     }
 
     // Safety net queue purging.
@@ -121,7 +147,7 @@ public abstract class Coder<I, O> extends Thread {
     protected abstract void initContext();
 
     // Take data from input queue and send to encoder/decoder
-    protected abstract void sendInPacket();
+    protected abstract void sendInPacket(I packet);
 
     // Take data from encoder/decoder and send to output queue
     protected abstract void receiveOutPacket();
@@ -184,60 +210,73 @@ public abstract class Coder<I, O> extends Thread {
 
     @Override
     public void run() {
-        boolean packetsAllocated = false;
         try {
             initContext();
-            // Subclasses clean null members safely, so mark cleanup required before allocation in
-            // case a later native allocation fails after an earlier one succeeded.
-            packetsAllocated = true;
             allocatePackets();
 
             // doRun is intentionally not reset here. A caller is allowed to request shutdown
             // immediately after start(); reviving the flag after that request leaves join()
             // blocked forever on an empty queue.
             while (doRun.get() && !Thread.currentThread().isInterrupted()) {
-                if (inPackets == null || inPackets.isEmpty()) {
-                    if (endOfInput.get()) {
+                I packet = inPackets.poll(INPUT_WAIT_MILLIS, TimeUnit.MILLISECONDS);
+                if (packet == null) {
+                    if (endOfInput.get() && inPackets.isEmpty()) {
                         flush();
                         outputComplete = true;
                         break;
                     }
-                    // Codec workers are long-lived. A pure spin here pins one CPU core per idle
-                    // worker; a short park keeps sub-millisecond response while interrupt makes
-                    // shutdown immediate.
-                    LockSupport.parkNanos(500_000L);
                     continue;
                 }
 
                 queuePurge();
-                sendInPacket();
+                sendInPacket(packet);
                 receiveOutPacket();
             }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            if (doRun.get()) {
+                recordFailure(e);
+            }
         } catch (Throwable t) {
-            failure = t;
-            doRun.set(false);
-            logger.error("{} worker failed", getClass().getSimpleName(), t);
+            recordFailure(t);
         } finally {
             synchronized (waitingObj) {
                 waitingObj.notifyAll();
             }
 
-            if (packetsAllocated) {
-                try {
-                    deallocatePackets();
-                } catch (Throwable t) {
-                    if (failure == null) {
-                        failure = t;
-                    } else {
-                        failure.addSuppressed(t);
+            // Concrete cleanup methods are null-safe and also drain the input queue. Run cleanup
+            // even when codec initialization failed, otherwise input accepted just before a
+            // native init error would be orphaned.
+            try {
+                deallocatePackets();
+            } catch (Throwable t) {
+                if (failure == null) {
+                    failure = t;
+                    try {
+                        failureHandler.accept(t);
+                    } catch (Throwable callbackFailure) {
+                        t.addSuppressed(callbackFailure);
                     }
-                    logger.error("{} packet cleanup failed", getClass().getSimpleName(), t);
+                } else {
+                    failure.addSuppressed(t);
                 }
+                logger.error("{} packet cleanup failed", getClass().getSimpleName(), t);
             }
             if (codec_ctx != null) {
                 avcodec_free_context(codec_ctx);
             }
             codec_ctx = null;
         }
+    }
+
+    private void recordFailure(Throwable t) {
+        failure = t;
+        doRun.set(false);
+        try {
+            failureHandler.accept(t);
+        } catch (Throwable callbackFailure) {
+            t.addSuppressed(callbackFailure);
+        }
+        logger.error("{} worker failed", getClass().getSimpleName(), t);
     }
 }

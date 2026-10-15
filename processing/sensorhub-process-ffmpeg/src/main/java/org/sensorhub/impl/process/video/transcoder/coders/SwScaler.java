@@ -1,12 +1,8 @@
 package org.sensorhub.impl.process.video.transcoder.coders;
 
-import org.bytedeco.ffmpeg.avcodec.AVCodec;
-import org.bytedeco.ffmpeg.avcodec.AVPacket;
 import org.bytedeco.ffmpeg.avutil.AVFrame;
 import org.bytedeco.ffmpeg.swscale.SwsContext;
-import org.bytedeco.javacpp.BytePointer;
 import org.bytedeco.javacpp.DoublePointer;
-import org.bytedeco.javacpp.PointerPointer;
 
 import java.util.HashMap;
 
@@ -31,7 +27,10 @@ public class SwScaler extends Coder<AVFrame, AVFrame> {
 
     @Override
     protected void deallocateOutQueue() {
-       outPackets.clear();
+        AVFrame frame;
+        while ((frame = outPackets.poll()) != null) {
+            av_frame_free(frame);
+        }
     }
 
     @Override
@@ -40,20 +39,26 @@ public class SwScaler extends Coder<AVFrame, AVFrame> {
         swsContext = sws_getContext(inWidth, inHeight, inPixFmt,
                 outWidth, outHeight, outPixFmt,
                 SWS_BICUBIC, null, null, (DoublePointer) null);
-
+        if (swsContext == null || swsContext.isNull()) {
+            throw new IllegalStateException("Could not initialize scaler context");
+        }
     }
 
     @Override
-    protected void sendInPacket() {
-        synchronized (inPackets) {
-            inPacket = inPackets.poll();
-            if (inPacket == null || outPacket == null)
-                return;
-            //pts++;
-            //inPacket.pts(pts);
-            sws_scale_frame(swsContext, outPacket, inPacket);
-            //avcodec_send_frame(codec_ctx, av_frame_clone(inPacket));
-            //av_frame_free(inPacket);
+    protected void sendInPacket(AVFrame frame) {
+        inPacket = frame;
+        if (frame == null || outPacket == null) {
+            return;
+        }
+        try {
+            int ret = sws_scale_frame(swsContext, outPacket, frame);
+            if (ret < 0) {
+                throw new IllegalStateException("Scaler rejected input frame (FFmpeg error " + ret + ")");
+            }
+        } finally {
+            // Polling transfers sole ownership of the input frame to this worker.
+            av_frame_free(inPacket);
+            inPacket = null;
         }
     }
 
@@ -61,8 +66,15 @@ public class SwScaler extends Coder<AVFrame, AVFrame> {
     protected void receiveOutPacket() {
         // We already have outPacket at this point (one method needed for scaling rather than two)
         // Just use this to add the output to the out queue and make the buffers writable
-        outPackets.add(av_frame_clone(outPacket));
-        av_frame_make_writable(outPacket);
+        AVFrame scaledFrame = av_frame_clone(outPacket);
+        if (scaledFrame == null || scaledFrame.isNull()) {
+            throw new IllegalStateException("Could not clone scaled frame");
+        }
+        outPackets.add(scaledFrame);
+        int ret = av_frame_make_writable(outPacket);
+        if (ret < 0) {
+            throw new IllegalStateException("Could not make scaler output writable (FFmpeg error " + ret + ")");
+        }
     }
 
     @Override
@@ -79,38 +91,39 @@ public class SwScaler extends Coder<AVFrame, AVFrame> {
 
     @Override
     protected void allocatePackets() {
-        inPacket = av_frame_alloc();
-
         outPacket = av_frame_alloc();
+        if (outPacket == null || outPacket.isNull()) {
+            throw new IllegalStateException("Could not allocate scaler output frame");
+        }
         outPacket.format(outPixFmt);
         outPacket.width(outWidth);
         outPacket.height(outHeight);
-        av_image_alloc(outPacket.data(), outPacket.linesize(),
-                outWidth, outHeight, outPixFmt, 1);
+        int ret = av_frame_get_buffer(outPacket, 32);
+        if (ret < 0) {
+            throw new IllegalStateException("Could not allocate scaler output buffer (FFmpeg error " + ret + ")");
+        }
     }
 
     @Override
     protected void deallocatePackets() {
         if (swsContext != null) {
             sws_freeContext(swsContext);
+            swsContext = null;
         }
         if (inPacket != null) {
             av_frame_free(inPacket);
+            inPacket = null;
         }
         if (outPacket != null) {
             av_frame_free(outPacket);
+            outPacket = null;
         }
-        if (outPackets != null) {
-            for (AVFrame frame : outPackets) {
-                av_frame_free(frame);
-            }
-            outPackets.clear();
+        if (!isOutputComplete()) {
+            deallocateOutQueue();
         }
-        if (inPackets != null) {
-            for (AVFrame frame : inPackets) {
-                av_frame_free(frame);
-            }
-            inPackets.clear();
+        AVFrame frame;
+        while (inPackets != null && (frame = inPackets.poll()) != null) {
+            av_frame_free(frame);
         }
     }
 }

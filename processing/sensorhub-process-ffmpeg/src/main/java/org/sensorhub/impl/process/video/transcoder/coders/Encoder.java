@@ -50,9 +50,9 @@ public class Encoder extends Coder<AVFrame, AVPacket> {
     }
 
     @Override
-    protected void sendInPacket() {
-        inPacket = inPackets.poll();
-        if (inPacket == null) {
+    protected void sendInPacket(AVFrame frame) {
+        inPacket = frame;
+        if (frame == null) {
             return;
         }
         try {
