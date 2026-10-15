@@ -18,7 +18,13 @@ public class Decoder extends Coder<AVPacket, AVFrame> {
     @Override
     protected void initContext() {
         AVCodec codec = avcodec_find_decoder(codecId);
+        if (codec == null || codec.isNull()) {
+            throw new IllegalStateException("Could not find decoder for codec " + codecId);
+        }
         codec_ctx = avcodec_alloc_context3(codec);
+        if (codec_ctx == null || codec_ctx.isNull()) {
+            throw new IllegalStateException("Could not allocate decoder context for " + codec.name().getString());
+        }
 
         initOptions(codec_ctx);
 
@@ -30,29 +36,50 @@ public class Decoder extends Coder<AVPacket, AVFrame> {
     // Get compressed packet, send to decoder
     @Override
     protected void sendInPacket() {
-        synchronized (inPackets) {
-            inPacket = inPackets.poll();
-            if (inPacket == null)
-                return;
-            //logger.debug("decode send:");
-            //logger.debug("  data[0]: {}", inPacket.data());
-            //logger.debug("Sent frame to encoder");
-            avcodec_send_packet(codec_ctx, inPacket);
-//        av_packet_free(inPacket);
+        inPacket = inPackets.poll();
+        if (inPacket == null) {
+            return;
+        }
+        try {
+            int ret = avcodec_send_packet(codec_ctx, inPacket);
+            if (ret < 0) {
+                throw new IllegalStateException("Decoder rejected input packet (FFmpeg error " + ret + ")");
+            }
+        } finally {
+            // Polling transfers the queue's sole native ownership to this worker. libavcodec does
+            // not retain the packet after avcodec_send_packet returns.
+            av_packet_free(inPacket);
+            inPacket = null;
         }
     }
 
     // Receive uncompressed frame from decoder
     @Override
     protected void receiveOutPacket() {
-        synchronized (outPackets) {
-            while (avcodec_receive_frame(codec_ctx, outPacket) >= 0) {
-                //av_packet_free(inPacket);
-                outPackets.add(av_frame_clone(outPacket));
-                //av_frame_free(outPacket);
-                //logger.debug("Decode Packet added");
+        int ret;
+        while ((ret = avcodec_receive_frame(codec_ctx, outPacket)) >= 0) {
+            AVFrame decodedFrame = av_frame_clone(outPacket);
+            av_frame_unref(outPacket);
+            if (decodedFrame == null || decodedFrame.isNull()) {
+                throw new IllegalStateException("Could not clone decoded frame");
             }
+            outPackets.add(decodedFrame);
         }
+        if (ret != AVERROR_EAGAIN() && ret != AVERROR_EOF) {
+            throw new IllegalStateException("Decoder could not receive a frame (FFmpeg error " + ret + ")");
+        }
+    }
+
+    @Override
+    protected void flush() {
+        int ret;
+        while ((ret = avcodec_send_packet(codec_ctx, (AVPacket) null)) == AVERROR_EAGAIN()) {
+            receiveOutPacket();
+        }
+        if (ret < 0 && ret != AVERROR_EOF) {
+            throw new IllegalStateException("Decoder could not start flushing (FFmpeg error " + ret + ")");
+        }
+        receiveOutPacket();
     }
 
     @Override
@@ -69,38 +96,38 @@ public class Decoder extends Coder<AVPacket, AVFrame> {
 
     @Override
     protected void deallocateOutQueue() {
-        outPackets.clear();
+        AVFrame frame;
+        while ((frame = outPackets.poll()) != null) {
+            av_frame_free(frame);
+        }
     }
 
     @Override
     protected void allocatePackets() {
-        inPacket = new AVPacket();
-        inPacket = av_packet_alloc();
-        av_init_packet(inPacket);
-        outPacket = new AVFrame();
         outPacket = av_frame_alloc();
+        if (outPacket == null || outPacket.isNull()) {
+            throw new IllegalStateException("Could not allocate decoder output frame");
+        }
     }
 
     @Override
     protected void deallocatePackets() {
         if (inPacket != null) {
             av_packet_free(inPacket);
+            inPacket = null;
         }
         if (outPacket != null) {
             av_frame_free(outPacket);
+            outPacket = null;
         }
-        if (outPackets != null) {
-            for (AVFrame frame : outPackets) {
-                av_frame_free(frame);
-            }
-            outPackets.clear();
+        // Preserve successfully flushed frames for the downstream consumer. On interruption or
+        // failure there is no complete output to deliver, so retain the historical cleanup path.
+        if (!isOutputComplete()) {
+            deallocateOutQueue();
         }
-        if (inPackets != null) {
-            for (AVPacket packet : inPackets) {
-                av_packet_free(packet);
-
-            }
-            inPackets.clear();
+        AVPacket packet;
+        while (inPackets != null && (packet = inPackets.poll()) != null) {
+            av_packet_free(packet);
         }
     }
 }

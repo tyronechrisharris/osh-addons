@@ -20,55 +20,87 @@ public class Encoder extends Coder<AVFrame, AVPacket> {
 
     @Override
     protected void deallocateOutQueue() {
-       outPackets.clear();
+        AVPacket packet;
+        while ((packet = outPackets.poll()) != null) {
+            av_packet_free(packet);
+        }
     }
 
     @Override
     protected void initContext() {
         pts = 0;
         AVCodec codec = avcodec_find_encoder(codecId);
+        if (codec == null || codec.isNull()) {
+            throw new IllegalStateException("Could not find encoder for codec " + codecId);
+        }
         codec_ctx = avcodec_alloc_context3(codec);
+        if (codec_ctx == null || codec_ctx.isNull()) {
+            throw new IllegalStateException("Could not allocate encoder context for " + codec.name().getString());
+        }
 
         initOptions(codec_ctx);
         int ret = avcodec_open2(codec_ctx, codec, (PointerPointer<?>)null);
         if (ret < 0) {
-            BytePointer errorBuffer = new BytePointer(AV_ERROR_MAX_STRING_SIZE);
-
-            av_strerror(ret, errorBuffer, AV_ERROR_MAX_STRING_SIZE);
-            logger.debug("Receive Error: {}", errorBuffer.getString());
+            try (BytePointer errorBuffer = new BytePointer(AV_ERROR_MAX_STRING_SIZE)) {
+                av_strerror(ret, errorBuffer, AV_ERROR_MAX_STRING_SIZE);
+                logger.debug("Receive Error: {}", errorBuffer.getString());
+            }
             throw new IllegalStateException("Error initializing " + codec.name().getString() + " encoder");
         }
     }
 
     @Override
     protected void sendInPacket() {
-        synchronized (inPackets) {
-            inPacket = inPackets.poll();
-            if (inPacket == null)
-                return;
-            //pts++;
-            //inPacket.pts(pts);
-
-            avcodec_send_frame(codec_ctx, av_frame_clone(inPacket));
-            //av_frame_free(inPacket);
+        inPacket = inPackets.poll();
+        if (inPacket == null) {
+            return;
+        }
+        try {
+            // Decoder timestamps are expressed in the source stream time base. This encoder emits
+            // constant-frame-rate H.264, so assign timestamps in codec_ctx.time_base explicitly
+            // rather than interpreting source ticks as encoder ticks.
+            inPacket.pts(pts++);
+            int ret = avcodec_send_frame(codec_ctx, inPacket);
+            if (ret < 0) {
+                throw new IllegalStateException("Encoder rejected input frame (FFmpeg error " + ret + ")");
+            }
+        } finally {
+            // Polling transfers the queue's sole native ownership to this worker. libavcodec does
+            // not retain the frame after avcodec_send_frame returns.
+            av_frame_free(inPacket);
+            inPacket = null;
         }
     }
 
     @Override
     protected void receiveOutPacket() {
-        /*
-        synchronized (outPackets) {
-
+        int ret;
+        while ((ret = avcodec_receive_packet(codec_ctx, outPacket)) >= 0) {
+            AVPacket encodedPacket = av_packet_clone(outPacket);
+            av_packet_unref(outPacket);
+            if (encodedPacket == null || encodedPacket.isNull()) {
+                throw new IllegalStateException("Could not clone encoded packet");
+            }
+            // AVPacket.time_base is not guaranteed to be populated by every encoder. Downstream
+            // remuxers need the exact units used by the PTS/DTS above.
+            encodedPacket.time_base(codec_ctx.time_base());
+            outPackets.add(encodedPacket);
         }
-
-         */
-        int ret = 0;
-        while (( ret = avcodec_receive_packet(codec_ctx, outPacket) ) >= 0) {
-            outPackets.add(av_packet_clone(outPacket));
+        if (ret != AVERROR_EAGAIN() && ret != AVERROR_EOF) {
+            throw new IllegalStateException("Encoder could not receive a packet (FFmpeg error " + ret + ")");
         }
-        //BytePointer errorBuffer = new BytePointer(AV_ERROR_MAX_STRING_SIZE);
-        //av_strerror(ret, errorBuffer, AV_ERROR_MAX_STRING_SIZE);
-        //logger.debug("Receive Error: {}", errorBuffer.getString());
+    }
+
+    @Override
+    protected void flush() {
+        int ret;
+        while ((ret = avcodec_send_frame(codec_ctx, (AVFrame) null)) == AVERROR_EAGAIN()) {
+            receiveOutPacket();
+        }
+        if (ret < 0 && ret != AVERROR_EOF) {
+            throw new IllegalStateException("Encoder could not start flushing (FFmpeg error " + ret + ")");
+        }
+        receiveOutPacket();
     }
 
     @Override
@@ -85,30 +117,30 @@ public class Encoder extends Coder<AVFrame, AVPacket> {
 
     @Override
     protected void allocatePackets() {
-        inPacket = av_frame_alloc();
         outPacket = av_packet_alloc();
-        av_init_packet(outPacket);
+        if (outPacket == null || outPacket.isNull()) {
+            throw new IllegalStateException("Could not allocate encoder output packet");
+        }
     }
 
     @Override
     protected void deallocatePackets() {
         if (inPacket != null) {
             av_frame_free(inPacket);
+            inPacket = null;
         }
         if (outPacket != null) {
             av_packet_free(outPacket);
+            outPacket = null;
         }
-        if (outPackets != null) {
-            for (AVPacket packet : outPackets) {
-                av_packet_free(packet);
-            }
-            outPackets.clear();
+        // Preserve successfully flushed packets for the downstream consumer. On interruption or
+        // failure there is no complete output to deliver, so retain the historical cleanup path.
+        if (!isOutputComplete()) {
+            deallocateOutQueue();
         }
-        if (inPackets != null) {
-            for (AVFrame frame : inPackets) {
-                av_frame_free(frame);
-            }
-            inPackets.clear();
+        AVFrame frame;
+        while (inPackets != null && (frame = inPackets.poll()) != null) {
+            av_frame_free(frame);
         }
     }
 }
