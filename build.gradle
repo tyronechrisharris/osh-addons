@@ -1,5 +1,5 @@
 plugins {
-  id "biz.aQute.bnd" version "6.1.0" apply false
+  id "biz.aQute.bnd" version "7.0.0" apply false
 }
 
 apply from: gradle.oshCoreDir + '/common.gradle'
