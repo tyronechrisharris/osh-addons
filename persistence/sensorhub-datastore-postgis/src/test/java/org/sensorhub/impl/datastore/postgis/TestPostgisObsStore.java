@@ -26,11 +26,13 @@ import org.sensorhub.impl.datastore.postgis.store.obs.PostgisDataStreamStoreImpl
 import org.sensorhub.impl.datastore.postgis.store.obs.PostgisObsStoreImpl;
 
 import org.sensorhub.api.data.ObsData;
+import org.vast.data.DataBlockDouble;
 import org.vast.swe.SWEHelper;
 
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.Map;
+import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 public class TestPostgisObsStore extends AbstractTestObsStore<PostgisObsStoreImpl> {
@@ -119,6 +121,54 @@ public class TestPostgisObsStore extends AbstractTestObsStore<PostgisObsStoreImp
         checkSelectedEntries(resultStream, expectedResults, filter);
 
          */
+    }
+
+    @Test
+    public void testSelectLatestResultForMultipleDataStreams() throws Exception
+    {
+        var ds1 = addSimpleDataStream(bigId(21), "health1");
+        var ds2 = addSimpleDataStream(bigId(22), "health2");
+        var early = Instant.parse("2026-01-01T00:00:00Z");
+        var late1 = early.plusSeconds(30);
+        var late2 = early.plusSeconds(60);
+
+        addObservation(new ObsData.Builder()
+                .withDataStream(ds1)
+                .withPhenomenonTime(early)
+                .withResultTime(early)
+                .withResult(new DataBlockDouble(5))
+                .build());
+        addObservation(new ObsData.Builder()
+                .withDataStream(ds1)
+                .withPhenomenonTime(late1)
+                .withResultTime(late1)
+                .withResult(new DataBlockDouble(5))
+                .build());
+        addObservation(new ObsData.Builder()
+                .withDataStream(ds2)
+                .withPhenomenonTime(early)
+                .withResultTime(early)
+                .withResult(new DataBlockDouble(5))
+                .build());
+        addObservation(new ObsData.Builder()
+                .withDataStream(ds2)
+                .withPhenomenonTime(late2)
+                .withResultTime(late2)
+                .withResult(new DataBlockDouble(5))
+                .build());
+        forceReadBackFromStorage();
+
+        var filter = new ObsFilter.Builder()
+                .withDataStreams(ds1, ds2)
+                .withLatestResult()
+                .build();
+        Map<BigId, IObsData> latestByDataStream = obsStore.selectEntries(filter)
+                .map(Map.Entry::getValue)
+                .collect(Collectors.toMap(IObsData::getDataStreamID, observation -> observation));
+
+        assertEquals(2, latestByDataStream.size());
+        assertEquals(late1, latestByDataStream.get(ds1).getResultTime());
+        assertEquals(late2, latestByDataStream.get(ds2).getResultTime());
     }
 
 

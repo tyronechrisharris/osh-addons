@@ -17,13 +17,16 @@ package org.sensorhub.impl.datastore.postgis.builder;
 import org.sensorhub.api.datastore.obs.IObsStore;
 import org.sensorhub.api.datastore.obs.ObsFilter;
 import org.sensorhub.api.datastore.obs.ObsStatsQuery;
+import org.sensorhub.impl.datastore.postgis.builder.filter.datastream.DataStreamFilterQuery;
 import org.sensorhub.impl.datastore.postgis.builder.query.obs.RemoveEntriesObsQuery;
 import org.sensorhub.impl.datastore.postgis.builder.query.obs.SelectEntriesObsQuery;
 import org.sensorhub.impl.datastore.postgis.builder.query.stats.StatsObsQuery;
 
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
+import java.util.stream.Collectors;
 
 import static org.sensorhub.api.datastore.feature.IFeatureStoreBase.FeatureField.GEOMETRY;
 import static org.sensorhub.api.datastore.feature.IFeatureStoreBase.FeatureField.VALID_TIME;
@@ -233,6 +236,95 @@ public class QueryBuilderObsStore extends QueryBuilder {
                 .withLimit(filter.getLimit())
                 .build();
         return selectEntriesObsQuery.toParameterizedQuery();
+    }
+
+    /**
+     * Returns whether the latest observation for each explicitly selected data
+     * stream can be read with the optimized lateral query.
+     *
+     * <p>The generic latest-result query uses {@code DISTINCT ON} across all
+     * matching observations. For a multi-stream request that makes PostgreSQL
+     * scan and sort each stream's history before it can return one row. The
+     * lateral form below performs one bounded index probe per stream instead.
+     * Keep the eligibility deliberately narrow so every other filter retains
+     * the existing query semantics.</p>
+     */
+    public boolean supportsLatestResultPerDataStreamQuery(ObsFilter filter) {
+        if (filter == null ||
+                filter.getResultTime() == null ||
+                !filter.getResultTime().isLatestTime() ||
+                filter.getDataStreamFilter() == null ||
+                !DataStreamFilterQuery.hasOnlyInternalIds(filter.getDataStreamFilter())) {
+            return false;
+        }
+
+        return filter.getPhenomenonTime() == null &&
+                filter.getPhenomenonLocation() == null &&
+                filter.getFoiFilter() == null &&
+                (filter.getInternalIDs() == null || filter.getInternalIDs().isEmpty()) &&
+                filter.getCQLFilter() == null &&
+                filter.getValuePredicate() == null;
+    }
+
+    /**
+     * Builds an index-probe query for the latest result of each requested data
+     * stream. The existing {@code (dataStreamID, resultTime)} index can be
+     * scanned backwards for each fixed stream ID and stop after one row.
+     */
+    public ParameterizedQuery createParameterizedLatestResultPerDataStreamQuery(
+            ObsFilter filter,
+            Set<IObsStore.ObsField> fields) {
+        if (!supportsLatestResultPerDataStreamQuery(filter)) {
+            throw new IllegalArgumentException("Filter is not eligible for the latest-result-per-stream query");
+        }
+
+        List<Long> dataStreamIds = filter.getDataStreamFilter().getInternalIDs().stream()
+                .map(id -> id.getIdAsLong())
+                // The legacy IN predicate collapses local IDs that differ only
+                // by BigId scope. unnest would otherwise probe and return the
+                // same local stream more than once.
+                .distinct()
+                .collect(Collectors.toList());
+        String placeholders = dataStreamIds.stream()
+                .map(id -> "?")
+                .collect(Collectors.joining(","));
+        List<Object> parameters = new ArrayList<>(dataStreamIds);
+
+        String selectedColumns;
+        if (fields != null && !fields.isEmpty()) {
+            List<String> selectedFields = fields.stream()
+                    .map(Object::toString)
+                    .distinct()
+                    .sorted()
+                    .collect(Collectors.toCollection(ArrayList::new));
+            selectedFields.add("id");
+            selectedColumns = selectedFields.stream()
+                    .map(field -> "latest." + field)
+                    .collect(Collectors.joining(","));
+        } else {
+            selectedColumns = "latest.*";
+        }
+
+        StringBuilder sql = new StringBuilder("SELECT ")
+                .append(selectedColumns)
+                .append(" FROM unnest(ARRAY[")
+                .append(placeholders)
+                .append("]::bigint[]) AS requested(dataStreamID)")
+                .append(" CROSS JOIN LATERAL (SELECT candidate.* FROM ")
+                .append(this.getStoreTableName())
+                .append(" candidate WHERE candidate.dataStreamID = requested.dataStreamID")
+                // IteratorResultSet detects an outer LIMIT textually when it
+                // decides whether to add paging. FETCH keeps this inner bound
+                // from being mistaken for the caller's outer result limit.
+                .append(" ORDER BY candidate.resultTime DESC, candidate.phenomenonTime ASC")
+                .append(" FETCH FIRST 1 ROW ONLY) latest")
+                .append(" ORDER BY latest.dataStreamID, latest.resultTime DESC, latest.phenomenonTime ASC");
+
+        if (filter.getLimit() != Long.MAX_VALUE) {
+            sql.append(" LIMIT ").append(filter.getLimit());
+        }
+
+        return new ParameterizedQuery(sql.toString(), parameters);
     }
 
     public String createSelectEntriesCountQuery(ObsFilter filter) {

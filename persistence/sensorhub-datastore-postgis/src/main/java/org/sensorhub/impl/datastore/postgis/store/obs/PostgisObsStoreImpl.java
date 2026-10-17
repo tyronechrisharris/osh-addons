@@ -108,7 +108,9 @@ public class PostgisObsStoreImpl extends PostgisStore<QueryBuilderObsStore> impl
             hashSet = null;
         }
 
-        ParameterizedQuery query = queryBuilder.createParameterizedSelectEntriesQuery(filter, hashSet);
+        ParameterizedQuery query = queryBuilder.supportsLatestResultPerDataStreamQuery(filter)
+                ? queryBuilder.createParameterizedLatestResultPerDataStreamQuery(filter, hashSet)
+                : queryBuilder.createParameterizedSelectEntriesQuery(filter, hashSet);
         logger.debug(query.sql());
 
         IteratorResultSet<Entry<BigId, IObsData>> iteratorResultSet =

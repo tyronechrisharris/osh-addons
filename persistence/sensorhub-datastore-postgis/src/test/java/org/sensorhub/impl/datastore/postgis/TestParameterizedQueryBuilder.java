@@ -13,8 +13,10 @@
 package org.sensorhub.impl.datastore.postgis;
 
 import org.junit.Test;
+import org.sensorhub.api.common.BigId;
 import org.sensorhub.api.datastore.command.CommandStreamFilter;
 import org.sensorhub.api.datastore.obs.DataStreamFilter;
+import org.sensorhub.api.datastore.obs.IObsStore;
 import org.sensorhub.api.datastore.obs.ObsFilter;
 import org.sensorhub.api.datastore.system.SystemFilter;
 import org.sensorhub.impl.datastore.postgis.builder.ParameterizedQuery;
@@ -28,6 +30,7 @@ import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 
 import java.util.Arrays;
+import java.util.Set;
 
 public class TestParameterizedQueryBuilder {
     private static final String INJECTION = "camera') OR 1=1 --";
@@ -116,6 +119,85 @@ public class TestParameterizedQueryBuilder {
         assertTrue(indexes.contains("WHERE jsonb_typeof(result->'maxNeutron') = 'number'"));
         assertTrue(Arrays.stream(builder.createEventFilterIndexQueries())
                 .allMatch(query -> query.startsWith("CREATE INDEX IF NOT EXISTS")));
+    }
+
+    @Test
+    public void testLatestResultsForExplicitDataStreamsUseParameterizedLateralProbes() {
+        QueryBuilderObsStore builder = new QueryBuilderObsStore("obs");
+        ObsFilter filter = new ObsFilter.Builder()
+                .withDataStreams(
+                        BigId.fromLong(2, 101),
+                        BigId.fromLong(2, 202),
+                        BigId.fromLong(2, 303))
+                .withLatestResult()
+                .withLimit(2)
+                .build();
+
+        assertTrue(builder.supportsLatestResultPerDataStreamQuery(filter));
+
+        ParameterizedQuery query = builder.createParameterizedLatestResultPerDataStreamQuery(
+                filter,
+                Set.of(IObsStore.ObsField.PHENOMENON_TIME, IObsStore.ObsField.RESULT));
+
+        assertTrue(query.sql().contains("unnest(ARRAY[?,?,?]::bigint[])"));
+        assertTrue(query.sql().contains("CROSS JOIN LATERAL"));
+        assertTrue(query.sql().contains("candidate.dataStreamID = requested.dataStreamID"));
+        assertTrue(query.sql().contains("ORDER BY candidate.resultTime DESC, candidate.phenomenonTime ASC FETCH FIRST 1 ROW ONLY"));
+        assertTrue(query.sql().endsWith("ORDER BY latest.dataStreamID, latest.resultTime DESC, latest.phenomenonTime ASC LIMIT 2"));
+        assertTrue(query.sql().startsWith("SELECT latest.phenomenonTime,latest.result,latest.id"));
+        assertEquals(Arrays.asList(101L, 202L, 303L), query.parameters());
+    }
+
+    @Test
+    public void testLatestResultOptimizationFallsBackForBroaderFilters() {
+        QueryBuilderObsStore builder = new QueryBuilderObsStore("obs");
+        BigId dataStreamId = BigId.fromLong(2, 101);
+
+        assertFalse(builder.supportsLatestResultPerDataStreamQuery(new ObsFilter.Builder()
+                .withDataStreams(dataStreamId)
+                .build()));
+        assertFalse(builder.supportsLatestResultPerDataStreamQuery(new ObsFilter.Builder()
+                .withDataStreams(new DataStreamFilter.Builder()
+                        .withOutputNames("connectionStatus")
+                        .build())
+                .withLatestResult()
+                .build()));
+        assertFalse(builder.supportsLatestResultPerDataStreamQuery(new ObsFilter.Builder()
+                .withDataStreams(dataStreamId)
+                .withLatestResult()
+                .withCQLFilter("isConnected = true")
+                .build()));
+    }
+
+    @Test
+    public void testLatestResultQueryLeavesUnboundedPagingToIterator() {
+        QueryBuilderObsStore builder = new QueryBuilderObsStore("obs");
+        ObsFilter filter = new ObsFilter.Builder()
+                .withDataStreams(BigId.fromLong(2, 101), BigId.fromLong(2, 202))
+                .withLatestResult()
+                .build();
+
+        ParameterizedQuery query = builder.createParameterizedLatestResultPerDataStreamQuery(filter, null);
+
+        assertTrue(query.sql().contains("FETCH FIRST 1 ROW ONLY"));
+        assertFalse(query.sql().contains(" LIMIT "));
+    }
+
+    @Test
+    public void testLatestResultQueryDeduplicatesLocalIdsAcrossScopes() {
+        QueryBuilderObsStore builder = new QueryBuilderObsStore("obs");
+        ObsFilter filter = new ObsFilter.Builder()
+                .withDataStreams(
+                        BigId.fromLong(1, 101),
+                        BigId.fromLong(2, 101),
+                        BigId.fromLong(2, 202))
+                .withLatestResult()
+                .build();
+
+        ParameterizedQuery query = builder.createParameterizedLatestResultPerDataStreamQuery(filter, null);
+
+        assertTrue(query.sql().contains("unnest(ARRAY[?,?]::bigint[])"));
+        assertEquals(Arrays.asList(101L, 202L), query.parameters());
     }
 
     private void assertSqlDoesNotContainInjection(ParameterizedQuery query) {
