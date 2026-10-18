@@ -10,8 +10,6 @@ import java.nio.file.Files;
 import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.attribute.BasicFileAttributes;
-import java.sql.Connection;
-import java.sql.DriverManager;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.time.Instant;
@@ -47,11 +45,26 @@ public final class ParquetArchiveReader {
                     "foi_scope, foi_id, phenomenon_time, result_time, result_json, profile";
 
     private final Path root;
+    private final TieredArchiveConfig config;
     private final Map<Path, VerificationStamp> verifiedObjects = new ConcurrentHashMap<>();
     private final AtomicInteger openCursors = new AtomicInteger();
 
     public ParquetArchiveReader(Path root) {
+        this(root, defaultConfig(root));
+    }
+
+    public ParquetArchiveReader(Path root, TieredArchiveConfig config) {
         this.root = root.toAbsolutePath().normalize();
+        this.config = Objects.requireNonNull(config, "config");
+    }
+
+    private static TieredArchiveConfig defaultConfig(Path root) {
+        TieredArchiveConfig config = new TieredArchiveConfig();
+        config.rootDirectory = root.toAbsolutePath().normalize().toString();
+        Path normalizedRoot = root.toAbsolutePath().normalize();
+        config.duckDbTemporaryDirectory = normalizedRoot.resolveSibling(
+                normalizedRoot.getFileName() + ".duckdb-test-tmp").toString();
+        return config;
     }
 
     public List<ArchivedRow> read(ArchiveGeneration generation, ObsFilter filter,
@@ -156,23 +169,23 @@ public final class ParquetArchiveReader {
     }
 
     private Stream<ArchivedRow> openRowStream(AuthorizedObjects objects, QueryPlan plan, int generationCount) {
-        Connection duck = null;
+        DuckDbResourcePolicy.Session duckSession = null;
         PreparedStatement statement = null;
         ResultSet result = null;
         try {
-            duck = DriverManager.getConnection("jdbc:duckdb:");
-            statement = duck.prepareStatement(plan.sql());
+            duckSession = DuckDbResourcePolicy.open(config, "cold-query");
+            statement = duckSession.connection().prepareStatement(plan.sql());
             bind(statement, plan.parameters());
             result = statement.executeQuery();
-            RowCursor cursor = new RowCursor(duck, statement, result, objects);
+            RowCursor cursor = new RowCursor(duckSession, statement, result, objects);
             openCursors.incrementAndGet();
             return StreamSupport.stream(Spliterators.spliteratorUnknownSize(cursor,
                             Spliterator.ORDERED | Spliterator.NONNULL), false)
                     .onClose(cursor::close);
         } catch (Exception error) {
-            closeQuietly(result);
-            closeQuietly(statement);
-            closeQuietly(duck);
+            closeAndSuppress(result, error);
+            closeAndSuppress(statement, error);
+            closeAndSuppress(duckSession, error);
             throw new IllegalStateException("Cannot query " + generationCount + " archive generation(s)", error);
         }
     }
@@ -197,8 +210,8 @@ public final class ParquetArchiveReader {
         if (objects.byFilename().isEmpty())
             return;
         QueryPlan plan = queryPlan(objects, filter, allowedDataStreams, allowedFois, false, true, limit);
-        try (Connection duck = DriverManager.getConnection("jdbc:duckdb:");
-             PreparedStatement statement = duck.prepareStatement(plan.sql())) {
+        try (DuckDbResourcePolicy.Session duckSession = DuckDbResourcePolicy.open(config, "metadata-query");
+             PreparedStatement statement = duckSession.connection().prepareStatement(plan.sql())) {
             bind(statement, plan.parameters());
             try (ResultSet result = statement.executeQuery()) {
                 while (result.next()) {
@@ -230,8 +243,9 @@ public final class ParquetArchiveReader {
             return 0;
         ObsFilter unbounded = ObsFilter.Builder.from(filter).withLimit(Long.MAX_VALUE).build();
         QueryPlan plan = queryPlan(objects, unbounded, allowedDataStreams, allowedFois, false, true, Long.MAX_VALUE);
-        try (Connection duck = DriverManager.getConnection("jdbc:duckdb:");
-             PreparedStatement statement = duck.prepareStatement("SELECT count(*) FROM (" + plan.sql() + ") archive_matches")) {
+        try (DuckDbResourcePolicy.Session duckSession = DuckDbResourcePolicy.open(config, "cold-count");
+             PreparedStatement statement = duckSession.connection().prepareStatement(
+                     "SELECT count(*) FROM (" + plan.sql() + ") archive_matches")) {
             bind(statement, plan.parameters());
             try (ResultSet result = statement.executeQuery()) {
                 long count = result.next() ? result.getLong(1) : 0;
@@ -463,15 +477,29 @@ public final class ParquetArchiveReader {
         return value.replace("'", "''");
     }
 
-    private static void closeQuietly(AutoCloseable closeable) {
+    private static void closeAndSuppress(AutoCloseable closeable, Throwable primary) {
         if (closeable == null)
             return;
         try {
             closeable.close();
-        } catch (Exception ignored) {
-            // Preserve the query/decoding failure. Cursor accounting and all
-            // remaining close attempts still run.
+        } catch (Throwable cleanupError) {
+            if (cleanupError != primary)
+                primary.addSuppressed(cleanupError);
         }
+    }
+
+    private static Throwable closeAndCollect(AutoCloseable closeable, Throwable failure) {
+        if (closeable == null)
+            return failure;
+        try {
+            closeable.close();
+        } catch (Throwable cleanupError) {
+            if (failure == null)
+                return cleanupError;
+            if (cleanupError != failure)
+                failure.addSuppressed(cleanupError);
+        }
+        return failure;
     }
 
     /**
@@ -606,7 +634,7 @@ public final class ParquetArchiveReader {
     }
 
     private final class RowCursor implements Iterator<ArchivedRow>, AutoCloseable {
-        private final Connection connection;
+        private final DuckDbResourcePolicy.Session duckSession;
         private final PreparedStatement statement;
         private final ResultSet result;
         private final AuthorizedObjects objects;
@@ -614,9 +642,9 @@ public final class ParquetArchiveReader {
         private ArchivedRow next;
         private boolean prefetched;
 
-        RowCursor(Connection connection, PreparedStatement statement, ResultSet result,
+        RowCursor(DuckDbResourcePolicy.Session duckSession, PreparedStatement statement, ResultSet result,
                   AuthorizedObjects objects) {
-            this.connection = connection;
+            this.duckSession = duckSession;
             this.statement = statement;
             this.result = result;
             this.objects = objects;
@@ -629,23 +657,23 @@ public final class ParquetArchiveReader {
             if (closed.get())
                 return false;
             try {
-                if (!result.next()) {
-                    close();
-                    return false;
+                if (result.next()) {
+                    ArchiveGeneration generation = generationForFilename(objects, result.getString(1));
+                    Integer foiScope = result.getObject(6, Integer.class);
+                    Long foiId = result.getObject(7, Long.class);
+                    next = new ArchivedRow(generation, new ArchivedObservation(
+                            result.getInt(2), result.getLong(3), result.getInt(4), result.getLong(5),
+                            foiScope, foiId, UtcJdbcTime.getDuckDbInstant(result, 8),
+                            UtcJdbcTime.getDuckDbInstant(result, 9), result.getString(10), result.getString(11)));
+                    prefetched = true;
+                    return true;
                 }
-                ArchiveGeneration generation = generationForFilename(objects, result.getString(1));
-                Integer foiScope = result.getObject(6, Integer.class);
-                Long foiId = result.getObject(7, Long.class);
-                next = new ArchivedRow(generation, new ArchivedObservation(
-                        result.getInt(2), result.getLong(3), result.getInt(4), result.getLong(5),
-                        foiScope, foiId, UtcJdbcTime.getDuckDbInstant(result, 8),
-                        UtcJdbcTime.getDuckDbInstant(result, 9), result.getString(10), result.getString(11)));
-                prefetched = true;
-                return true;
             } catch (Exception error) {
-                close();
+                closeAndSuppress(this, error);
                 throw new IllegalStateException("Cannot decode archived observation", error);
             }
+            close();
+            return false;
         }
 
         @Override
@@ -662,12 +690,18 @@ public final class ParquetArchiveReader {
         public void close() {
             if (!closed.compareAndSet(false, true))
                 return;
-            closeQuietly(result);
-            closeQuietly(statement);
-            closeQuietly(connection);
-            openCursors.decrementAndGet();
-            next = null;
-            prefetched = false;
+            Throwable failure = null;
+            try {
+                failure = closeAndCollect(result, failure);
+                failure = closeAndCollect(statement, failure);
+                failure = closeAndCollect(duckSession, failure);
+            } finally {
+                openCursors.decrementAndGet();
+                next = null;
+                prefetched = false;
+            }
+            if (failure != null)
+                throw new IllegalStateException("Cannot close archive query resources", failure);
         }
     }
 

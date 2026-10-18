@@ -220,6 +220,7 @@ public abstract class PostgisStore<T extends QueryBuilder> implements ICancellab
         if(timerTask != null) {
             timerTask.cancel();
         }
+        connectionManager.close();
     }
 
     public void commit() throws DataStoreException {

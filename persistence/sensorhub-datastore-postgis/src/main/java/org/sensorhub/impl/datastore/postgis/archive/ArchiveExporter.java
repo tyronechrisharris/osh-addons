@@ -15,7 +15,6 @@ import java.nio.file.StandardOpenOption;
 import java.security.MessageDigest;
 import java.sql.Array;
 import java.sql.Connection;
-import java.sql.DriverManager;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.time.Instant;
@@ -187,15 +186,13 @@ public final class ArchiveExporter {
         Map<Long, Boolean> schemaIds = new TreeMap<>();
         List<ArchiveCatalog.SchemaSnapshot> schemas = List.of();
 
-        try (Connection source = postgres.open(); Connection duck = DriverManager.getConnection("jdbc:duckdb:")) {
+        try (Connection source = postgres.open();
+             DuckDbResourcePolicy.Session duckSession = DuckDbResourcePolicy.open(config, "export")) {
+            Connection duck = duckSession.connection();
             source.setAutoCommit(false);
             source.setReadOnly(true);
             source.setTransactionIsolation(Connection.TRANSACTION_REPEATABLE_READ);
             try (java.sql.Statement create = duck.createStatement()) {
-                // DuckDB spills larger intermediates instead of allowing one
-                // archive window to consume the service JVM's entire heap or
-                // native-memory budget.
-                create.execute("SET memory_limit='256MB'");
                 create.execute("CREATE TABLE archive_rows (id_scope INTEGER, id_value BIGINT, datastream_scope INTEGER, " +
                         "datastream_id BIGINT, foi_scope INTEGER, foi_id BIGINT, phenomenon_time TIMESTAMP, " +
                         "result_time TIMESTAMP, result_json VARCHAR, archive_version INTEGER, profile VARCHAR)");
@@ -293,7 +290,8 @@ public final class ArchiveExporter {
     }
 
     private void verifyParquet(Path parquet, ExportStats expected) throws Exception {
-        try (Connection duck = DriverManager.getConnection("jdbc:duckdb:"); java.sql.Statement statement = duck.createStatement();
+        try (DuckDbResourcePolicy.Session duckSession = DuckDbResourcePolicy.open(config, "export-verify");
+             java.sql.Statement statement = duckSession.connection().createStatement();
              ResultSet result = statement.executeQuery("SELECT count(*), min(id_value), max(id_value) FROM read_parquet('" +
                      sqlLiteral(parquet.toString()) + "')")) {
             if (!result.next() || result.getLong(1) != expected.rowCount ||

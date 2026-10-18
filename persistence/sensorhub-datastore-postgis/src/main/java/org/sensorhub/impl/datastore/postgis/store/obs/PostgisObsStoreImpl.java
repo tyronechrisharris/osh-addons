@@ -121,6 +121,16 @@ public class PostgisObsStoreImpl extends PostgisStore<QueryBuilderObsStore> impl
         queryBuilder.linkTo(dataStreamStore);
     }
 
+    @Override
+    public void close() {
+        // A failed observation flush must leave both pools usable for the
+        // documented retry path, so close the linked metadata store only
+        // after the observation store has committed and closed successfully.
+        super.close();
+        if (dataStreamStore != null)
+            dataStreamStore.close();
+    }
+
     /**
      * Base store initialization runs table DDL only for a new table. Apply the
      * corrected NULL-safe natural key to upgraded tables as a separate online
@@ -229,7 +239,7 @@ public class PostgisObsStoreImpl extends PostgisStore<QueryBuilderObsStore> impl
 
             // get datastream schema from datastreamId
             if (dataStreamId != null) {
-                IDataStreamInfo dataStreamInfo = dataStreamStore.get(new DataStreamKey(dataStreamId));
+                IDataStreamInfo dataStreamInfo = getDataStreamInfo(dataStreamId);
                 DataBlock dataBlock = SerializerUtils.readDataBlockFromJson(dataStreamInfo.getRecordStructure(), resultSet.getString(String.valueOf(RESULT)));
                 obsData = obsDataBuilder.withResult(dataBlock).build();
             } else {
@@ -246,6 +256,11 @@ public class PostgisObsStoreImpl extends PostgisStore<QueryBuilderObsStore> impl
     @Override
     public IDataStreamStore getDataStreams() {
         return this.dataStreamStore;
+    }
+
+    /** Central schema lookup so a coordinated metadata mutation can pin it. */
+    protected IDataStreamInfo getDataStreamInfo(BigId dataStreamId) {
+        return dataStreamStore.get(new DataStreamKey(dataStreamId));
     }
 
     protected String fillAddStatement(BigId id,long dataStreamKey, IObsData obs) throws SQLException {
@@ -284,7 +299,7 @@ public class PostgisObsStoreImpl extends PostgisStore<QueryBuilderObsStore> impl
             values.put("10", "NULL");
         }
         // insert DataBlock
-        IDataStreamInfo dataStreamInfo = dataStreamStore.get(new DataStreamKey(obs.getDataStreamID()));
+        IDataStreamInfo dataStreamInfo = getDataStreamInfo(obs.getDataStreamID());
         String serializedBlock = SerializerUtils.writeDataBlockToJson(dataStreamInfo.getRecordStructure(),
                 dataStreamInfo.getRecordEncoding(), obs.getResult());
 
@@ -333,7 +348,7 @@ public class PostgisObsStoreImpl extends PostgisStore<QueryBuilderObsStore> impl
     }
 
     protected PreparedObservation prepareObservation(BigId id, long dataStreamKey, IObsData obs) {
-        IDataStreamInfo dataStreamInfo = dataStreamStore.get(new DataStreamKey(obs.getDataStreamID()));
+        IDataStreamInfo dataStreamInfo = getDataStreamInfo(obs.getDataStreamID());
         String serializedBlock = SerializerUtils.writeDataBlockToJson(dataStreamInfo.getRecordStructure(),
                 dataStreamInfo.getRecordEncoding(), obs.getResult());
 
@@ -595,7 +610,7 @@ public class PostgisObsStoreImpl extends PostgisStore<QueryBuilderObsStore> impl
                         obsDataBuilder = obsDataBuilder.withResultTime(resultTime);
 
                     // get datastream schema from datastreamId
-                    IDataStreamInfo dataStreamInfo = dataStreamStore.get(new DataStreamKey(dataStreamId));
+                    IDataStreamInfo dataStreamInfo = getDataStreamInfo(dataStreamId);
                     DataBlock dataBlock = SerializerUtils.readDataBlockFromJson(dataStreamInfo.getRecordStructure(), resultSet.getString(String.valueOf(RESULT)));
                     return obsDataBuilder.withResult(dataBlock).build();
                 } else {
@@ -672,7 +687,7 @@ public class PostgisObsStoreImpl extends PostgisStore<QueryBuilderObsStore> impl
                     preparedStatement.setNull(4, Types.TIMESTAMP);
                 }
 
-                IDataStreamInfo dataStreamInfo = dataStreamStore.get(new DataStreamKey(obs.getDataStreamID()));
+                IDataStreamInfo dataStreamInfo = getDataStreamInfo(obs.getDataStreamID());
                 String serializedBlock = SerializerUtils.writeDataBlockToJson(
                         dataStreamInfo.getRecordStructure(),
                         dataStreamInfo.getRecordEncoding(),

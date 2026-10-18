@@ -93,6 +93,11 @@ public class PostgisDataStreamStoreImpl extends PostgisStore<QueryBuilderDataStr
         }
     }
 
+    /** Runtime pool bound used by constrained deployments and deadlock probes. */
+    public void setMaximumPoolSize(int maximumPoolSize) {
+        connectionManager.setMaximumPoolSize(maximumPoolSize);
+    }
+
     protected class DataStreamInfoWithTimeRanges extends DataStreamInfoWrapper
     {
         Long dsID;
@@ -394,11 +399,22 @@ public class PostgisDataStreamStoreImpl extends PostgisStore<QueryBuilderDataStr
         IDataStreamInfo data = this.get(key);
 
         logger.debug("Remove Feature with key={}", key.toString());
+        if (this.obsStore instanceof OscarTieredObsStore tiered)
+            return tiered.withPinnedDataStreamSchema(
+                    key.getInternalID().getIdAsLong(), data,
+                    () -> removeTieredDataStream(key, data));
+
         // remove corresponding Obs
         ObsFilter filter = new ObsFilter.Builder()
                 .withDataStreams(key.getInternalID())
                 .build();
         this.obsStore.removeEntries(filter);
+        long remainingObservations = this.obsStore.countMatchingEntries(filter);
+        if (remainingObservations != 0) {
+            throw new IllegalStateException("Cannot remove datastream " +
+                    key.getInternalID() + ": " + remainingObservations +
+                    " observation(s) remain, including records protected by retention holds");
+        }
 
         try (Connection connection = this.connectionManager.getConnection()) {
             try (PreparedStatement preparedStatement = connection.prepareStatement(queryBuilder.removeByIdQuery())) {
@@ -416,8 +432,171 @@ public class PostgisDataStreamStoreImpl extends PostgisStore<QueryBuilderDataStr
         }
     }
 
+    /**
+     * Keeps a SHARE table lock from the hold preflight through metadata
+     * deletion. Hold creation/release takes SHARE ROW EXCLUSIVE, so a held
+     * child is discovered before any observation is changed and a new hold
+     * cannot race between the preflight and the bounded child deletions.
+     */
+    private IDataStreamInfo removeTieredDataStream(DataStreamKey key, IDataStreamInfo data) {
+        long dataStreamId = key.getInternalID().getIdAsLong();
+        ObsFilter filter = new ObsFilter.Builder()
+                .withDataStreams(key.getInternalID())
+                .build();
+        try (Connection connection = this.connectionManager.getConnection()) {
+            boolean oldAutoCommit = connection.getAutoCommit();
+            connection.setAutoCommit(false);
+            try {
+                try (Statement lockHolds = connection.createStatement()) {
+                    lockHolds.execute("LOCK TABLE oscar_retention_hold IN SHARE MODE");
+                }
+                long blockingHolds = countActiveRetentionHoldsForDataStream(
+                        connection, dataStreamId);
+                if (blockingHolds != 0) {
+                    throw new IllegalStateException("Cannot remove datastream " +
+                            key.getInternalID() + ": " + blockingHolds +
+                            " active retention hold(s) protect matching or unresolved observations; " +
+                            "no observation was removed");
+                }
+
+                this.obsStore.removeEntries(filter);
+                long remainingObservations = this.obsStore.countMatchingEntries(filter);
+                if (remainingObservations != 0) {
+                    throw new IllegalStateException("Cannot remove datastream " +
+                            key.getInternalID() + ": " + remainingObservations +
+                            " observation(s) remain after hold-aware removal");
+                }
+
+                try (PreparedStatement preparedStatement =
+                             connection.prepareStatement(queryBuilder.removeByIdQuery())) {
+                    preparedStatement.setLong(1, dataStreamId);
+                    if (preparedStatement.executeUpdate() != 1)
+                        throw new IllegalStateException("Cannot remove IDataStreamInfo " +
+                                (data == null ? key.getInternalID() : data.getOutputName()));
+                }
+                connection.commit();
+                cache.invalidate(dataStreamId);
+                return data;
+            } catch (Exception error) {
+                try {
+                    connection.rollback();
+                } catch (SQLException rollbackError) {
+                    error.addSuppressed(rollbackError);
+                }
+                if (error instanceof RuntimeException runtime)
+                    throw runtime;
+                throw new IllegalStateException("Cannot remove tiered datastream " +
+                        key.getInternalID(), error);
+            } finally {
+                connection.setAutoCommit(oldAutoCommit);
+            }
+        } catch (SQLException error) {
+            throw new IllegalStateException("Cannot remove tiered datastream " +
+                    key.getInternalID(), error);
+        }
+    }
+
+    /**
+     * Resolves active exact and conservative holds against the target
+     * datastream. An unresolvable legacy/corrupt hold blocks every datastream
+     * deletion in its namespace rather than allowing a destructive false
+     * negative. Cold observation holds use generation ID ranges plus schema
+     * membership and are therefore intentionally conservative.
+     */
+    private long countActiveRetentionHoldsForDataStream(Connection connection,
+                                                        long dataStreamId)
+            throws SQLException {
+        String observations = this.obsStore.getDatastoreName();
+        String sql = "WITH active_holds AS (" +
+                "SELECT id, subject_type, subject_id, resolution_mode " +
+                "FROM oscar_retention_hold WHERE store_key=? AND id_scope=? " +
+                "AND released_at IS NULL), " +
+                "exact_resolution(hold_id, datastream_id) AS (" +
+                "SELECT hold.id, observation.datastreamid FROM active_holds hold " +
+                "JOIN " + observations + " observation ON hold.subject_type='OBSERVATION' " +
+                "AND hold.resolution_mode IN ('HOT_EXACT','LEGACY_UNKNOWN') " +
+                "AND observation.id::text=hold.subject_id " +
+                "UNION SELECT hold.id, overlay_row.datastream_id FROM active_holds hold " +
+                "JOIN oscar_obs_overlay overlay_row ON hold.subject_type='OBSERVATION' " +
+                "AND hold.resolution_mode IN ('HOT_EXACT','LEGACY_UNKNOWN') " +
+                "AND overlay_row.store_key=? AND overlay_row.id_scope=? " +
+                "AND overlay_row.observation_id::text=hold.subject_id " +
+                "JOIN oscar_archive_generation overlay_generation " +
+                "ON overlay_generation.id=overlay_row.generation_id " +
+                "AND overlay_generation.store_key=overlay_row.store_key " +
+                "AND overlay_generation.id_scope=overlay_row.id_scope " +
+                "AND overlay_generation.state IN ('ACTIVE','SEALED')), " +
+                "range_resolution(hold_id, datastream_id) AS (" +
+                "SELECT hold.id, schema_row.datastream_id FROM active_holds hold " +
+                "JOIN oscar_archive_id_block block ON hold.subject_type='OBSERVATION' " +
+                "AND hold.resolution_mode IN ('COLD_RANGE_CONSERVATIVE','LEGACY_UNKNOWN') " +
+                "AND CASE WHEN hold.subject_id ~ '^[0-9]+$' " +
+                "THEN hold.subject_id::numeric END BETWEEN block.min_id::numeric AND block.max_id::numeric " +
+                "JOIN oscar_archive_generation generation ON generation.id=block.generation_id " +
+                "AND generation.store_key=? AND generation.id_scope=? " +
+                "AND generation.state IN ('ACTIVE','SEALED') " +
+                "JOIN oscar_archive_schema schema_row ON schema_row.generation_id=generation.id), " +
+                "generation_resolution(hold_id, datastream_id) AS (" +
+                "SELECT hold.id, schema_row.datastream_id FROM active_holds hold " +
+                "JOIN oscar_archive_generation generation " +
+                "ON hold.subject_type='ARCHIVE_GENERATION' " +
+                "AND hold.resolution_mode='GENERATION_EXACT' " +
+                "AND generation.id::text=hold.subject_id AND generation.store_key=? " +
+                "AND generation.id_scope=? AND generation.state IN ('ACTIVE','SEALED') " +
+                "JOIN oscar_archive_schema schema_row ON schema_row.generation_id=generation.id), " +
+                "resolved(hold_id, datastream_id) AS (" +
+                "SELECT exact.hold_id, exact.datastream_id FROM exact_resolution exact " +
+                "JOIN active_holds hold ON hold.id=exact.hold_id " +
+                "WHERE hold.resolution_mode='HOT_EXACT' " +
+                "UNION SELECT range_row.hold_id, range_row.datastream_id " +
+                "FROM range_resolution range_row JOIN active_holds hold ON hold.id=range_row.hold_id " +
+                "WHERE hold.resolution_mode='COLD_RANGE_CONSERVATIVE' " +
+                "UNION SELECT generation_row.hold_id, generation_row.datastream_id " +
+                "FROM generation_resolution generation_row " +
+                "UNION SELECT exact.hold_id, exact.datastream_id FROM exact_resolution exact " +
+                "JOIN active_holds hold ON hold.id=exact.hold_id " +
+                "WHERE hold.resolution_mode='LEGACY_UNKNOWN' AND 1=(" +
+                "SELECT count(DISTINCT candidate.datastream_id) FROM exact_resolution candidate " +
+                "WHERE candidate.hold_id=hold.id) " +
+                "UNION SELECT range_row.hold_id, range_row.datastream_id " +
+                "FROM range_resolution range_row JOIN active_holds hold ON hold.id=range_row.hold_id " +
+                "WHERE hold.resolution_mode='LEGACY_UNKNOWN' " +
+                "AND NOT EXISTS (SELECT 1 FROM exact_resolution exact " +
+                "WHERE exact.hold_id=hold.id) AND 1=(" +
+                "SELECT count(DISTINCT candidate.datastream_id) FROM range_resolution candidate " +
+                "WHERE candidate.hold_id=hold.id)), " +
+                "resolution_stats AS (SELECT hold_id, count(DISTINCT datastream_id) AS stream_count " +
+                "FROM resolved GROUP BY hold_id) " +
+                "SELECT count(*) FROM active_holds hold " +
+                "LEFT JOIN resolution_stats stats ON stats.hold_id=hold.id WHERE " +
+                "stats.stream_count IS NULL OR stats.stream_count=0 OR " +
+                "(hold.resolution_mode='HOT_EXACT' AND stats.stream_count<>1) OR " +
+                "EXISTS (SELECT 1 FROM resolved WHERE hold_id=hold.id AND datastream_id=?)";
+        try (PreparedStatement statement = connection.prepareStatement(sql)) {
+            int parameter = 1;
+            statement.setString(parameter++, observations);
+            statement.setInt(parameter++, this.obsStore.idScope);
+            statement.setString(parameter++, observations);
+            statement.setInt(parameter++, this.obsStore.idScope);
+            statement.setString(parameter++, observations);
+            statement.setInt(parameter++, this.obsStore.idScope);
+            statement.setString(parameter++, observations);
+            statement.setInt(parameter++, this.obsStore.idScope);
+            statement.setLong(parameter, dataStreamId);
+            try (ResultSet result = statement.executeQuery()) {
+                if (!result.next())
+                    throw new SQLException("Retention-hold preflight returned no result");
+                return result.getLong(1);
+            }
+        }
+    }
+
     @Override
     public void clear() {
+        if (obsStore instanceof OscarTieredObsStore) {
+            throw new UnsupportedOperationException(
+                    "Tiered datastream metadata cannot be cleared independently of held observations");
+        }
         try {
             super.clear();
             this.clearCache();
@@ -426,6 +605,33 @@ public class PostgisDataStreamStoreImpl extends PostgisStore<QueryBuilderDataStr
         } finally {
             cache.invalidateAll();
         }
+    }
+
+    @Override
+    public void drop() {
+        if (obsStore instanceof OscarTieredObsStore) {
+            throw new UnsupportedOperationException(
+                    "Tiered datastream metadata cannot be dropped through the datastore API");
+        }
+        super.drop();
+    }
+
+    @Override
+    public void backup(java.io.OutputStream output) throws IOException {
+        if (obsStore instanceof OscarTieredObsStore) {
+            throw new UnsupportedOperationException(
+                    "Tiered datastream metadata requires the coordinated OSCAR storage backup");
+        }
+        super.backup(output);
+    }
+
+    @Override
+    public void restore(java.io.InputStream input) throws IOException {
+        if (obsStore instanceof OscarTieredObsStore) {
+            throw new UnsupportedOperationException(
+                    "Tiered datastream metadata requires the coordinated OSCAR storage restore");
+        }
+        super.restore(input);
     }
 
     public void clearCache() {

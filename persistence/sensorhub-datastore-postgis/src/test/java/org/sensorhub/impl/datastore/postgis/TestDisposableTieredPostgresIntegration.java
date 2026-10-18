@@ -56,10 +56,12 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.stream.Stream;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 
@@ -80,6 +82,8 @@ public class TestDisposableTieredPostgresIntegration extends TestPostgisObsStore
 
         archiveConfig = new TieredArchiveConfig();
         archiveConfig.rootDirectory = root.toString();
+        archiveConfig.duckDbTemporaryDirectory = root.resolveSibling(
+                root.getFileName() + ".duckdb-test-tmp").toString();
         archiveConfig.outputNames = List.of("gammaCounts");
         archiveConfig.deleteBatchSize = 2;
         archiveConfig.rollbackGraceDays = 1;
@@ -192,11 +196,10 @@ public class TestDisposableTieredPostgresIntegration extends TestPostgisObsStore
     @org.junit.After
     public void cleanup() throws Exception {
         if (postgisObsStore != null) {
-            postgisObsStore.drop();
-            if (postgisObsStore.getDataStreams() != null) {
-                ((PostgisDataStreamStoreImpl) postgisObsStore.getDataStreams()).drop();
+            postgisObsStore.close();
+            dropDisposableTieredTables(TABLE);
+            if (postgisObsStore.getDataStreams() != null)
                 ((PostgisDataStreamStoreImpl) postgisObsStore.getDataStreams()).clearCache();
-            }
         }
         // This probe is opt-in and must point at a uniquely named disposable
         // PostgreSQL instance. Keep its global archive catalog isolated
@@ -281,7 +284,7 @@ public class TestDisposableTieredPostgresIntegration extends TestPostgisObsStore
         try (var paths = Files.walk(root)) {
             assertEquals(0, paths.filter(path -> path.getFileName().toString().endsWith(".partial")).count());
         }
-        assertCatalogV4AndActivation(generation);
+        assertCatalogV5AndActivation(generation);
 
         // Grace overlap must be deduplicated by both the full query and exact cardinality paths.
         assertEquals(6, selectAll(tiered));
@@ -355,8 +358,9 @@ public class TestDisposableTieredPostgresIntegration extends TestPostgisObsStore
         long heldId = inserted.keySet().stream().mapToLong(BigId::getIdAsLong).sorted().skip(2).findFirst().orElseThrow();
         UUID holdId = UUID.randomUUID();
         try (Connection connection = open(); PreparedStatement statement = connection.prepareStatement(
-                "INSERT INTO oscar_retention_hold(id, store_key, id_scope, subject_type, subject_id, reason, created_by) " +
-                        "VALUES (?, ?, ?, 'OBSERVATION', ?, 'integration hold', 'codex-integration')")) {
+                "INSERT INTO oscar_retention_hold(id, store_key, id_scope, subject_type, subject_id, " +
+                        "resolution_mode, reason, created_by) VALUES (?, ?, ?, 'OBSERVATION', ?, " +
+                        "'HOT_EXACT', 'integration hold', 'codex-integration')")) {
             statement.setObject(1, holdId);
             statement.setString(2, TABLE);
             statement.setInt(3, DATABASE_NUM);
@@ -617,6 +621,490 @@ public class TestDisposableTieredPostgresIntegration extends TestPostgisObsStore
                 assertTrue(result.next());
                 assertEquals(2, result.getLong(1));
             }
+        }
+    }
+
+    @Test
+    public void activeObservationHoldBlocksSingleHotRemoveUntilRelease() throws Exception {
+        OscarTieredObsStore tiered = (OscarTieredObsStore) postgisObsStore;
+        Instant start = Instant.parse("2026-02-02T12:00:00Z");
+        BigId stream = addSimpleDataStream(bigId(610), "gammaCounts");
+        BigId key = addSimpleObsWithoutResultTime(
+                stream, BigId.NONE, start, 1, 0).keySet().iterator().next();
+        forceReadBackFromStorage();
+
+        UUID hold = insertRetentionHold("OBSERVATION",
+                Long.toString(key.getIdAsLong()), "HOT_EXACT");
+        assertThrows(ArchiveCatalog.RetentionHoldException.class, () -> tiered.remove(key));
+        assertNotNull(tiered.get(key));
+        assertTrue(hotRowExists(key.getIdAsLong()));
+
+        releaseRetentionHold(hold);
+        assertNotNull(tiered.remove(key));
+        assertTrue(tiered.get(key) == null);
+        assertFalse(hotRowExists(key.getIdAsLong()));
+    }
+
+    @Test
+    public void activeObservationHoldBlocksSingleHotRemoveWhenArchivingIsDisabled() throws Exception {
+        OscarTieredObsStore tiered = (OscarTieredObsStore) postgisObsStore;
+        Instant start = Instant.parse("2026-02-02T12:30:00Z");
+        BigId stream = addSimpleDataStream(bigId(613), "gammaCounts");
+        BigId key = addSimpleObsWithoutResultTime(
+                stream, BigId.NONE, start, 1, 0).keySet().iterator().next();
+        forceReadBackFromStorage();
+
+        UUID hold = insertRetentionHold("OBSERVATION",
+                Long.toString(key.getIdAsLong()), "HOT_EXACT");
+        archiveConfig.enabled = false;
+        assertThrows(ArchiveCatalog.RetentionHoldException.class, () -> tiered.remove(key));
+        assertNotNull(tiered.get(key));
+        assertTrue(hotRowExists(key.getIdAsLong()));
+
+        releaseRetentionHold(hold);
+        assertNotNull(tiered.remove(key));
+        assertNull(tiered.get(key));
+        assertFalse(hotRowExists(key.getIdAsLong()));
+    }
+
+    @Test
+    public void activeObservationHoldIsSkippedByBulkRemoveWhenArchivingIsDisabled() throws Exception {
+        OscarTieredObsStore tiered = (OscarTieredObsStore) postgisObsStore;
+        Instant start = Instant.parse("2026-02-02T12:45:00Z");
+        BigId stream = addSimpleDataStream(bigId(614), "gammaCounts");
+        List<BigId> keys = addSimpleObsWithoutResultTime(
+                stream, BigId.NONE, start, 2, 60_000).keySet().stream()
+                .sorted(Comparator.comparingLong(BigId::getIdAsLong))
+                .toList();
+        forceReadBackFromStorage();
+
+        UUID hold = insertRetentionHold("OBSERVATION",
+                Long.toString(keys.get(0).getIdAsLong()), "HOT_EXACT");
+        archiveConfig.enabled = false;
+        assertEquals(1, tiered.removeEntries(new ObsFilter.Builder().build()));
+        assertNotNull(tiered.get(keys.get(0)));
+        assertNull(tiered.get(keys.get(1)));
+
+        releaseRetentionHold(hold);
+        assertEquals(1, tiered.removeEntries(new ObsFilter.Builder().build()));
+        assertEquals(0, tiered.getNumRecords());
+    }
+
+    @Test
+    public void disabledModeDoesNotRemoveInvisibleColdOnlyObservation() throws Exception {
+        OscarTieredObsStore tiered = (OscarTieredObsStore) postgisObsStore;
+        ArchiveCatalog catalog = tiered.getArchiveCatalog();
+        Instant start = Instant.parse("2026-02-02T12:47:00Z");
+        BigId stream = addSimpleDataStream(bigId(617), "gammaCounts");
+        BigId key = addSimpleObsWithoutResultTime(
+                stream, BigId.NONE, start, 1, 0).keySet().iterator().next();
+        forceReadBackFromStorage();
+        ArchiveGeneration generation = tiered.archiveWindow(
+                start, start.plus(1, ChronoUnit.HOURS), "RAW_GATED").orElseThrow();
+        tiered.maintainArchiveLifecycle();
+        ageGeneration(generation.id());
+        archiveConfig.deleteHotAfterArchive = true;
+        tiered.maintainArchiveLifecycle();
+        assertFalse(hotRowExists(key.getIdAsLong()));
+
+        archiveConfig.enabled = false;
+        assertNull(tiered.get(key));
+        assertNull(tiered.remove(key));
+        assertFalse(catalog.isTombstoned(key.getIdAsLong()));
+    }
+
+    @Test
+    public void disabledModeRemovesVisibleGraceRowsConsistently() throws Exception {
+        OscarTieredObsStore tiered = (OscarTieredObsStore) postgisObsStore;
+        ArchiveCatalog catalog = tiered.getArchiveCatalog();
+        Instant start = Instant.parse("2026-02-02T12:48:00Z");
+        BigId stream = addSimpleDataStream(bigId(618), "gammaCounts");
+        List<BigId> keys = addSimpleObsWithoutResultTime(
+                stream, BigId.NONE, start, 2, 60_000).keySet().stream()
+                .sorted(Comparator.comparingLong(BigId::getIdAsLong))
+                .toList();
+        forceReadBackFromStorage();
+        tiered.archiveWindow(start, start.plus(1, ChronoUnit.HOURS), "RAW_GATED").orElseThrow();
+        tiered.maintainArchiveLifecycle();
+        assertEquals(2, archivedHotRows());
+
+        archiveConfig.enabled = false;
+        assertNotNull(tiered.get(keys.get(0)));
+        assertNotNull(tiered.remove(keys.get(0)));
+        assertNull(tiered.get(keys.get(0)));
+        assertFalse(hotRowExists(keys.get(0).getIdAsLong()));
+        assertTrue(catalog.isTombstoned(keys.get(0).getIdAsLong()));
+
+        assertEquals(1, tiered.removeEntries(new ObsFilter.Builder().build()));
+        assertEquals(0, tiered.getNumRecords());
+        assertEquals(0, selectAll(tiered));
+        assertFalse(hotRowExists(keys.get(1).getIdAsLong()));
+        assertTrue(catalog.isTombstoned(keys.get(1).getIdAsLong()));
+        assertEquals(0, tiered.removeEntries(new ObsFilter.Builder().build()));
+    }
+
+    @Test
+    public void clearCannotBypassRetentionHolds() throws Exception {
+        OscarTieredObsStore tiered = (OscarTieredObsStore) postgisObsStore;
+        Instant start = Instant.parse("2026-02-02T12:50:00Z");
+        BigId stream = addSimpleDataStream(bigId(615), "gammaCounts");
+        BigId key = addSimpleObsWithoutResultTime(
+                stream, BigId.NONE, start, 1, 0).keySet().iterator().next();
+        forceReadBackFromStorage();
+
+        insertRetentionHold("OBSERVATION",
+                Long.toString(key.getIdAsLong()), "HOT_EXACT");
+        assertThrows(UnsupportedOperationException.class, tiered::clear);
+        assertThrows(UnsupportedOperationException.class, tiered::drop);
+        assertThrows(UnsupportedOperationException.class, () -> tiered.getDataStreams().clear());
+        assertThrows(UnsupportedOperationException.class,
+                () -> ((PostgisDataStreamStoreImpl) tiered.getDataStreams()).drop());
+        assertThrows(UnsupportedOperationException.class,
+                () -> tiered.backup(new java.io.ByteArrayOutputStream()));
+        assertThrows(UnsupportedOperationException.class,
+                () -> tiered.restore(new java.io.ByteArrayInputStream(new byte[0])));
+        assertThrows(UnsupportedOperationException.class,
+                () -> ((PostgisDataStreamStoreImpl) tiered.getDataStreams())
+                        .backup(new java.io.ByteArrayOutputStream()));
+        assertThrows(UnsupportedOperationException.class,
+                () -> ((PostgisDataStreamStoreImpl) tiered.getDataStreams())
+                        .restore(new java.io.ByteArrayInputStream(new byte[0])));
+        assertNotNull(tiered.getDataStreams().get(new DataStreamKey(stream)));
+        assertNotNull(tiered.get(key));
+        assertTrue(hotRowExists(key.getIdAsLong()));
+    }
+
+    @Test
+    public void datastreamRemovalCannotOrphanHeldHotObservation() throws Exception {
+        OscarTieredObsStore tiered = (OscarTieredObsStore) postgisObsStore;
+        Instant start = Instant.parse("2026-02-02T12:55:00Z");
+        BigId stream = addSimpleDataStream(bigId(616), "gammaCounts");
+        List<BigId> keys = addSimpleObsWithoutResultTime(
+                stream, BigId.NONE, start, 2, 60_000).keySet().stream()
+                .sorted(Comparator.comparingLong(BigId::getIdAsLong)).toList();
+        forceReadBackFromStorage();
+
+        UUID hold = insertRetentionHold("OBSERVATION",
+                Long.toString(keys.get(0).getIdAsLong()), "HOT_EXACT");
+        DataStreamKey dataStreamKey = new DataStreamKey(stream);
+        assertThrows(IllegalStateException.class,
+                () -> tiered.getDataStreams().remove(dataStreamKey));
+        assertNotNull(tiered.getDataStreams().get(dataStreamKey));
+        assertNotNull(tiered.get(keys.get(0)));
+        assertNotNull("Hold preflight must preserve an unheld sibling too",
+                tiered.get(keys.get(1)));
+
+        releaseRetentionHold(hold);
+        assertNotNull(tiered.getDataStreams().remove(dataStreamKey));
+        assertNull(tiered.get(keys.get(0)));
+        assertNull(tiered.get(keys.get(1)));
+    }
+
+    @Test
+    public void datastreamRemovalCompletesWithOneDatastreamConnection() throws Exception {
+        TestableTieredStore tiered = (TestableTieredStore) postgisObsStore;
+        Instant start = Instant.parse("2026-02-02T12:57:00Z");
+        BigId stream = addSimpleDataStream(bigId(617), "gammaCounts");
+        List<BigId> keys = addSimpleObsWithoutResultTime(
+                stream, BigId.NONE, start, 2, 60_000).keySet().stream().toList();
+        forceReadBackFromStorage();
+        tiered.limitDataStreamPool(1);
+        tiered.beforeNextRemoveBatch(() ->
+                ((PostgisDataStreamStoreImpl) tiered.getDataStreams()).clearCache());
+
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        try {
+            Future<?> removal = executor.submit(() ->
+                    tiered.getDataStreams().remove(new DataStreamKey(stream)));
+            assertNotNull("Exact-ID child removal must not recursively borrow the metadata pool",
+                    removal.get(5, TimeUnit.SECONDS));
+        } finally {
+            executor.shutdownNow();
+            executor.awaitTermination(30, TimeUnit.SECONDS);
+        }
+        assertNull(tiered.getDataStreams().get(new DataStreamKey(stream)));
+        for (BigId key : keys)
+            assertNull(tiered.get(key));
+    }
+
+    @Test
+    public void datastreamRemovalFailureKeepsMetadataAndRetryCompletes() throws Exception {
+        TestableTieredStore tiered = (TestableTieredStore) postgisObsStore;
+        Instant start = Instant.parse("2026-02-02T12:58:00Z");
+        BigId stream = addSimpleDataStream(bigId(619), "gammaCounts");
+        addSimpleObsWithoutResultTime(stream, BigId.NONE, start, 513, 1_000);
+        forceReadBackFromStorage();
+        DataStreamKey key = new DataStreamKey(stream);
+
+        tiered.failBeforeRemoveBatch(2);
+        assertThrows(IllegalStateException.class,
+                () -> tiered.getDataStreams().remove(key));
+        assertNotNull("Metadata must remain when a later child batch fails",
+                tiered.getDataStreams().get(key));
+        assertEquals("The first bounded child batch may commit, making the operation retry-safe",
+                1, tiered.countMatchingEntries(new ObsFilter.Builder()
+                        .withDataStreams(stream)
+                        .build()));
+
+        assertNotNull("Retry must remove the remaining child and then metadata",
+                tiered.getDataStreams().remove(key));
+        assertNull(tiered.getDataStreams().get(key));
+        assertEquals(0, tiered.countMatchingEntries(new ObsFilter.Builder()
+                .withDataStreams(stream)
+                .build()));
+    }
+
+    @Test
+    public void hotExactDatastreamHoldDoesNotExpandThroughArchiveRange() throws Exception {
+        OscarTieredObsStore tiered = (OscarTieredObsStore) postgisObsStore;
+        Instant start = Instant.parse("2026-02-02T12:59:00Z");
+        BigId heldStream = addSimpleDataStream(bigId(620), "gammaCounts");
+        BigId siblingStream = addSimpleDataStream(bigId(621), "gammaCounts");
+        BigId heldObservation = addSimpleObsWithoutResultTime(
+                heldStream, BigId.NONE, start, 1, 0).keySet().iterator().next();
+        addSimpleObsWithoutResultTime(
+                siblingStream, BigId.NONE, start.plus(1, ChronoUnit.MINUTES), 1, 0);
+        forceReadBackFromStorage();
+        tiered.archiveWindow(start, start.plus(1, ChronoUnit.HOURS),
+                "RAW_GATED").orElseThrow();
+
+        UUID hold = insertRetentionHold("OBSERVATION",
+                Long.toString(heldObservation.getIdAsLong()), "HOT_EXACT");
+        try {
+            assertNotNull("An exact hold must not broaden through its generation ID range",
+                    tiered.getDataStreams().remove(new DataStreamKey(siblingStream)));
+            assertThrows(IllegalStateException.class,
+                    () -> tiered.getDataStreams().remove(new DataStreamKey(heldStream)));
+            assertNotNull(tiered.getDataStreams().get(new DataStreamKey(heldStream)));
+            assertNotNull(tiered.get(heldObservation));
+        } finally {
+            releaseRetentionHold(hold);
+        }
+    }
+
+    @Test
+    public void coldRangeAndLegacyUnknownDatastreamHoldsUseConservativeProvenance() throws Exception {
+        OscarTieredObsStore tiered = (OscarTieredObsStore) postgisObsStore;
+        Instant start = Instant.parse("2026-02-02T13:01:00Z");
+        BigId firstStream = addSimpleDataStream(bigId(622), "gammaCounts");
+        BigId gapStream = addSimpleDataStream(bigId(623), "notArchived");
+        BigId secondStream = addSimpleDataStream(bigId(624), "gammaCounts");
+        BigId unrelatedStream = addSimpleDataStream(bigId(625), "gammaCounts");
+        BigId first = addSimpleObsWithoutResultTime(
+                firstStream, BigId.NONE, start, 1, 0).keySet().iterator().next();
+        BigId gap = addSimpleObsWithoutResultTime(
+                gapStream, BigId.NONE, start.plus(1, ChronoUnit.MINUTES), 1, 0)
+                .keySet().iterator().next();
+        BigId second = addSimpleObsWithoutResultTime(
+                secondStream, BigId.NONE, start.plus(2, ChronoUnit.MINUTES), 1, 0)
+                .keySet().iterator().next();
+        addSimpleObsWithoutResultTime(
+                unrelatedStream, BigId.NONE, start.plus(2, ChronoUnit.HOURS), 1, 0);
+        forceReadBackFromStorage();
+        assertNotNull(tiered.remove(gap));
+        ArchiveGeneration generation = tiered.archiveWindow(
+                start, start.plus(1, ChronoUnit.HOURS), "RAW_GATED").orElseThrow();
+        assertTrue(gap.getIdAsLong() > first.getIdAsLong());
+        assertTrue(gap.getIdAsLong() < second.getIdAsLong());
+
+        UUID cold = insertRetentionHold("OBSERVATION",
+                Long.toString(gap.getIdAsLong()), "COLD_RANGE_CONSERVATIVE");
+        try {
+            assertThrows(IllegalStateException.class,
+                    () -> tiered.getDataStreams().remove(new DataStreamKey(firstStream)));
+            assertThrows(IllegalStateException.class,
+                    () -> tiered.getDataStreams().remove(new DataStreamKey(secondStream)));
+            assertNotNull("A cold range hold is scoped to candidate generation schemas",
+                    tiered.getDataStreams().remove(new DataStreamKey(unrelatedStream)));
+        } finally {
+            releaseRetentionHold(cold);
+        }
+
+        BigId retryProbe = addSimpleDataStream(bigId(626), "gammaCounts");
+        addSimpleObsWithoutResultTime(
+                retryProbe, BigId.NONE, start.plus(3, ChronoUnit.HOURS), 1, 0);
+        forceReadBackFromStorage();
+        UUID legacy = insertRetentionHold("OBSERVATION",
+                Long.toString(gap.getIdAsLong()), "LEGACY_UNKNOWN");
+        try {
+            assertThrows("A legacy hold spanning multiple generation schemas must fail closed",
+                    IllegalStateException.class,
+                    () -> tiered.getDataStreams().remove(new DataStreamKey(retryProbe)));
+            assertNotNull(tiered.getDataStreams().get(new DataStreamKey(retryProbe)));
+        } finally {
+            releaseRetentionHold(legacy);
+        }
+
+        UUID exactGeneration = insertRetentionHold("ARCHIVE_GENERATION",
+                generation.id().toString(), "GENERATION_EXACT");
+        try {
+            assertThrows(IllegalStateException.class,
+                    () -> tiered.getDataStreams().remove(new DataStreamKey(firstStream)));
+            assertNotNull("An exact generation hold must not block an unrelated stream",
+                    tiered.getDataStreams().remove(new DataStreamKey(retryProbe)));
+        } finally {
+            releaseRetentionHold(exactGeneration);
+        }
+    }
+
+    @Test
+    public void activeGenerationHoldBlocksSingleColdRemoveAndIsScopedToCandidates() throws Exception {
+        OscarTieredObsStore tiered = (OscarTieredObsStore) postgisObsStore;
+        ArchiveCatalog catalog = tiered.getArchiveCatalog();
+        Instant start = Instant.parse("2026-02-02T13:00:00Z");
+        BigId stream = addSimpleDataStream(bigId(611), "gammaCounts");
+        BigId archived = addSimpleObsWithoutResultTime(
+                stream, BigId.NONE, start, 1, 0).keySet().iterator().next();
+        BigId unrelatedHot = addSimpleObsWithoutResultTime(
+                stream, BigId.NONE, start.plus(2, ChronoUnit.HOURS), 1, 0)
+                .keySet().iterator().next();
+        forceReadBackFromStorage();
+
+        ArchiveGeneration generation = tiered.archiveWindow(
+                start, start.plus(1, ChronoUnit.HOURS), "RAW_GATED").orElseThrow();
+        tiered.maintainArchiveLifecycle();
+        ageGeneration(generation.id());
+        archiveConfig.deleteHotAfterArchive = true;
+        tiered.maintainArchiveLifecycle();
+        assertFalse(hotRowExists(archived.getIdAsLong()));
+        assertTrue(hotRowExists(unrelatedHot.getIdAsLong()));
+
+        UUID hold = insertRetentionHold(
+                "ARCHIVE_GENERATION", generation.id().toString(), "GENERATION_EXACT");
+        try (Connection connection = open()) {
+            connection.setAutoCommit(false);
+            catalog.lockForMutation(connection, unrelatedHot.getIdAsLong());
+            ArchiveCatalog.ActiveRemovalHolds scoped = catalog.lockActiveRemovalHolds(
+                    connection, List.of(unrelatedHot.getIdAsLong()));
+            assertFalse(scoped.generationIds().contains(generation.id()));
+            connection.rollback();
+        }
+        assertNotNull(tiered.remove(unrelatedHot));
+
+        assertThrows(ArchiveCatalog.RetentionHoldException.class, () -> catalog.tombstone(
+                archived.getIdAsLong(), generation.id(), "blocked integration delete", "TEST"));
+        assertThrows(ArchiveCatalog.RetentionHoldException.class,
+                () -> tiered.remove(archived));
+        assertNotNull(tiered.get(archived));
+        assertFalse(catalog.isTombstoned(archived.getIdAsLong()));
+
+        releaseRetentionHold(hold);
+        assertNotNull(tiered.remove(archived));
+        assertTrue(catalog.isTombstoned(archived.getIdAsLong()));
+    }
+
+    @Test
+    public void bulkRemoveSkipsHeldRowsIncludingHoldCommittedAfterMutationLocks() throws Exception {
+        TestableTieredStore tiered = (TestableTieredStore) postgisObsStore;
+        Instant start = Instant.parse("2026-02-02T14:00:00Z");
+        BigId stream = addSimpleDataStream(bigId(612), "gammaCounts");
+        List<BigId> keys = addSimpleObsWithoutResultTime(
+                stream, BigId.NONE, start, 3, 60_000).keySet().stream()
+                .sorted(Comparator.comparingLong(BigId::getIdAsLong))
+                .toList();
+        forceReadBackFromStorage();
+
+        UUID firstHold = insertRetentionHold(
+                "OBSERVATION", Long.toString(keys.get(0).getIdAsLong()), "HOT_EXACT");
+        AtomicReference<UUID> racingHold = new AtomicReference<>();
+        tiered.afterNextRemoveBatchLocked(() -> {
+            try {
+                racingHold.set(insertRetentionHold(
+                        "OBSERVATION", Long.toString(keys.get(1).getIdAsLong()), "HOT_EXACT"));
+            } catch (Exception error) {
+                throw new IllegalStateException(error);
+            }
+        });
+
+        assertEquals(1, tiered.removeEntries(new ObsFilter.Builder().build()));
+        assertNotNull(tiered.get(keys.get(0)));
+        assertNotNull(tiered.get(keys.get(1)));
+        assertTrue(tiered.get(keys.get(2)) == null);
+
+        releaseRetentionHold(firstHold);
+        releaseRetentionHold(racingHold.get());
+        assertEquals(2, tiered.removeEntries(new ObsFilter.Builder().build()));
+        assertEquals(0, tiered.getNumRecords());
+    }
+
+    @Test
+    public void heldGenerationUsesOneBoundedCandidateSnapshotPass() throws Exception {
+        TestableTieredStore tiered = (TestableTieredStore) postgisObsStore;
+        Instant start = Instant.parse("2026-02-02T14:30:00Z");
+        BigId stream = addSimpleDataStream(bigId(618), "gammaCounts");
+        addSimpleObsWithoutResultTime(stream, BigId.NONE, start, 513, 1_000);
+        List<BigId> removable = addSimpleObsWithoutResultTime(
+                stream, BigId.NONE, start.plus(2, ChronoUnit.HOURS), 2, 1_000)
+                .keySet().stream().toList();
+        forceReadBackFromStorage();
+
+        ArchiveGeneration generation = tiered.archiveWindow(
+                start, start.plus(1, ChronoUnit.HOURS), "RAW_GATED").orElseThrow();
+        UUID hold = insertRetentionHold(
+                "ARCHIVE_GENERATION", generation.id().toString(), "GENERATION_EXACT");
+        try {
+            tiered.beginRemovalPagingProbe();
+            assertEquals(2, tiered.removeEntries(new ObsFilter.Builder()
+                    .withDataStreams(stream)
+                    .build()));
+            tiered.endRemovalPagingProbe();
+
+            // A 513-row held prefix exceeds the normal 512-row page. The old
+            // growing-prefix algorithm selected it three or more times and
+            // retained every held ID. The bounded strategy performs one
+            // normal page plus one linear scratch snapshot, while every
+            // revalidation transaction remains capped at 512 candidates.
+            assertEquals(2, tiered.removalSelectionPasses());
+            assertEquals(3, tiered.removalBatchPasses());
+            assertTrue(tiered.maximumRemovalBatchSize() <= 512);
+            assertEquals(513, tiered.countMatchingEntries(new ObsFilter.Builder()
+                    .withDataStreams(stream)
+                    .build()));
+            for (BigId key : removable)
+                assertNull(tiered.get(key));
+        } finally {
+            tiered.endRemovalPagingProbe();
+            releaseRetentionHold(hold);
+        }
+    }
+
+    @Test
+    public void limitedRemovalBehindLargeHeldPrefixUsesFixedBatches() throws Exception {
+        TestableTieredStore tiered = (TestableTieredStore) postgisObsStore;
+        Instant start = Instant.parse("2026-02-02T17:30:00Z");
+        BigId stream = addSimpleDataStream(bigId(619), "gammaCounts");
+        addSimpleObsWithoutResultTime(stream, BigId.NONE, start, 1_025, 1_000);
+        List<BigId> removable = addSimpleObsWithoutResultTime(
+                stream, BigId.NONE, start.plus(2, ChronoUnit.HOURS), 2, 1_000)
+                .keySet().stream().toList();
+        forceReadBackFromStorage();
+
+        ArchiveGeneration generation = tiered.archiveWindow(
+                start, start.plus(1, ChronoUnit.HOURS), "RAW_GATED").orElseThrow();
+        UUID hold = insertRetentionHold(
+                "ARCHIVE_GENERATION", generation.id().toString(), "GENERATION_EXACT");
+        try {
+            tiered.beginRemovalPagingProbe();
+            assertEquals(1, tiered.removeEntries(new ObsFilter.Builder()
+                    .withDataStreams(stream)
+                    .withLimit(1)
+                    .build()));
+            tiered.endRemovalPagingProbe();
+
+            // The first one-row selection encounters a held row. The snapshot
+            // then advances through 1,025 held candidates in 512-row pages and
+            // removes exactly one later row. It must not open 1,026 one-row
+            // revalidation transactions merely because the delete limit is 1.
+            assertEquals(2, tiered.removalSelectionPasses());
+            assertEquals(4, tiered.removalBatchPasses());
+            assertEquals(512, tiered.maximumRemovalBatchSize());
+            assertEquals(1_026, tiered.countMatchingEntries(new ObsFilter.Builder()
+                    .withDataStreams(stream)
+                    .build()));
+            assertEquals(1, removable.stream().filter(key -> tiered.get(key) == null).count());
+        } finally {
+            tiered.endRemovalPagingProbe();
+            releaseRetentionHold(hold);
         }
     }
 
@@ -1445,6 +1933,206 @@ public class TestDisposableTieredPostgresIntegration extends TestPostgisObsStore
     }
 
     @Test
+    public void catalogMigrationPreservesUnknownLegacyObservationHoldProvenance() throws Exception {
+        TestableTieredStore tiered = (TestableTieredStore) postgisObsStore;
+        UUID generationHold = UUID.randomUUID();
+        UUID observationHold = UUID.randomUUID();
+        tiered.close();
+        try (Connection connection = open(); Statement statement = connection.createStatement()) {
+            connection.setAutoCommit(false);
+            statement.execute("DELETE FROM oscar_storage_schema_version WHERE version=5");
+            statement.execute("ALTER TABLE oscar_retention_hold DROP CONSTRAINT IF EXISTS " +
+                    "oscar_retention_hold_resolution_check");
+            statement.execute("ALTER TABLE oscar_retention_hold DROP COLUMN resolution_mode");
+            try (PreparedStatement insert = connection.prepareStatement(
+                    "INSERT INTO oscar_retention_hold(id,store_key,id_scope,subject_type," +
+                            "subject_id,reason,created_by) VALUES (?,?,?,?,?,'legacy test','migration')")) {
+                insert.setObject(1, generationHold);
+                insert.setString(2, TABLE);
+                insert.setInt(3, DATABASE_NUM);
+                insert.setString(4, "ARCHIVE_GENERATION");
+                insert.setString(5, UUID.randomUUID().toString());
+                assertEquals(1, insert.executeUpdate());
+                insert.setObject(1, observationHold);
+                insert.setString(4, "OBSERVATION");
+                insert.setString(5, "123456789");
+                assertEquals(1, insert.executeUpdate());
+            }
+            connection.commit();
+        }
+
+        tiered = new TestableTieredStore(url, DB_NAME, login, password, TABLE,
+                DATABASE_NUM, IdProviderType.SEQUENTIAL, archiveConfig);
+        postgisObsStore = tiered;
+        try (Connection connection = open(); PreparedStatement statement = connection.prepareStatement(
+                "SELECT id,resolution_mode FROM oscar_retention_hold WHERE id IN (?,?) ORDER BY id")) {
+            statement.setObject(1, generationHold);
+            statement.setObject(2, observationHold);
+            try (ResultSet result = statement.executeQuery()) {
+                Map<UUID, String> modes = new java.util.HashMap<>();
+                while (result.next())
+                    modes.put(result.getObject(1, UUID.class), result.getString(2));
+                assertEquals("GENERATION_EXACT", modes.get(generationHold));
+                assertEquals("LEGACY_UNKNOWN", modes.get(observationHold));
+            }
+        }
+    }
+
+    @Test
+    public void catalogMigrationCompactsLegacyBackupGenerationInventoryReceipt() throws Exception {
+        TestableTieredStore tiered = (TestableTieredStore) postgisObsStore;
+        UUID epochId = UUID.randomUUID();
+        tiered.close();
+        try (Connection connection = open(); Statement statement = connection.createStatement()) {
+            statement.execute("DELETE FROM oscar_storage_schema_version WHERE version=5");
+            statement.execute("ALTER TABLE oscar_backup_epoch " +
+                    "ADD COLUMN archive_generation_ids uuid[] NOT NULL DEFAULT '{}'");
+            statement.execute("ALTER TABLE oscar_backup_epoch " +
+                    "DROP COLUMN archive_generation_count, " +
+                    "DROP COLUMN archive_generation_inventory_sha256, " +
+                    "DROP COLUMN archive_generation_inventory_bytes");
+            statement.execute("INSERT INTO oscar_backup_epoch(" +
+                    "id,state,postgres_lsn,archive_generation_ids,manifest_path,sha256) VALUES ('" +
+                    epochId + "','VERIFIED','0/ABC',ARRAY[" +
+                    "'22222222-2222-4222-8222-222222222222'::uuid," +
+                    "'11111111-1111-4111-8111-111111111111'::uuid]," +
+                    "'backup/epoch.json',repeat('a',64))");
+        }
+
+        tiered = new TestableTieredStore(url, DB_NAME, login, password, TABLE,
+                DATABASE_NUM, IdProviderType.SEQUENTIAL, archiveConfig);
+        postgisObsStore = tiered;
+        assertEquals(5, ArchiveCatalog.SCHEMA_VERSION);
+        assertEquals("sha256:b37753a17c972d57418545c05a2544068affc7804b8622db3a0f0c4b422c63b5",
+                ArchiveCatalog.SCHEMA_CHECKSUM);
+        try (Connection connection = open(); Statement statement = connection.createStatement()) {
+            try (ResultSet result = statement.executeQuery(
+                    "SELECT archive_generation_count,archive_generation_inventory_sha256," +
+                            "archive_generation_inventory_bytes,postgres_lsn::text,manifest_path,sha256 " +
+                            "FROM oscar_backup_epoch WHERE id='" +
+                            epochId + "'")) {
+                assertTrue(result.next());
+                assertEquals(2L, result.getLong(1));
+                assertEquals("be2001bca1476f8f8480dd7db6264be12c94cb7be24332f370976c1ebc46e729",
+                        result.getString(2));
+                assertEquals(74L, result.getLong(3));
+                assertEquals("0/ABC", result.getString(4));
+                assertEquals("backup/epoch.json", result.getString(5));
+                assertEquals("a".repeat(64), result.getString(6));
+            }
+            try (ResultSet result = statement.executeQuery(
+                    "SELECT count(*) FROM information_schema.columns " +
+                            "WHERE table_name='oscar_backup_epoch' " +
+                            "AND column_name='archive_generation_ids'")) {
+                assertTrue(result.next());
+                assertEquals(0L, result.getLong(1));
+            }
+            try (ResultSet result = statement.executeQuery(
+                    "SELECT column_name,is_nullable FROM information_schema.columns " +
+                            "WHERE table_name='oscar_backup_epoch' AND column_name IN (" +
+                            "'archive_generation_count','archive_generation_inventory_sha256'," +
+                            "'archive_generation_inventory_bytes') ORDER BY column_name")) {
+                List<String> columns = new ArrayList<>();
+                while (result.next()) {
+                    columns.add(result.getString(1));
+                    assertEquals("NO", result.getString(2));
+                }
+                assertEquals(List.of("archive_generation_count",
+                        "archive_generation_inventory_bytes",
+                        "archive_generation_inventory_sha256"), columns);
+            }
+            try (ResultSet result = statement.executeQuery(
+                    "SELECT conname FROM pg_constraint WHERE conrelid='oscar_backup_epoch'::regclass " +
+                            "AND conname LIKE 'oscar_backup_epoch_archive_generation_%_check' " +
+                            "ORDER BY conname")) {
+                List<String> constraints = new ArrayList<>();
+                while (result.next())
+                    constraints.add(result.getString(1));
+                assertEquals(List.of(
+                        "oscar_backup_epoch_archive_generation_count_check",
+                        "oscar_backup_epoch_archive_generation_inventory_bytes_check",
+                        "oscar_backup_epoch_archive_generation_inventory_sha256_check"), constraints);
+            }
+            String validHash = "'" + "0".repeat(64) + "'";
+            assertThrows(SQLException.class, () -> statement.execute(
+                    "INSERT INTO oscar_backup_epoch(id,state,archive_generation_count," +
+                            "archive_generation_inventory_sha256,archive_generation_inventory_bytes) VALUES (" +
+                            "'" + UUID.randomUUID() + "','CREATED',-1," + validHash + ",0)"));
+            assertThrows(SQLException.class, () -> statement.execute(
+                    "INSERT INTO oscar_backup_epoch(id,state,archive_generation_count," +
+                            "archive_generation_inventory_sha256,archive_generation_inventory_bytes) VALUES (" +
+                            "'" + UUID.randomUUID() + "','CREATED',1000001," + validHash + ",37000037)"));
+            assertThrows(SQLException.class, () -> statement.execute(
+                    "INSERT INTO oscar_backup_epoch(id,state,archive_generation_count," +
+                            "archive_generation_inventory_sha256,archive_generation_inventory_bytes) VALUES (" +
+                            "'" + UUID.randomUUID() + "','CREATED',0,repeat('A',64),0)"));
+            assertThrows(SQLException.class, () -> statement.execute(
+                    "INSERT INTO oscar_backup_epoch(id,state,archive_generation_count," +
+                            "archive_generation_inventory_sha256,archive_generation_inventory_bytes) VALUES (" +
+                            "'" + UUID.randomUUID() + "','CREATED',0," + validHash + ",-1)"));
+            assertThrows(SQLException.class, () -> statement.execute(
+                    "INSERT INTO oscar_backup_epoch(id,state,archive_generation_count," +
+                            "archive_generation_inventory_sha256,archive_generation_inventory_bytes) VALUES (" +
+                            "'" + UUID.randomUUID() + "','CREATED',1," + validHash + ",36)"));
+            assertEquals(1, statement.executeUpdate(
+                    "INSERT INTO oscar_backup_epoch(id,state,archive_generation_count," +
+                            "archive_generation_inventory_sha256,archive_generation_inventory_bytes) VALUES (" +
+                            "'" + UUID.randomUUID() + "','CREATED',1000000," + validHash + ",37000000)"));
+        }
+    }
+
+    @Test
+    public void catalogMigrationRejectsFutureSchemaVersion() throws Exception {
+        TestableTieredStore tiered = (TestableTieredStore) postgisObsStore;
+        try (Connection connection = open(); PreparedStatement statement = connection.prepareStatement(
+                "INSERT INTO oscar_storage_schema_version(version,checksum) VALUES (6,?)")) {
+            statement.setString(1, "future-test-checksum");
+            assertEquals(1, statement.executeUpdate());
+        }
+        tiered.close();
+        assertThrows(IllegalStateException.class, () -> new TestableTieredStore(
+                url, DB_NAME, login, password, TABLE, DATABASE_NUM,
+                IdProviderType.SEQUENTIAL, archiveConfig));
+        try (Connection connection = open(); Statement statement = connection.createStatement()) {
+            assertEquals(1, statement.executeUpdate(
+                    "DELETE FROM oscar_storage_schema_version WHERE version=6"));
+        }
+        tiered = new TestableTieredStore(url, DB_NAME, login, password, TABLE,
+                DATABASE_NUM, IdProviderType.SEQUENTIAL, archiveConfig);
+        postgisObsStore = tiered;
+    }
+
+    @Test
+    public void catalogMigrationRejectsTamperedPriorSchemaChecksum() throws Exception {
+        TestableTieredStore tiered = (TestableTieredStore) postgisObsStore;
+        tiered.close();
+        try (Connection connection = open(); Statement statement = connection.createStatement()) {
+            statement.execute("DELETE FROM oscar_storage_schema_version WHERE version=5");
+            statement.execute("INSERT INTO oscar_storage_schema_version(version,checksum) " +
+                    "VALUES (4,'tampered-v4') ON CONFLICT(version) DO UPDATE SET checksum=excluded.checksum");
+        }
+
+        assertThrows(IllegalStateException.class, () -> new TestableTieredStore(
+                url, DB_NAME, login, password, TABLE, DATABASE_NUM,
+                IdProviderType.SEQUENTIAL, archiveConfig));
+        try (Connection connection = open(); Statement statement = connection.createStatement()) {
+            assertEquals(0L, queryLong(connection,
+                    "SELECT count(*) FROM oscar_storage_schema_version WHERE version=5"));
+            statement.execute("UPDATE oscar_storage_schema_version SET checksum=" +
+                    "'sha256:7aa2b6dd22cbed4499eb9fb16966323bbf90d14bff4d35e03a1670868fb2f8e8' " +
+                    "WHERE version=4");
+        }
+        tiered = new TestableTieredStore(url, DB_NAME, login, password, TABLE,
+                DATABASE_NUM, IdProviderType.SEQUENTIAL, archiveConfig);
+        postgisObsStore = tiered;
+        try (Connection connection = open(); Statement statement = connection.createStatement()) {
+            assertEquals(1L, queryLong(connection,
+                    "SELECT count(*) FROM oscar_storage_schema_version WHERE version=5"));
+            statement.execute("DELETE FROM oscar_storage_schema_version WHERE version=4");
+        }
+    }
+
+    @Test
     public void archiveCatalogNamespacesIndependentObservationStores() throws Exception {
         String secondTable = TABLE + "_second";
         int secondScope = DATABASE_NUM + 100;
@@ -1502,9 +2190,16 @@ public class TestDisposableTieredPostgresIntegration extends TestPostgisObsStore
             assertEquals(0, firstCatalog.countTieredRecords(TABLE));
             assertEquals(1, secondCatalog.countTieredRecords(secondTable));
         } finally {
-            second.drop();
-            ((PostgisDataStreamStoreImpl) second.getDataStreams()).drop();
+            second.close();
+            dropDisposableTieredTables(secondTable);
             ((PostgisDataStreamStoreImpl) second.getDataStreams()).clearCache();
+        }
+    }
+
+    private void dropDisposableTieredTables(String observationTable) throws Exception {
+        try (Connection connection = open(); Statement statement = connection.createStatement()) {
+            statement.execute("DROP TABLE IF EXISTS " + observationTable);
+            statement.execute("DROP TABLE IF EXISTS " + observationTable + "_datastreams");
         }
     }
 
@@ -1661,6 +2356,12 @@ public class TestDisposableTieredPostgresIntegration extends TestPostgisObsStore
     private static final class TestableTieredStore extends OscarTieredObsStore {
         private Runnable beforeRemoveBatch;
         private Runnable afterRemoveBatchLocked;
+        private boolean probeRemovalPaging;
+        private int removalSelectionPasses;
+        private int removalBatchPasses;
+        private int maximumRemovalBatchSize;
+        private int failBeforeRemoveBatch;
+        private int removeBatchOrdinal;
 
         TestableTieredStore(String url, String dbName, String login, String password, String dataStoreName,
                             int idScope, IdProviderType idProviderType, TieredArchiveConfig config) {
@@ -1679,8 +2380,61 @@ public class TestDisposableTieredPostgresIntegration extends TestPostgisObsStore
             connectionManager.setMaximumPoolSize(maximumPoolSize);
         }
 
+        void limitDataStreamPool(int maximumPoolSize) {
+            ((PostgisDataStreamStoreImpl) getDataStreams())
+                    .setMaximumPoolSize(maximumPoolSize);
+        }
+
+        void beginRemovalPagingProbe() {
+            removalSelectionPasses = 0;
+            removalBatchPasses = 0;
+            maximumRemovalBatchSize = 0;
+            probeRemovalPaging = true;
+        }
+
+        void failBeforeRemoveBatch(int ordinal) {
+            if (ordinal < 1)
+                throw new IllegalArgumentException("Removal batch ordinal must be positive");
+            failBeforeRemoveBatch = ordinal;
+            removeBatchOrdinal = 0;
+        }
+
+        void endRemovalPagingProbe() {
+            probeRemovalPaging = false;
+        }
+
+        int removalSelectionPasses() {
+            return removalSelectionPasses;
+        }
+
+        int removalBatchPasses() {
+            return removalBatchPasses;
+        }
+
+        int maximumRemovalBatchSize() {
+            return maximumRemovalBatchSize;
+        }
+
+        @Override
+        public Stream<Map.Entry<BigId, org.sensorhub.api.data.IObsData>> selectEntries(
+                ObsFilter filter, Set<IObsStore.ObsField> fields) {
+            if (probeRemovalPaging)
+                removalSelectionPasses++;
+            return super.selectEntries(filter, fields);
+        }
+
         @Override
         protected void beforeRemoveBatchRevalidation(List<BigId> candidateIds) {
+            removeBatchOrdinal++;
+            if (removeBatchOrdinal == failBeforeRemoveBatch) {
+                failBeforeRemoveBatch = 0;
+                throw new IllegalStateException("Injected child-removal batch failure");
+            }
+            if (probeRemovalPaging) {
+                removalBatchPasses++;
+                maximumRemovalBatchSize = Math.max(
+                        maximumRemovalBatchSize, candidateIds.size());
+            }
             Runnable action = beforeRemoveBatch;
             beforeRemoveBatch = null;
             if (action != null)
@@ -1707,12 +2461,26 @@ public class TestDisposableTieredPostgresIntegration extends TestPostgisObsStore
         }
     }
 
-    private void assertCatalogV4AndActivation(ArchiveGeneration generation) throws Exception {
+    private void assertCatalogV5AndActivation(ArchiveGeneration generation) throws Exception {
         try (Connection connection = open(); Statement statement = connection.createStatement()) {
             try (ResultSet result = statement.executeQuery(
-                    "SELECT checksum FROM oscar_storage_schema_version WHERE version=4")) {
+                    "SELECT checksum FROM oscar_storage_schema_version WHERE version=5")) {
                 assertTrue(result.next());
                 assertEquals(ArchiveCatalog.SCHEMA_CHECKSUM, result.getString(1));
+            }
+            try (ResultSet result = statement.executeQuery(
+                    "SELECT is_nullable, column_default FROM information_schema.columns " +
+                            "WHERE table_name='oscar_retention_hold' AND column_name='resolution_mode'")) {
+                assertTrue(result.next());
+                assertEquals("NO", result.getString(1));
+                assertNull(result.getString(2));
+            }
+            try (ResultSet result = statement.executeQuery(
+                    "SELECT pg_get_constraintdef(oid) FROM pg_constraint " +
+                            "WHERE conrelid='oscar_retention_hold'::regclass " +
+                            "AND conname='oscar_retention_hold_resolution_check'")) {
+                assertTrue(result.next());
+                assertTrue(result.getString(1).contains("LEGACY_UNKNOWN"));
             }
             try (ResultSet result = statement.executeQuery(
                     "SELECT column_name, is_nullable FROM information_schema.columns " +
@@ -1853,6 +2621,47 @@ public class TestDisposableTieredPostgresIntegration extends TestPostgisObsStore
                 assertTrue(result.next());
                 return result.getObject(1, UUID.class);
             }
+        }
+    }
+
+    private UUID insertRetentionHold(String subjectType, String subjectId,
+                                     String resolutionMode) throws Exception {
+        UUID id = UUID.randomUUID();
+        try (Connection connection = open()) {
+            connection.setAutoCommit(false);
+            try (Statement lock = connection.createStatement()) {
+                lock.execute("LOCK TABLE oscar_retention_hold IN SHARE ROW EXCLUSIVE MODE");
+            }
+            try (PreparedStatement statement = connection.prepareStatement(
+                    "INSERT INTO oscar_retention_hold(id, store_key, id_scope, subject_type, " +
+                            "subject_id, resolution_mode, reason, created_by) " +
+                            "VALUES (?, ?, ?, ?, ?, ?, 'integration hold', 'codex-integration')")) {
+                statement.setObject(1, id);
+                statement.setString(2, TABLE);
+                statement.setInt(3, DATABASE_NUM);
+                statement.setString(4, subjectType);
+                statement.setString(5, subjectId);
+                statement.setString(6, resolutionMode);
+                assertEquals(1, statement.executeUpdate());
+            }
+            connection.commit();
+        }
+        return id;
+    }
+
+    private void releaseRetentionHold(UUID id) throws Exception {
+        try (Connection connection = open()) {
+            connection.setAutoCommit(false);
+            try (Statement lock = connection.createStatement()) {
+                lock.execute("LOCK TABLE oscar_retention_hold IN SHARE ROW EXCLUSIVE MODE");
+            }
+            try (PreparedStatement statement = connection.prepareStatement(
+                    "UPDATE oscar_retention_hold SET released_at=now(), released_by='codex-integration' " +
+                            "WHERE id=? AND released_at IS NULL")) {
+                statement.setObject(1, id);
+                assertEquals(1, statement.executeUpdate());
+            }
+            connection.commit();
         }
     }
 

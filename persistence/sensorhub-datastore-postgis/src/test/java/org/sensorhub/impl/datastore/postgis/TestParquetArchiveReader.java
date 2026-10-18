@@ -10,10 +10,14 @@ import org.sensorhub.api.datastore.obs.ObsFilter;
 import org.sensorhub.impl.datastore.postgis.archive.ArchiveExporter;
 import org.sensorhub.impl.datastore.postgis.archive.ArchiveGeneration;
 import org.sensorhub.impl.datastore.postgis.archive.ParquetArchiveReader;
+import org.sensorhub.impl.datastore.postgis.archive.TieredArchiveConfig;
 import org.sensorhub.impl.datastore.postgis.archive.UtcJdbcTime;
 
 import java.nio.file.Path;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
+import java.nio.file.attribute.PosixFileAttributeView;
+import java.nio.file.attribute.PosixFilePermissions;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.PreparedStatement;
@@ -24,6 +28,7 @@ import java.util.UUID;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertThrows;
+import static org.junit.Assert.assertTrue;
 
 public class TestParquetArchiveReader {
     @Rule
@@ -299,6 +304,78 @@ public class TestParquetArchiveReader {
         assertEquals(1, limitedRows.count());
         assertEquals(0, reader.getOpenCursorCount());
         limitedRows.close();
+    }
+
+    @Test
+    public void cursorCloseReportsSpillCleanupFailure() throws Exception {
+        Path root = temporary.newFolder("cleanup-failure-archive").toPath();
+        Path spillRoot = temporary.newFolder("cleanup-failure-spill").toPath();
+        if (Files.getFileAttributeView(
+                spillRoot, PosixFileAttributeView.class, LinkOption.NOFOLLOW_LINKS) == null)
+            return;
+        Files.setPosixFilePermissions(spillRoot, PosixFilePermissions.fromString("rwx------"));
+        ArchiveGeneration generation = writeGeneration(root, "cleanup-failure.parquet", new TestRow[]{
+                new TestRow(1, 10, "2026-01-01T00:01:00Z")
+        });
+        TieredArchiveConfig config = new TieredArchiveConfig();
+        config.rootDirectory = root.toString();
+        config.duckDbTemporaryDirectory = spillRoot.toString();
+        ParquetArchiveReader reader = new ParquetArchiveReader(root, config);
+        var rows = reader.stream(List.of(generation), new ObsFilter.Builder().build(),
+                null, null, Long.MAX_VALUE);
+
+        assertEquals(1, reader.getOpenCursorCount());
+        Files.setPosixFilePermissions(spillRoot, PosixFilePermissions.fromString("r-x------"));
+        try {
+            IllegalStateException failure = assertThrows(IllegalStateException.class, rows::close);
+            assertTrue(failure.getMessage().contains("Cannot close archive query resources"));
+            assertEquals(0, reader.getOpenCursorCount());
+        } finally {
+            Files.setPosixFilePermissions(spillRoot, PosixFilePermissions.fromString("rwx------"));
+        }
+    }
+
+    @Test
+    public void decodingFailureKeepsCleanupFailureSuppressed() throws Exception {
+        Path root = temporary.newFolder("decode-cleanup-archive").toPath();
+        Path spillRoot = temporary.newFolder("decode-cleanup-spill").toPath();
+        if (Files.getFileAttributeView(
+                spillRoot, PosixFileAttributeView.class, LinkOption.NOFOLLOW_LINKS) == null)
+            return;
+        Files.setPosixFilePermissions(spillRoot, PosixFilePermissions.fromString("rwx------"));
+        Path object = root.resolve("malformed.parquet");
+        try (Connection duck = DriverManager.getConnection("jdbc:duckdb:");
+             Statement statement = duck.createStatement()) {
+            statement.execute("CREATE TABLE rows (id_scope VARCHAR, id_value BIGINT, " +
+                    "datastream_scope INTEGER, datastream_id BIGINT, foi_scope INTEGER, foi_id BIGINT, " +
+                    "phenomenon_time TIMESTAMP, result_time TIMESTAMP, result_json VARCHAR, " +
+                    "archive_version INTEGER, profile VARCHAR)");
+            statement.execute("INSERT INTO rows VALUES ('not-an-integer', 1, 4, 10, NULL, NULL, " +
+                    "TIMESTAMP '2026-01-01 00:01:00', TIMESTAMP '2026-01-01 00:01:00', " +
+                    "'{\"value\":1}', 1, 'RAW_GATED')");
+            statement.execute("COPY rows TO '" + object.toString().replace("'", "''") +
+                    "' (FORMAT PARQUET, COMPRESSION ZSTD)");
+        }
+        ArchiveGeneration generation = new ArchiveGeneration(UUID.randomUUID(), "RAW_GATED",
+                Instant.parse("2026-01-01T00:00:00Z"), Instant.parse("2026-01-01T01:00:00Z"),
+                root.relativize(object), ArchiveExporter.sha256(object), 1, 1, 1, "ACTIVE", true);
+        TieredArchiveConfig config = new TieredArchiveConfig();
+        config.rootDirectory = root.toString();
+        config.duckDbTemporaryDirectory = spillRoot.toString();
+        ParquetArchiveReader reader = new ParquetArchiveReader(root, config);
+        var rows = reader.stream(List.of(generation), new ObsFilter.Builder().build(),
+                null, null, Long.MAX_VALUE);
+
+        Files.setPosixFilePermissions(spillRoot, PosixFilePermissions.fromString("r-x------"));
+        try {
+            IllegalStateException failure = assertThrows(IllegalStateException.class, rows::findFirst);
+            assertTrue(failure.getMessage().contains("Cannot decode archived observation"));
+            assertTrue(java.util.Arrays.stream(failure.getCause().getSuppressed())
+                    .anyMatch(cleanup -> cleanup.getMessage().contains("Cannot close archive query resources")));
+            assertEquals(0, reader.getOpenCursorCount());
+        } finally {
+            Files.setPosixFilePermissions(spillRoot, PosixFilePermissions.fromString("rwx------"));
+        }
     }
 
     @Test

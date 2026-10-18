@@ -29,6 +29,12 @@ public class TestTieredArchiveConfiguration {
         assertTrue(config.maximumGenerationsPerCycle > 1);
         assertTrue(config.maximumCycleMinutes > 0);
         assertTrue(config.maximumUncompressedBytesPerGeneration > 0);
+        assertTrue(config.duckDbMemoryLimitMegabytes >= 16);
+        assertTrue(config.duckDbThreads > 0);
+        assertTrue(config.duckDbMaximumTemporaryMegabytes >= 16);
+        assertTrue(config.duckDbMaximumConcurrentSessions > 0);
+        assertTrue(config.duckDbSessionAcquireTimeoutSeconds > 0);
+        assertFalse(config.duckDbTemporaryDirectory.isBlank());
         assertTrue(config.outputNames.contains("gammaCounts"));
         assertFalse(config.outputNames.contains("occupancy"));
     }
@@ -44,6 +50,53 @@ public class TestTieredArchiveConfiguration {
     public void archivePayloadByteCapCannotBeDisabled() {
         TieredArchiveConfig config = new TieredArchiveConfig();
         config.maximumUncompressedBytesPerGeneration = 0;
+        assertThrows(IllegalArgumentException.class, config::validate);
+    }
+
+    @Test
+    public void duckDbResourceCapsCannotBeDisabled() {
+        TieredArchiveConfig config = new TieredArchiveConfig();
+        config.duckDbMemoryLimitMegabytes = 0;
+        assertThrows(IllegalArgumentException.class, config::validate);
+        config.duckDbMemoryLimitMegabytes = 256;
+        config.duckDbThreads = 0;
+        assertThrows(IllegalArgumentException.class, config::validate);
+        config.duckDbThreads = 2;
+        config.duckDbMaximumTemporaryMegabytes = 0;
+        assertThrows(IllegalArgumentException.class, config::validate);
+        config.duckDbMaximumTemporaryMegabytes = 4096;
+        config.duckDbMaximumConcurrentSessions = 0;
+        assertThrows(IllegalArgumentException.class, config::validate);
+        config.duckDbMaximumConcurrentSessions = 2;
+        config.duckDbSessionAcquireTimeoutSeconds = 0;
+        assertThrows(IllegalArgumentException.class, config::validate);
+        config.duckDbSessionAcquireTimeoutSeconds = 30;
+        config.duckDbTemporaryDirectory = "";
+        assertThrows(IllegalArgumentException.class, config::validate);
+    }
+
+    @Test
+    public void duckDbScratchInsidePersistedStateMustUseReservedExcludedPath() {
+        TieredArchiveConfig config = new TieredArchiveConfig();
+        config.validate();
+
+        config.duckDbTemporaryDirectory = "/var/lib/oscar/other-scratch";
+        assertThrows(IllegalArgumentException.class, config::validate);
+        config.duckDbTemporaryDirectory = "/var/lib/oscar/../oscar/duckdb-tmp/child";
+        assertThrows(IllegalArgumentException.class, config::validate);
+
+        config.duckDbTemporaryDirectory = "/srv/oscar-duckdb-tmp";
+        config.validate();
+    }
+
+    @Test
+    public void duckDbScratchAndArchiveRootsMustBeDisjoint() {
+        TieredArchiveConfig config = new TieredArchiveConfig();
+        config.rootDirectory = "/srv/oscar-archive";
+        config.duckDbTemporaryDirectory = "/srv/oscar-archive/duckdb-tmp";
+        assertThrows(IllegalArgumentException.class, config::validate);
+
+        config.duckDbTemporaryDirectory = "/srv";
         assertThrows(IllegalArgumentException.class, config::validate);
     }
 

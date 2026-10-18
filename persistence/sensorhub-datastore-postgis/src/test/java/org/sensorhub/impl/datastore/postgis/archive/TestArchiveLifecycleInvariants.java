@@ -11,9 +11,12 @@ import java.sql.Array;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.sql.Statement;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
@@ -41,6 +44,22 @@ public class TestArchiveLifecycleInvariants {
         assertEquals(1, ArchiveCatalog.nextRevision(0));
         assertEquals(42, ArchiveCatalog.nextRevision(41));
         assertThrows(ArithmeticException.class, () -> ArchiveCatalog.nextRevision(Integer.MAX_VALUE));
+    }
+
+    @Test
+    public void legacyBackupInventoryMigrationEnforcesCanonicalLauncherBounds() throws Exception {
+        ArchiveCatalog.requireBackupGenerationInventoryBounds(0, 0);
+        ArchiveCatalog.requireBackupGenerationInventoryBounds(1_000_000, 37_000_000);
+
+        SQLException tooMany = assertThrows(SQLException.class,
+                () -> ArchiveCatalog.requireBackupGenerationInventoryBounds(1_000_001, 37_000_037));
+        assertTrue(tooMany.getMessage().contains("1,000,000-entry migration limit"));
+        SQLException tooLarge = assertThrows(SQLException.class,
+                () -> ArchiveCatalog.requireBackupGenerationInventoryBounds(1_000_000, 37_000_001));
+        assertTrue(tooLarge.getMessage().contains("37,000,000-byte migration limit"));
+        SQLException noncanonical = assertThrows(SQLException.class,
+                () -> ArchiveCatalog.requireBackupGenerationInventoryBounds(1, 36));
+        assertTrue(noncanonical.getMessage().contains("canonical UUID-line form"));
     }
 
     @Test
@@ -102,6 +121,64 @@ public class TestArchiveLifecycleInvariants {
     }
 
     @Test
+    public void removalHoldSnapshotIsSetBasedScopedAndUsesCallerTransaction() throws Exception {
+        List<String> sql = new ArrayList<>();
+        AtomicReference<List<Long>> boundIds = new AtomicReference<>();
+        AtomicBoolean arrayFreed = new AtomicBoolean();
+        UUID generation = UUID.randomUUID();
+
+        Array array = (Array) Proxy.newProxyInstance(getClass().getClassLoader(),
+                new Class<?>[]{Array.class}, (proxy, method, arguments) -> {
+                    if (method.getName().equals("free")) {
+                        arrayFreed.set(true);
+                        return null;
+                    }
+                    return defaultValue(method.getReturnType());
+                });
+        Statement lock = (Statement) Proxy.newProxyInstance(getClass().getClassLoader(),
+                new Class<?>[]{Statement.class}, (proxy, method, arguments) -> {
+                    if (method.getName().equals("execute")) {
+                        sql.add((String) arguments[0]);
+                        return true;
+                    }
+                    return defaultValue(method.getReturnType());
+                });
+        Connection connection = (Connection) Proxy.newProxyInstance(getClass().getClassLoader(),
+                new Class<?>[]{Connection.class}, (proxy, method, arguments) -> switch (method.getName()) {
+                    case "getAutoCommit" -> false;
+                    case "createStatement" -> lock;
+                    case "createArrayOf" -> {
+                        assertEquals("bigint", arguments[0]);
+                        boundIds.set(java.util.Arrays.stream((Object[]) arguments[1])
+                                .map(value -> (Long) value).toList());
+                        yield array;
+                    }
+                    case "prepareStatement" -> {
+                        sql.add((String) arguments[0]);
+                        yield holdSnapshotStatement(generation);
+                    }
+                    default -> defaultValue(method.getReturnType());
+                });
+
+        ArchiveCatalog catalog = new ArchiveCatalog(
+                () -> { throw new AssertionError("provider must not be used"); }, "hold_probe", 9);
+        ArchiveCatalog.ActiveRemovalHolds holds = catalog.lockActiveRemovalHolds(
+                connection, List.of(12L, 11L, 11L));
+
+        assertEquals(List.of(11L, 12L), boundIds.get());
+        assertTrue(sql.get(0).contains("LOCK TABLE oscar_retention_hold IN SHARE MODE"));
+        assertTrue(sql.get(1).contains("WITH requested(id)"));
+        assertTrue(sql.get(1).contains("oscar_archive_id_block"));
+        assertTrue(sql.get(1).contains("requested.id BETWEEN block.min_id AND block.max_id"));
+        assertEquals(Set.of(11L), holds.observationIds());
+        assertEquals(Set.of(generation), holds.generationIds());
+        assertTrue(holds.blocks(11L, null));
+        assertTrue(holds.blocks(12L, generation));
+        assertFalse(holds.blocks(12L, UUID.randomUUID()));
+        assertTrue(arrayFreed.get());
+    }
+
+    @Test
     public void lifecycleRejectsSymbolicLinkArchiveObjects() throws Exception {
         Path root = temporary.newFolder("archive-root").toPath();
         Path outside = temporary.newFile("outside.parquet").toPath();
@@ -136,6 +213,24 @@ public class TestArchiveLifecycleInvariants {
                                         });
                     }
                     default -> defaultValue(method.getReturnType());
+                });
+    }
+
+    private PreparedStatement holdSnapshotStatement(UUID generation) {
+        return (PreparedStatement) Proxy.newProxyInstance(getClass().getClassLoader(),
+                new Class<?>[]{PreparedStatement.class}, (proxy, method, arguments) -> {
+                    if (!method.getName().equals("executeQuery"))
+                        return defaultValue(method.getReturnType());
+                    AtomicInteger row = new AtomicInteger(-1);
+                    String[][] values = {{"OBSERVATION", "11"},
+                            {"ARCHIVE_GENERATION", generation.toString()}};
+                    return Proxy.newProxyInstance(getClass().getClassLoader(),
+                            new Class<?>[]{ResultSet.class}, (resultProxy, resultMethod, resultArguments) ->
+                                    switch (resultMethod.getName()) {
+                                        case "next" -> row.incrementAndGet() < values.length;
+                                        case "getString" -> values[row.get()][(int) resultArguments[0] - 1];
+                                        default -> defaultValue(resultMethod.getReturnType());
+                                    });
                 });
     }
 

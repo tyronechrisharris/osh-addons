@@ -8,7 +8,6 @@ import java.nio.file.Path;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.security.MessageDigest;
 import java.sql.Connection;
-import java.sql.DriverManager;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.Statement;
@@ -59,8 +58,8 @@ public final class ArchiveLifecycleManager {
 
             MessageDigest archiveDigest = MessageDigest.getInstance("SHA-256");
             MessageDigest hotDigest = MessageDigest.getInstance("SHA-256");
-            try (Connection duck = DriverManager.getConnection("jdbc:duckdb:");
-                 PreparedStatement archived = duck.prepareStatement(
+            try (DuckDbResourcePolicy.Session duckSession = DuckDbResourcePolicy.open(config, "parity-verify");
+                 PreparedStatement archived = duckSession.connection().prepareStatement(
                          "SELECT id_value, datastream_id, foi_id, phenomenon_time, result_time, result_json " +
                                  "FROM read_parquet('" + sqlLiteral(parquet.toString()) + "') ORDER BY id_value");
                  ResultSet rows = archived.executeQuery()) {
@@ -125,8 +124,8 @@ public final class ArchiveLifecycleManager {
         }
         long deleted = 0;
         long deferredHolds = 0;
-        try (Connection duck = DriverManager.getConnection("jdbc:duckdb:");
-             PreparedStatement archived = duck.prepareStatement(
+        try (DuckDbResourcePolicy.Session duckSession = DuckDbResourcePolicy.open(config, "hot-delete");
+             PreparedStatement archived = duckSession.connection().prepareStatement(
                      "SELECT id_value FROM read_parquet('" + sqlLiteral(parquet.toString()) + "') ORDER BY id_value");
              ResultSet rows = archived.executeQuery()) {
             List<Long> batch = new ArrayList<>(config.deleteBatchSize);

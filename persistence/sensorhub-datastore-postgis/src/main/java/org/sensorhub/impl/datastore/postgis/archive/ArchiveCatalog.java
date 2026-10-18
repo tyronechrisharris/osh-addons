@@ -5,9 +5,11 @@ import org.sensorhub.api.common.BigId;
 import org.sensorhub.api.datastore.TemporalFilter;
 import org.sensorhub.api.datastore.obs.ObsFilter;
 
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.sql.Connection;
-import java.sql.DriverManager;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
@@ -18,6 +20,7 @@ import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashSet;
+import java.util.HexFormat;
 import java.util.Iterator;
 import java.util.List;
 import java.util.NoSuchElementException;
@@ -40,14 +43,20 @@ import java.util.stream.StreamSupport;
  * recoverable and prevents a partial file from becoming query-visible.</p>
  */
 public final class ArchiveCatalog {
-    public static final int SCHEMA_VERSION = 4;
+    public static final int SCHEMA_VERSION = 5;
     public static final String SCHEMA_CHECKSUM =
+            "sha256:b37753a17c972d57418545c05a2544068affc7804b8622db3a0f0c4b422c63b5";
+    private static final int PREVIOUS_SCHEMA_VERSION = 4;
+    private static final String PREVIOUS_SCHEMA_CHECKSUM =
             "sha256:7aa2b6dd22cbed4499eb9fb16966323bbf90d14bff4d35e03a1670868fb2f8e8";
+    static final long MAX_BACKUP_ARCHIVE_GENERATIONS = 1_000_000L;
+    static final long MAX_BACKUP_ARCHIVE_GENERATION_INVENTORY_BYTES = 37_000_000L;
     private static final long MIGRATION_LOCK = 0x4f5343415253544fL;
 
     private final SqlConnectionProvider connections;
     private final String storeKey;
     private final int idScope;
+    private final TieredArchiveConfig resourceConfig;
     private final AtomicInteger openOverlayCursors = new AtomicInteger();
     private final AtomicLong overlayRowsRead = new AtomicLong();
 
@@ -56,8 +65,8 @@ public final class ArchiveCatalog {
      *
      *  1. shared store mutation lock;
      *  2. observation locks in ascending numeric ID order;
-     *  3. hot observation row, overlay row, then tombstone/generation rows;
-     *  4. the retention-hold table, when lifecycle deletion needs it.
+     *  3. the retention-hold table in SHARE mode for a removal;
+     *  4. hot observation row, overlay row, then tombstone/generation rows.
      *
      * Archive activation takes the exclusive form of the store lock before it
      * marks hot rows.  It never takes an observation lock.  Consequently it
@@ -74,9 +83,22 @@ public final class ArchiveCatalog {
     }
 
     public ArchiveCatalog(SqlConnectionProvider connections, String storeKey, int idScope) {
+        this(connections, storeKey, idScope, defaultResourceConfig());
+    }
+
+    public ArchiveCatalog(SqlConnectionProvider connections, String storeKey, int idScope,
+                          TieredArchiveConfig resourceConfig) {
         this.connections = connections;
         this.storeKey = safeIdentifier(storeKey);
         this.idScope = idScope;
+        this.resourceConfig = java.util.Objects.requireNonNull(resourceConfig, "resourceConfig");
+    }
+
+    private static TieredArchiveConfig defaultResourceConfig() {
+        TieredArchiveConfig config = new TieredArchiveConfig();
+        config.duckDbTemporaryDirectory = Path.of(
+                System.getProperty("java.io.tmpdir"), "oscar-duckdb-test").toString();
+        return config;
     }
 
     public String storeKey() {
@@ -132,6 +154,93 @@ public final class ArchiveCatalog {
         }
     }
 
+    /**
+     * Serializes a logical removal with retention-hold creation/release and
+     * returns the active exact observation and generation holds relevant to a
+     * bounded mutation batch. The caller must already own the store/per-ID
+     * mutation locks and must keep this transaction open through the mutation.
+     */
+    public ActiveRemovalHolds lockActiveRemovalHolds(Connection connection,
+                                                     Collection<Long> observationIds)
+            throws SQLException {
+        requireTransaction(connection);
+        try (Statement lock = connection.createStatement()) {
+            // CLI hold creation/release uses SHARE ROW EXCLUSIVE. SHARE is
+            // compatible across removers but conflicts with that writer lock,
+            // making either the hold or the removal win completely.
+            lock.execute("LOCK TABLE oscar_retention_hold IN SHARE MODE");
+        }
+
+        List<Long> requested = observationIds.stream()
+                .distinct()
+                .sorted()
+                .toList();
+        java.sql.Array ids = connection.createArrayOf("bigint", requested.toArray(Long[]::new));
+        Set<Long> heldObservations = new java.util.HashSet<>();
+        Set<UUID> heldGenerations = new java.util.HashSet<>();
+        try (PreparedStatement statement = connection.prepareStatement(
+                "WITH requested(id) AS (SELECT DISTINCT unnest(?::bigint[])) " +
+                        "SELECT DISTINCT hold.subject_type, hold.subject_id " +
+                        "FROM oscar_retention_hold hold WHERE hold.store_key=? AND hold.id_scope=? " +
+                        "AND hold.released_at IS NULL AND ((hold.subject_type='OBSERVATION' AND EXISTS (" +
+                        "SELECT 1 FROM requested WHERE hold.subject_id=requested.id::text)) OR " +
+                        "(hold.subject_type='ARCHIVE_GENERATION' AND EXISTS (" +
+                        "SELECT 1 FROM oscar_archive_id_block block " +
+                        "JOIN oscar_archive_generation generation ON generation.id=block.generation_id " +
+                        "JOIN requested ON requested.id BETWEEN block.min_id AND block.max_id " +
+                        "WHERE block.generation_id::text=hold.subject_id " +
+                        "AND generation.store_key=hold.store_key AND generation.id_scope=hold.id_scope " +
+                        "AND generation.state IN ('ACTIVE','SEALED'))))")) {
+            statement.setArray(1, ids);
+            statement.setString(2, storeKey);
+            statement.setInt(3, idScope);
+            try (ResultSet result = statement.executeQuery()) {
+                while (result.next()) {
+                    String subjectType = result.getString(1);
+                    String subjectId = result.getString(2);
+                    try {
+                        if ("OBSERVATION".equals(subjectType))
+                            heldObservations.add(Long.parseLong(subjectId));
+                        else if ("ARCHIVE_GENERATION".equals(subjectType))
+                            heldGenerations.add(UUID.fromString(subjectId));
+                    } catch (IllegalArgumentException invalidCatalogValue) {
+                        throw new SQLException("Invalid active retention-hold subject", invalidCatalogValue);
+                    }
+                }
+            }
+        } finally {
+            ids.free();
+        }
+        return new ActiveRemovalHolds(heldObservations, heldGenerations);
+    }
+
+    public record ActiveRemovalHolds(Set<Long> observationIds, Set<UUID> generationIds) {
+        public ActiveRemovalHolds {
+            observationIds = Set.copyOf(observationIds);
+            generationIds = Set.copyOf(generationIds);
+        }
+
+        public boolean blocks(long observationId, UUID generationId) {
+            return observationIds.contains(observationId) ||
+                    (generationId != null && generationIds.contains(generationId));
+        }
+    }
+
+    public static final class RetentionHoldException extends IllegalStateException {
+        public RetentionHoldException(long observationId, UUID generationId) {
+            super("Active retention hold blocks removal of observation " + observationId +
+                    (generationId == null ? "" : " in archive generation " + generationId));
+        }
+    }
+
+    public static void requireRemovalAllowed(ActiveRemovalHolds holds,
+                                             long observationId, UUID generationId) {
+        if (holds == null)
+            throw new IllegalArgumentException("A transaction-scoped retention-hold snapshot is required");
+        if (holds.blocks(observationId, generationId))
+            throw new RetentionHoldException(observationId, generationId);
+    }
+
     private static void requireTransaction(Connection connection) throws SQLException {
         if (connection == null || connection.getAutoCommit())
             throw new IllegalArgumentException("Archive mutation locks require a caller-owned transaction");
@@ -145,6 +254,19 @@ public final class ArchiveCatalog {
                 statement.execute("SELECT pg_advisory_xact_lock(" + MIGRATION_LOCK + ")");
                 statement.execute("CREATE TABLE IF NOT EXISTS oscar_storage_schema_version (" +
                         "version integer PRIMARY KEY, checksum text NOT NULL, applied_at timestamptz NOT NULL DEFAULT now())");
+                try (ResultSet result = statement.executeQuery(
+                        "SELECT max(version) FROM oscar_storage_schema_version")) {
+                    if (result.next()) {
+                        int newest = result.getInt(1);
+                        if (!result.wasNull() && newest > SCHEMA_VERSION)
+                            throw new IllegalStateException(
+                                    "Storage schema version " + newest +
+                                            " is newer than supported version " + SCHEMA_VERSION);
+                    }
+                }
+                requireRecordedSchemaChecksum(connection, PREVIOUS_SCHEMA_VERSION,
+                        PREVIOUS_SCHEMA_CHECKSUM);
+                requireRecordedSchemaChecksum(connection, SCHEMA_VERSION, SCHEMA_CHECKSUM);
                 statement.execute("CREATE TABLE IF NOT EXISTS oscar_archive_job (" +
                         "id uuid PRIMARY KEY, store_key text NOT NULL, id_scope integer NOT NULL, " +
                         "profile text NOT NULL, window_start timestamptz NOT NULL, " +
@@ -252,10 +374,23 @@ public final class ArchiveCatalog {
                         "id uuid PRIMARY KEY, store_key text NOT NULL, id_scope integer NOT NULL, " +
                         "subject_type text NOT NULL, subject_id text NOT NULL, reason text NOT NULL, " +
                         "created_by text NOT NULL, created_at timestamptz NOT NULL DEFAULT now(), " +
-                        "released_at timestamptz, released_by text)");
+                        "released_at timestamptz, released_by text, " +
+                        "resolution_mode text NOT NULL)");
                 statement.execute("ALTER TABLE oscar_retention_hold ADD COLUMN IF NOT EXISTS released_by text");
                 statement.execute("ALTER TABLE oscar_retention_hold ADD COLUMN IF NOT EXISTS store_key text NOT NULL DEFAULT 'legacy'");
                 statement.execute("ALTER TABLE oscar_retention_hold ADD COLUMN IF NOT EXISTS id_scope integer NOT NULL DEFAULT -1");
+                statement.execute("ALTER TABLE oscar_retention_hold ADD COLUMN IF NOT EXISTS resolution_mode text " +
+                        "NOT NULL DEFAULT 'LEGACY_UNKNOWN'");
+                statement.execute("UPDATE oscar_retention_hold SET resolution_mode='GENERATION_EXACT' " +
+                        "WHERE subject_type='ARCHIVE_GENERATION' AND resolution_mode='LEGACY_UNKNOWN'");
+                statement.execute("ALTER TABLE oscar_retention_hold ALTER COLUMN resolution_mode DROP DEFAULT");
+                statement.execute("ALTER TABLE oscar_retention_hold DROP CONSTRAINT IF EXISTS " +
+                        "oscar_retention_hold_resolution_check");
+                statement.execute("ALTER TABLE oscar_retention_hold ADD CONSTRAINT " +
+                        "oscar_retention_hold_resolution_check CHECK " +
+                        "((subject_type='ARCHIVE_GENERATION' AND resolution_mode='GENERATION_EXACT') OR " +
+                        "(subject_type='OBSERVATION' AND resolution_mode IN " +
+                        "('HOT_EXACT','COLD_RANGE_CONSERVATIVE','LEGACY_UNKNOWN'))) ");
                 statement.execute("ALTER TABLE oscar_retention_hold ALTER COLUMN store_key DROP DEFAULT");
                 statement.execute("ALTER TABLE oscar_retention_hold ALTER COLUMN id_scope DROP DEFAULT");
                 statement.execute("DROP INDEX IF EXISTS oscar_retention_hold_active_idx");
@@ -300,8 +435,40 @@ public final class ArchiveCatalog {
                         "PRIMARY KEY(event_id, camera_uid, ordinal), FOREIGN KEY(event_id, camera_uid) " +
                         "REFERENCES oscar_media_manifest(event_id, camera_uid) ON DELETE CASCADE)");
                 statement.execute("CREATE TABLE IF NOT EXISTS oscar_backup_epoch (" +
-                        "id uuid PRIMARY KEY, state text NOT NULL, postgres_lsn pg_lsn, archive_generation_ids uuid[] NOT NULL DEFAULT '{}', " +
+                        "id uuid PRIMARY KEY, state text NOT NULL, postgres_lsn pg_lsn, " +
+                        "archive_generation_count bigint NOT NULL, " +
+                        "archive_generation_inventory_sha256 text NOT NULL, " +
+                        "archive_generation_inventory_bytes bigint NOT NULL, " +
                         "manifest_path text, sha256 text, created_at timestamptz NOT NULL DEFAULT now(), verified_at timestamptz)");
+                statement.execute("ALTER TABLE oscar_backup_epoch ADD COLUMN IF NOT EXISTS " +
+                        "archive_generation_count bigint");
+                statement.execute("ALTER TABLE oscar_backup_epoch ADD COLUMN IF NOT EXISTS " +
+                        "archive_generation_inventory_sha256 text");
+                statement.execute("ALTER TABLE oscar_backup_epoch ADD COLUMN IF NOT EXISTS " +
+                        "archive_generation_inventory_bytes bigint");
+                migrateLegacyBackupGenerationInventory(connection);
+                statement.execute("ALTER TABLE oscar_backup_epoch DROP COLUMN IF EXISTS archive_generation_ids");
+                statement.execute("ALTER TABLE oscar_backup_epoch ALTER COLUMN archive_generation_count SET NOT NULL");
+                statement.execute("ALTER TABLE oscar_backup_epoch ALTER COLUMN " +
+                        "archive_generation_inventory_sha256 SET NOT NULL");
+                statement.execute("ALTER TABLE oscar_backup_epoch ALTER COLUMN " +
+                        "archive_generation_inventory_bytes SET NOT NULL");
+                statement.execute("ALTER TABLE oscar_backup_epoch DROP CONSTRAINT IF EXISTS " +
+                        "oscar_backup_epoch_archive_generation_count_check");
+                statement.execute("ALTER TABLE oscar_backup_epoch ADD CONSTRAINT " +
+                        "oscar_backup_epoch_archive_generation_count_check CHECK " +
+                        "(archive_generation_count BETWEEN 0 AND 1000000)");
+                statement.execute("ALTER TABLE oscar_backup_epoch DROP CONSTRAINT IF EXISTS " +
+                        "oscar_backup_epoch_archive_generation_inventory_sha256_check");
+                statement.execute("ALTER TABLE oscar_backup_epoch ADD CONSTRAINT " +
+                        "oscar_backup_epoch_archive_generation_inventory_sha256_check CHECK " +
+                        "(archive_generation_inventory_sha256 ~ '^[0-9a-f]{64}$')");
+                statement.execute("ALTER TABLE oscar_backup_epoch DROP CONSTRAINT IF EXISTS " +
+                        "oscar_backup_epoch_archive_generation_inventory_bytes_check");
+                statement.execute("ALTER TABLE oscar_backup_epoch ADD CONSTRAINT " +
+                        "oscar_backup_epoch_archive_generation_inventory_bytes_check CHECK " +
+                        "(archive_generation_inventory_bytes BETWEEN 0 AND 37000000 " +
+                        "AND archive_generation_inventory_bytes = archive_generation_count * 37)");
                 statement.execute("CREATE TABLE IF NOT EXISTS oscar_archive_verification (" +
                         "generation_id uuid NOT NULL REFERENCES oscar_archive_generation(id) ON DELETE CASCADE, " +
                         "verification_type text NOT NULL, status text NOT NULL, expected_rows bigint, actual_rows bigint, " +
@@ -367,14 +534,6 @@ public final class ArchiveCatalog {
                         "AND ledger.store_key='legacy' AND ledger.id_scope=-1 " +
                         "AND plan.store_key='" + storeKey + "' AND plan.id_scope=" + idScope);
 
-                try (PreparedStatement select = connection.prepareStatement(
-                        "SELECT checksum FROM oscar_storage_schema_version WHERE version = ?")) {
-                    select.setInt(1, SCHEMA_VERSION);
-                    try (ResultSet result = select.executeQuery()) {
-                        if (result.next() && !SCHEMA_CHECKSUM.equals(result.getString(1)))
-                            throw new IllegalStateException("Storage schema migration checksum mismatch for version " + SCHEMA_VERSION);
-                    }
-                }
                 try (PreparedStatement insert = connection.prepareStatement(
                         "INSERT INTO oscar_storage_schema_version(version, checksum) VALUES (?, ?) ON CONFLICT (version) DO NOTHING")) {
                     insert.setInt(1, SCHEMA_VERSION);
@@ -391,6 +550,136 @@ public final class ArchiveCatalog {
         } catch (Exception e) {
             throw new IllegalStateException("Cannot migrate OSCAR archive catalog", e);
         }
+    }
+
+    /** A missing row denotes a fresh/direct upgrade; a recorded migration must be authentic. */
+    private static void requireRecordedSchemaChecksum(Connection connection, int version,
+                                                       String expectedChecksum)
+            throws SQLException {
+        try (PreparedStatement select = connection.prepareStatement(
+                "SELECT checksum FROM oscar_storage_schema_version WHERE version=?")) {
+            select.setInt(1, version);
+            try (ResultSet result = select.executeQuery()) {
+                if (result.next() && !expectedChecksum.equals(result.getString(1)))
+                    throw new IllegalStateException(
+                            "Storage schema migration checksum mismatch for version " + version);
+            }
+        }
+    }
+
+    /**
+     * Converts the bounded v4 UUID-array receipt into the canonical inventory
+     * summary used by v5. The canonical bytes are sorted lowercase UUIDs, each
+     * terminated by a single LF, exactly matching archive-generation-ids.txt.
+     */
+    private static void migrateLegacyBackupGenerationInventory(Connection connection)
+            throws SQLException {
+        if (!columnExists(connection, "oscar_backup_epoch", "archive_generation_ids"))
+            return;
+        try (PreparedStatement select = connection.prepareStatement(
+                "SELECT id, archive_generation_ids FROM oscar_backup_epoch");
+             PreparedStatement update = connection.prepareStatement(
+                     "UPDATE oscar_backup_epoch SET archive_generation_count=?, " +
+                             "archive_generation_inventory_sha256=?, " +
+                             "archive_generation_inventory_bytes=? WHERE id=?");
+             ResultSet rows = select.executeQuery()) {
+            while (rows.next()) {
+                java.sql.Array legacyIds = rows.getArray(2);
+                if (legacyIds == null)
+                    throw new SQLException("Legacy backup epoch has no archive generation inventory");
+                BackupGenerationInventory inventory;
+                try {
+                    inventory = summarizeBackupGenerationInventory(legacyIds);
+                } finally {
+                    legacyIds.free();
+                }
+                update.setLong(1, inventory.count());
+                update.setString(2, inventory.sha256());
+                update.setLong(3, inventory.bytes());
+                update.setObject(4, rows.getObject(1, UUID.class));
+                if (update.executeUpdate() != 1)
+                    throw new SQLException("Legacy backup epoch disappeared during schema migration");
+            }
+        }
+    }
+
+    private static BackupGenerationInventory summarizeBackupGenerationInventory(
+            java.sql.Array legacyIds) throws SQLException {
+        Object rawArray = legacyIds.getArray();
+        if (!(rawArray instanceof Object[] values))
+            throw new SQLException("Unsupported legacy archive generation inventory representation");
+        requireBackupGenerationInventoryBounds(values.length, Math.multiplyExact(37L, values.length));
+        List<String> canonicalIds = new ArrayList<>(values.length);
+        for (Object value : values) {
+            if (value == null)
+                throw new SQLException("Legacy archive generation inventory contains null");
+            try {
+                UUID id = UUID.fromString(value.toString());
+                if (id.version() < 1 || id.version() > 5 || id.variant() != 2)
+                    throw new IllegalArgumentException("noncanonical UUID version or variant");
+                canonicalIds.add(id.toString());
+            } catch (IllegalArgumentException invalidUuid) {
+                throw new SQLException(
+                        "Legacy archive generation inventory contains a noncanonical UUID", invalidUuid);
+            }
+        }
+        canonicalIds.sort(String::compareTo);
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            long bytes = 0L;
+            String previous = null;
+            for (String id : canonicalIds) {
+                if (id.equals(previous))
+                    throw new SQLException("Legacy archive generation inventory contains a duplicate UUID");
+                previous = id;
+                byte[] line = (id + '\n').getBytes(StandardCharsets.UTF_8);
+                digest.update(line);
+                bytes = Math.addExact(bytes, line.length);
+            }
+            requireBackupGenerationInventoryBounds(canonicalIds.size(), bytes);
+            return new BackupGenerationInventory(
+                    canonicalIds.size(), HexFormat.of().formatHex(digest.digest()), bytes);
+        } catch (NoSuchAlgorithmException impossible) {
+            throw new IllegalStateException("SHA-256 is unavailable", impossible);
+        } catch (ArithmeticException overflow) {
+            throw new SQLException("Legacy archive generation inventory is too large", overflow);
+        }
+    }
+
+    static void requireBackupGenerationInventoryBounds(long count, long bytes) throws SQLException {
+        if (count < 0 || count > MAX_BACKUP_ARCHIVE_GENERATIONS)
+            throw new SQLException(
+                    "Legacy archive generation inventory exceeds the 1,000,000-entry migration limit");
+        if (bytes < 0 || bytes > MAX_BACKUP_ARCHIVE_GENERATION_INVENTORY_BYTES)
+            throw new SQLException(
+                    "Legacy archive generation inventory exceeds the 37,000,000-byte migration limit");
+        final long canonicalBytes;
+        try {
+            canonicalBytes = Math.multiplyExact(count, 37L);
+        } catch (ArithmeticException overflow) {
+            throw new SQLException("Legacy archive generation inventory is too large", overflow);
+        }
+        if (bytes != canonicalBytes)
+            throw new SQLException(
+                    "Legacy archive generation inventory is not in canonical UUID-line form");
+    }
+
+    private static boolean columnExists(Connection connection, String table, String column)
+            throws SQLException {
+        try (PreparedStatement statement = connection.prepareStatement(
+                "SELECT EXISTS (SELECT 1 FROM pg_attribute " +
+                        "WHERE attrelid=?::regclass AND attname=? AND NOT attisdropped)")) {
+            statement.setString(1, table);
+            statement.setString(2, column);
+            try (ResultSet result = statement.executeQuery()) {
+                if (!result.next())
+                    throw new SQLException("PostgreSQL did not return a column-presence result");
+                return result.getBoolean(1);
+            }
+        }
+    }
+
+    private record BackupGenerationInventory(long count, String sha256, long bytes) {
     }
 
     public Optional<UUID> claimJob(String profile, Instant start, Instant end) {
@@ -613,8 +902,9 @@ public final class ArchiveCatalog {
         long count = 0;
         long minimumId = Long.MAX_VALUE;
         long maximumId = Long.MIN_VALUE;
-        try (Connection duck = DriverManager.getConnection("jdbc:duckdb:");
-             Statement read = duck.createStatement();
+        try (DuckDbResourcePolicy.Session duckSession = DuckDbResourcePolicy.open(
+                resourceConfig, "activation-stage");
+             Statement read = duckSession.connection().createStatement();
              ResultSet rows = read.executeQuery(select);
              PreparedStatement stage = postgres.prepareStatement(insert)) {
             while (rows.next()) {
@@ -1169,6 +1459,34 @@ public final class ArchiveCatalog {
         }
     }
 
+    /** Returns exact logical-deletion membership for one bounded hot-row page. */
+    public Set<Long> tombstonedObservationIds(Collection<Long> observationIds) {
+        if (observationIds == null || observationIds.isEmpty())
+            return Set.of();
+        String sql = "WITH requested(id) AS (SELECT unnest(?::bigint[])) SELECT requested.id " +
+                "FROM requested WHERE EXISTS (SELECT 1 FROM oscar_tombstone tombstone " +
+                "WHERE tombstone.subject_type='OBSERVATION' AND tombstone.store_key=? " +
+                "AND tombstone.id_scope=? AND tombstone.subject_id=requested.id::text)";
+        Set<Long> tombstoned = new HashSet<>();
+        try (Connection connection = connections.open()) {
+            java.sql.Array ids = connection.createArrayOf("bigint", observationIds.toArray());
+            try (PreparedStatement statement = connection.prepareStatement(sql)) {
+                statement.setArray(1, ids);
+                statement.setString(2, storeKey);
+                statement.setInt(3, idScope);
+                try (ResultSet result = statement.executeQuery()) {
+                    while (result.next())
+                        tombstoned.add(result.getLong(1));
+                }
+            } finally {
+                ids.free();
+            }
+            return tombstoned;
+        } catch (SQLException e) {
+            throw new IllegalStateException("Cannot resolve observation tombstones", e);
+        }
+    }
+
     /**
      * Streams only query-relevant overlays in the same global order used by
      * hot and Parquet observations. Structured predicates are pushed into
@@ -1468,6 +1786,9 @@ public final class ArchiveCatalog {
             connection.setAutoCommit(false);
             try {
                 lockForMutation(connection, observationId);
+                ActiveRemovalHolds holds = lockActiveRemovalHolds(
+                        connection, List.of(observationId));
+                requireRemovalAllowed(holds, observationId, generationId);
                 try (PreparedStatement statement = connection.prepareStatement(
                         "INSERT INTO oscar_tombstone(store_key, id_scope, subject_type, subject_id, generation_id, reason, policy) " +
                                 "SELECT ?, ?, 'OBSERVATION', ?, generation.id, ?, ? " +
@@ -1512,10 +1833,25 @@ public final class ArchiveCatalog {
     public boolean tombstoneIfAbsent(Connection connection, long observationId,
                                      UUID generationId, String reason, String policy)
             throws SQLException {
+        ActiveRemovalHolds holds = lockActiveRemovalHolds(connection, List.of(observationId));
+        return tombstoneIfAbsent(connection, observationId, generationId, reason, policy, holds);
+    }
+
+    /**
+     * Batch form using the caller's transaction-scoped hold snapshot. The
+     * snapshot must have been acquired after the same transaction took all
+     * relevant mutation locks.
+     */
+    public boolean tombstoneIfAbsent(Connection connection, long observationId,
+                                     UUID generationId, String reason, String policy,
+                                     ActiveRemovalHolds holds)
+            throws SQLException {
         if (connection == null)
             throw new IllegalArgumentException("A transaction connection is required");
         if (generationId == null)
             throw new IllegalArgumentException("Archived observation tombstones require an exact generation ID");
+        requireTransaction(connection);
+        requireRemovalAllowed(holds, observationId, generationId);
         try (PreparedStatement statement = connection.prepareStatement(
                 "INSERT INTO oscar_tombstone(store_key, id_scope, subject_type, subject_id, generation_id, reason, policy) " +
                         "SELECT ?, ?, 'OBSERVATION', ?, generation.id, ?, ? " +
