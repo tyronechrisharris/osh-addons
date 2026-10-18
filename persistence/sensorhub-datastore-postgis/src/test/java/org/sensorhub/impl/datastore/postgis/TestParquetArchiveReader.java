@@ -1,13 +1,16 @@
 package org.sensorhub.impl.datastore.postgis;
 
+import com.google.common.collect.Range;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
 import org.sensorhub.api.common.BigId;
+import org.sensorhub.api.datastore.TemporalFilter;
 import org.sensorhub.api.datastore.obs.ObsFilter;
 import org.sensorhub.impl.datastore.postgis.archive.ArchiveExporter;
 import org.sensorhub.impl.datastore.postgis.archive.ArchiveGeneration;
 import org.sensorhub.impl.datastore.postgis.archive.ParquetArchiveReader;
+import org.sensorhub.impl.datastore.postgis.archive.UtcJdbcTime;
 
 import java.nio.file.Path;
 import java.nio.file.Files;
@@ -218,6 +221,50 @@ public class TestParquetArchiveReader {
     }
 
     @Test
+    public void openLowerBoundDoesNotConsumeBoundedColdLimit() throws Exception {
+        Path root = temporary.newFolder("open-lower-limit").toPath();
+        ArchiveGeneration generation = writeGeneration(root, "open-lower.parquet", new TestRow[]{
+                new TestRow(1, 10, "2026-01-01T00:01:00Z"),
+                new TestRow(2, 10, "2026-01-01T00:02:00Z"),
+                new TestRow(3, 10, "2026-01-01T00:03:00Z")
+        });
+        TemporalFilter time = new TemporalFilter.Builder()
+                .withRange(Range.openClosed(
+                        Instant.parse("2026-01-01T00:01:00Z"),
+                        Instant.parse("2026-01-01T00:03:00Z")))
+                .build();
+        ObsFilter filter = new ObsFilter.Builder()
+                .withPhenomenonTime(time)
+                .withLimit(1)
+                .build();
+
+        var rows = new ParquetArchiveReader(root).read(
+                List.of(generation), filter, null, null, 1);
+        assertEquals(List.of(2L),
+                rows.stream().map(row -> row.observation().id()).toList());
+    }
+
+    @Test
+    public void metadataCountHonorsBothOpenColdEndpoints() throws Exception {
+        Path root = temporary.newFolder("open-count").toPath();
+        ArchiveGeneration generation = writeGeneration(root, "open-count.parquet", new TestRow[]{
+                new TestRow(1, 10, "2026-01-01T00:01:00Z"),
+                new TestRow(2, 10, "2026-01-01T00:02:00Z"),
+                new TestRow(3, 10, "2026-01-01T00:03:00Z")
+        });
+        ObsFilter filter = new ObsFilter.Builder()
+                .withPhenomenonTime(new TemporalFilter.Builder()
+                        .withRange(Range.open(
+                                Instant.parse("2026-01-01T00:01:00Z"),
+                                Instant.parse("2026-01-01T00:03:00Z")))
+                        .build())
+                .build();
+
+        assertEquals(1, new ParquetArchiveReader(root).count(
+                List.of(generation), filter, null, null));
+    }
+
+    @Test
     public void lazyCursorClosesOnEarlyStreamCloseAndOnExhaustion() throws Exception {
         Path root = temporary.newFolder("cursor-lifecycle").toPath();
         ArchiveGeneration generation = writeGeneration(root, "cursor.parquet", new TestRow[]{
@@ -290,8 +337,8 @@ public class TestParquetArchiveReader {
                     Instant time = Instant.parse(row.time());
                     insert.setLong(1, row.id());
                     insert.setLong(2, row.dataStreamId());
-                    insert.setTimestamp(3, java.sql.Timestamp.from(time));
-                    insert.setTimestamp(4, java.sql.Timestamp.from(time));
+                    UtcJdbcTime.setDuckDbInstant(insert, 3, time);
+                    UtcJdbcTime.setDuckDbInstant(insert, 4, time);
                     insert.setString(5, "{\"value\":" + row.id() + "}");
                     insert.addBatch();
                 }

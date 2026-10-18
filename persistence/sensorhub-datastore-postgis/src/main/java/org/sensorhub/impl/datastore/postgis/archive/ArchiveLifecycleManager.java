@@ -165,6 +165,10 @@ public final class ArchiveLifecycleManager {
             boolean oldAutoCommit = connection.getAutoCommit();
             connection.setAutoCommit(false);
             try {
+                // Participate in the same archive mutation protocol as direct
+                // and filtered writes.  This prevents a physical hot-row
+                // delete from racing a logical overlay/tombstone transition.
+                catalog.lockForMutation(connection, ids);
                 // Serialize hold creation/release with each small deletion
                 // batch. Without this lock, a hold could commit after the
                 // hold lookup but immediately before DELETE.

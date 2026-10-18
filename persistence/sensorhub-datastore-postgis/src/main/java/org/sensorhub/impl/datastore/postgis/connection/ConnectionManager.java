@@ -59,6 +59,13 @@ public class ConnectionManager {
         this.batchSize = batchSize;
     }
 
+    /** Runtime pool bound used by constrained deployments and deadlock probes. */
+    public void setMaximumPoolSize(int maximumPoolSize) {
+        if (maximumPoolSize < 1)
+            throw new IllegalArgumentException("PostgreSQL pool size must be positive");
+        hikariDataSourceInstance.setMaximumPoolSize(maximumPoolSize);
+    }
+
     private HikariDataSource createHikariDataSource() {
         HikariConfig config = new HikariConfig();
         config.setJdbcUrl("jdbc:postgresql://" + url + "/" + dbName);

@@ -166,12 +166,15 @@ public class PostgisBatchObsStoreImpl extends PostgisObsStoreImpl {
         try (Connection connection = this.connectionManager.getConnection()) {
             boolean previousAutoCommit = connection.getAutoCommit();
             connection.setAutoCommit(false);
-            try (PreparedStatement statement = connection.prepareStatement(preparedObservationUpsertQuery())) {
-                for (PreparedObservation observation : pending.values()) {
-                    bindPreparedObservation(statement, observation);
-                    statement.addBatch();
+            try {
+                beforeObservationWrite(connection, pending.values());
+                try (PreparedStatement statement = connection.prepareStatement(preparedObservationUpsertQuery())) {
+                    for (PreparedObservation observation : pending.values()) {
+                        bindPreparedObservation(statement, observation);
+                        statement.addBatch();
+                    }
+                    statement.executeBatch();
                 }
-                statement.executeBatch();
                 reconcileProtectedObservations(connection, pending.values());
                 connection.commit();
                 pending.clear();
@@ -195,6 +198,17 @@ public class PostgisBatchObsStoreImpl extends PostgisObsStoreImpl {
     }
 
     /**
+     * Transaction hook invoked before any observation row is inserted or
+     * updated. Tiered stores use it to acquire their archive mutation locks in
+     * the documented global order; ordinary PostgreSQL stores do nothing.
+     */
+    protected void beforeObservationWrite(Connection connection,
+                                          java.util.Collection<PreparedObservation> observations)
+            throws Exception {
+        // no-op
+    }
+
+    /**
      * Hook for storage tiers that protect a committed base row from in-place
      * mutation. It runs inside the batch transaction after the guarded upsert
      * and before the pending queue is cleared.
@@ -210,9 +224,12 @@ public class PostgisBatchObsStoreImpl extends PostgisObsStoreImpl {
         List<PreparedObservation> snapshot = new ArrayList<>(pending.values());
         ObservationConflictException firstConflict = null;
         for (PreparedObservation observation : snapshot) {
-            try (PreparedStatement statement = connection.prepareStatement(preparedObservationUpsertQuery())) {
-                bindPreparedObservation(statement, observation);
-                statement.executeUpdate();
+            try {
+                beforeObservationWrite(connection, List.of(observation));
+                try (PreparedStatement statement = connection.prepareStatement(preparedObservationUpsertQuery())) {
+                    bindPreparedObservation(statement, observation);
+                    statement.executeUpdate();
+                }
                 Set<Long> protectedIds = reconcileProtectedObservations(
                         connection, List.of(observation));
                 if (!protectedIds.contains(observation.id))

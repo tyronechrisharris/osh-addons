@@ -50,6 +50,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
@@ -525,6 +526,253 @@ public class TestDisposableTieredPostgresIntegration extends TestPostgisObsStore
     }
 
     @Test
+    public void activationSerializesDirectPutIntoAnOverlay() throws Exception {
+        OscarTieredObsStore tiered = (OscarTieredObsStore) postgisObsStore;
+        Instant start = Instant.parse("2026-02-03T00:00:00Z");
+        BigId stream = addSimpleDataStream(bigId(62), "gammaCounts");
+        BigId key = addSimpleObsWithoutResultTime(
+                stream, BigId.NONE, start, 1, 0).keySet().iterator().next();
+        forceReadBackFromStorage();
+        String immutableBase = hotResultJson(key.getIdAsLong());
+        ObsData correction = new ObsData.Builder()
+                .withDataStream(stream)
+                .withPhenomenonTime(start)
+                .withResult(values(501))
+                .build();
+
+        installActivationBarrier();
+        ExecutorService executor = Executors.newFixedThreadPool(2);
+        try (Connection barrier = open(); Statement lock = barrier.createStatement()) {
+            lock.execute("SELECT pg_advisory_lock(" + ACTIVATION_LOCK_CLASS + "," +
+                    ACTIVATION_LOCK_OBJECT + ")");
+            Future<java.util.Optional<ArchiveGeneration>> activation = executor.submit(() ->
+                    tiered.archiveWindow(start, start.plus(1, ChronoUnit.HOURS), "RAW_GATED"));
+            waitForBlockedActivation();
+            Future<org.sensorhub.api.data.IObsData> update = executor.submit(() ->
+                    tiered.put(key, correction));
+            // The activation barrier owns the exclusive store lock; direct put
+            // must be a second advisory waiter, not a timing-based race.
+            waitForAdvisoryWaiters(2);
+            lock.execute("SELECT pg_advisory_unlock(" + ACTIVATION_LOCK_CLASS + "," +
+                    ACTIVATION_LOCK_OBJECT + ")");
+
+            ArchiveGeneration generation = activation.get(30, TimeUnit.SECONDS).orElseThrow();
+            update.get(30, TimeUnit.SECONDS);
+            assertEquals(immutableBase, hotResultJson(key.getIdAsLong()));
+            assertEquals(501.0, tiered.get(key).getResult().getDoubleValue(0), 0.0);
+            assertEquals(generation.id(), tiered.getArchiveCatalog().overlayWithGeneration(
+                    key.getIdAsLong(), DATABASE_NUM, "OVERLAY").orElseThrow().generationId());
+        } finally {
+            executor.shutdownNow();
+            executor.awaitTermination(30, TimeUnit.SECONDS);
+            dropActivationBarrier();
+        }
+    }
+
+    @Test
+    public void activationSerializesDirectRemoveIntoATombstone() throws Exception {
+        OscarTieredObsStore tiered = (OscarTieredObsStore) postgisObsStore;
+        Instant start = Instant.parse("2026-02-04T00:00:00Z");
+        BigId stream = addSimpleDataStream(bigId(63), "gammaCounts");
+        BigId key = addSimpleObsWithoutResultTime(
+                stream, BigId.NONE, start, 1, 0).keySet().iterator().next();
+        forceReadBackFromStorage();
+
+        installActivationBarrier();
+        ExecutorService executor = Executors.newFixedThreadPool(2);
+        try (Connection barrier = open(); Statement lock = barrier.createStatement()) {
+            lock.execute("SELECT pg_advisory_lock(" + ACTIVATION_LOCK_CLASS + "," +
+                    ACTIVATION_LOCK_OBJECT + ")");
+            Future<java.util.Optional<ArchiveGeneration>> activation = executor.submit(() ->
+                    tiered.archiveWindow(start, start.plus(1, ChronoUnit.HOURS), "RAW_GATED"));
+            waitForBlockedActivation();
+            Future<org.sensorhub.api.data.IObsData> removal = executor.submit(() -> tiered.remove(key));
+            waitForAdvisoryWaiters(2);
+            lock.execute("SELECT pg_advisory_unlock(" + ACTIVATION_LOCK_CLASS + "," +
+                    ACTIVATION_LOCK_OBJECT + ")");
+
+            ArchiveGeneration generation = activation.get(30, TimeUnit.SECONDS).orElseThrow();
+            assertTrue(removal.get(30, TimeUnit.SECONDS) != null);
+            assertTrue(hotRowExists(key.getIdAsLong()));
+            assertTrue(tiered.getArchiveCatalog().isTombstoned(key.getIdAsLong()));
+            assertEquals(generation.id(), tombstoneGeneration(key.getIdAsLong()));
+            assertTrue(tiered.get(key) == null);
+        } finally {
+            executor.shutdownNow();
+            executor.awaitTermination(30, TimeUnit.SECONDS);
+            dropActivationBarrier();
+        }
+    }
+
+    @Test
+    public void filteredColdRemoveSerializesAnOverlappingOverlayPut() throws Exception {
+        TestableTieredStore tiered = (TestableTieredStore) postgisObsStore;
+        Instant start = Instant.parse("2026-02-05T00:00:00Z");
+        BigId stream = addSimpleDataStream(bigId(64), "gammaCounts");
+        BigId key = addSimpleObsWithoutResultTime(
+                stream, BigId.NONE, start, 1, 0).keySet().iterator().next();
+        forceReadBackFromStorage();
+        ArchiveGeneration generation = tiered.archiveWindow(
+                start, start.plus(1, ChronoUnit.HOURS), "RAW_GATED").orElseThrow();
+        tiered.maintainArchiveLifecycle();
+        ageGeneration(generation.id());
+        archiveConfig.deleteHotAfterArchive = true;
+        tiered.maintainArchiveLifecycle();
+        assertFalse(hotRowExists(key.getIdAsLong()));
+
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        AtomicReference<Future<org.sensorhub.api.data.IObsData>> update = new AtomicReference<>();
+        tiered.afterNextRemoveBatchLocked(() -> {
+            update.set(executor.submit(() -> tiered.put(key, new ObsData.Builder()
+                    .withDataStream(stream)
+                    .withPhenomenonTime(start)
+                    .withResult(values(601))
+                    .build())));
+            try {
+                waitForAdvisoryWaiters(1);
+            } catch (Exception error) {
+                throw new IllegalStateException(error);
+            }
+        });
+        try {
+            assertEquals(1, tiered.removeEntries(new ObsFilter.Builder()
+                    .withInternalIDs(key)
+                    .build()));
+            ExecutionException failure = assertThrows(ExecutionException.class,
+                    () -> update.get().get(30, TimeUnit.SECONDS));
+            assertTrue(failure.getCause() instanceof UnsupportedOperationException);
+            assertTrue(tiered.getArchiveCatalog().isTombstoned(key.getIdAsLong()));
+            assertTrue(tiered.getArchiveCatalog().overlayWithGeneration(
+                    key.getIdAsLong(), DATABASE_NUM, "OVERLAY").isEmpty());
+        } finally {
+            executor.shutdownNow();
+            executor.awaitTermination(30, TimeUnit.SECONDS);
+        }
+    }
+
+    @Test
+    public void coldFilteredRemoveCompletesWithOneObservationConnection() throws Exception {
+        TestableTieredStore tiered = (TestableTieredStore) postgisObsStore;
+        Instant start = Instant.parse("2026-02-06T00:00:00Z");
+        BigId stream = addSimpleDataStream(bigId(65), "gammaCounts");
+        BigId key = addSimpleObsWithoutResultTime(
+                stream, BigId.NONE, start, 1, 0).keySet().iterator().next();
+        forceReadBackFromStorage();
+        ArchiveGeneration generation = tiered.archiveWindow(
+                start, start.plus(1, ChronoUnit.HOURS), "RAW_GATED").orElseThrow();
+        tiered.maintainArchiveLifecycle();
+        ageGeneration(generation.id());
+        archiveConfig.deleteHotAfterArchive = true;
+        tiered.maintainArchiveLifecycle();
+        assertFalse(hotRowExists(key.getIdAsLong()));
+
+        // Force the initial candidate query through all three sources. Before
+        // overlay keyset paging, the eager overlay cursor retained the pool's
+        // sole connection while base mutation filtering tried to borrow it.
+        tiered.put(key, new ObsData.Builder()
+                .withDataStream(stream)
+                .withPhenomenonTime(start)
+                .withResult(values(651))
+                .build());
+        assertTrue(tiered.getArchiveCatalog().overlayWithGeneration(
+                key.getIdAsLong(), DATABASE_NUM, "OVERLAY").isPresent());
+        tiered.limitObservationPool(1);
+
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        try {
+            Future<Long> removal = executor.submit(() -> tiered.removeEntries(
+                    new ObsFilter.Builder()
+                            .withInternalIDs(key)
+                            .withDataStreams(stream)
+                            .build()));
+            assertEquals(Long.valueOf(1), removal.get(5, TimeUnit.SECONDS));
+        } finally {
+            executor.shutdownNow();
+            executor.awaitTermination(30, TimeUnit.SECONDS);
+        }
+    }
+
+    @Test
+    public void restartAllocatesAboveFullyColdCatalogMaximum() throws Exception {
+        TestableTieredStore tiered = (TestableTieredStore) postgisObsStore;
+        Instant start = Instant.parse("2026-02-07T00:00:00Z");
+        BigId stream = addSimpleDataStream(bigId(66), "gammaCounts");
+        Map<BigId, org.sensorhub.api.data.IObsData> inserted =
+                addSimpleObsWithoutResultTime(stream, BigId.NONE, start, 2, 60_000);
+        forceReadBackFromStorage();
+        long archivedMaximum = inserted.keySet().stream()
+                .mapToLong(BigId::getIdAsLong).max().orElseThrow();
+        ArchiveGeneration generation = tiered.archiveWindow(
+                start, start.plus(1, ChronoUnit.HOURS), "RAW_GATED").orElseThrow();
+        tiered.maintainArchiveLifecycle();
+        ageGeneration(generation.id());
+        archiveConfig.deleteHotAfterArchive = true;
+        tiered.maintainArchiveLifecycle();
+        assertEquals(0, hotRows());
+
+        tiered.close();
+        tiered = new TestableTieredStore(url, DB_NAME, login, password, TABLE,
+                DATABASE_NUM, IdProviderType.SEQUENTIAL, archiveConfig);
+        postgisObsStore = tiered;
+        BigId next = tiered.add(new ObsData.Builder()
+                .withDataStream(stream)
+                .withPhenomenonTime(start.plus(2, ChronoUnit.HOURS))
+                .withResult(values(701))
+                .build());
+        assertEquals(archivedMaximum + 1, next.getIdAsLong());
+        tiered.commit();
+        assertEquals(3, tiered.getNumRecords());
+        assertEquals(3, selectAll(tiered));
+    }
+
+    @Test
+    public void coldOpenBoundsPreserveLimitCountAndRemoval() throws Exception {
+        TestableTieredStore tiered = (TestableTieredStore) postgisObsStore;
+        Instant start = Instant.parse("2026-02-08T00:00:00Z");
+        BigId stream = addSimpleDataStream(bigId(67), "gammaCounts");
+        Map<BigId, org.sensorhub.api.data.IObsData> inserted =
+                addSimpleObsWithoutResultTime(stream, BigId.NONE, start, 3, 60_000);
+        forceReadBackFromStorage();
+        ArchiveGeneration generation = tiered.archiveWindow(
+                start, start.plus(1, ChronoUnit.HOURS), "RAW_GATED").orElseThrow();
+        tiered.maintainArchiveLifecycle();
+        ageGeneration(generation.id());
+        archiveConfig.deleteHotAfterArchive = true;
+        tiered.maintainArchiveLifecycle();
+        assertEquals(0, hotRows());
+
+        ObsFilter limited = new ObsFilter.Builder()
+                .withPhenomenonTime(new TemporalFilter.Builder()
+                        .withRange(Range.openClosed(start, start.plus(2, ChronoUnit.MINUTES)))
+                        .build())
+                .withLimit(1)
+                .build();
+        try (var selected = tiered.selectEntries(limited)) {
+            var rows = selected.toList();
+            assertEquals(1, rows.size());
+            assertEquals(start.plus(1, ChronoUnit.MINUTES),
+                    rows.get(0).getValue().getPhenomenonTime());
+        }
+        ObsFilter openCount = new ObsFilter.Builder()
+                .withPhenomenonTime(new TemporalFilter.Builder()
+                        .withRange(Range.open(start, start.plus(2, ChronoUnit.MINUTES)))
+                        .build())
+                .build();
+        assertEquals(1, tiered.countMatchingEntries(openCount));
+        assertEquals(1, tiered.removeEntries(limited));
+
+        BigId first = inserted.entrySet().stream()
+                .filter(entry -> entry.getValue().getPhenomenonTime().equals(start))
+                .map(Map.Entry::getKey).findFirst().orElseThrow();
+        BigId middle = inserted.entrySet().stream()
+                .filter(entry -> entry.getValue().getPhenomenonTime().equals(
+                        start.plus(1, ChronoUnit.MINUTES)))
+                .map(Map.Entry::getKey).findFirst().orElseThrow();
+        assertTrue(tiered.get(first) != null);
+        assertTrue(tiered.get(middle) == null);
+    }
+
+    @Test
     public void lateRowsCreateANewRevisionOfTheAnchoredUtcHour() throws Exception {
         OscarTieredObsStore tiered = (OscarTieredObsStore) postgisObsStore;
         Instant firstTime = Instant.parse("2026-03-04T12:34:56.123456789Z");
@@ -857,6 +1105,7 @@ public class TestDisposableTieredPostgresIntegration extends TestPostgisObsStore
         tiered = new TestableTieredStore(url, DB_NAME, login, password, TABLE,
                 DATABASE_NUM, IdProviderType.SEQUENTIAL, archiveConfig);
         postgisObsStore = tiered;
+        ((TestableTieredStore) tiered).limitObservationPool(1);
         BigId coldReplay = tiered.add(new ObsData.Builder().withDataStream(stream)
                 .withPhenomenonTime(time).withResult(values(101)).build());
         BigId coldBaseReplay = tiered.add(new ObsData.Builder().withDataStream(stream)
@@ -877,6 +1126,10 @@ public class TestDisposableTieredPostgresIntegration extends TestPostgisObsStore
                 .withPhenomenonTime(time).withResult(values(201)).build());
         assertEquals(stableId, coldFirstCorrection);
         assertEquals(stableId, coldFinalCorrection);
+        // Force reconcileProtectedObservations to resolve the schema through
+        // the datastream store's independent pool while the observation pool's
+        // sole connection is held by the batch transaction.
+        ((PostgisDataStreamStoreImpl) tiered.getDataStreams()).clearCache();
         tiered.commit();
         assertEquals(0, hotRows());
         assertEquals(2, tiered.getNumRecords());
@@ -1115,6 +1368,14 @@ public class TestDisposableTieredPostgresIntegration extends TestPostgisObsStore
                     firstJob, TABLE, DATABASE_NUM, start, end, "first.parquet");
             UUID secondGeneration = insertManualGeneration(
                     secondJob, secondTable, secondScope, start, end, "second.parquet");
+            try (Connection connection = open(); PreparedStatement statement = connection.prepareStatement(
+                    "UPDATE oscar_archive_generation SET max_id=? WHERE id=?")) {
+                statement.setLong(1, 9_000_000L);
+                statement.setObject(2, secondGeneration);
+                assertEquals(1, statement.executeUpdate());
+            }
+            assertEquals(Long.valueOf(42), firstCatalog.maximumObservationId().orElseThrow());
+            assertEquals(Long.valueOf(9_000_000L), secondCatalog.maximumObservationId().orElseThrow());
 
             ArchivedObservation firstOverlay = new ArchivedObservation(
                     DATABASE_NUM, 42, DATABASE_NUM, 10, null, null,
@@ -1304,6 +1565,7 @@ public class TestDisposableTieredPostgresIntegration extends TestPostgisObsStore
 
     private static final class TestableTieredStore extends OscarTieredObsStore {
         private Runnable beforeRemoveBatch;
+        private Runnable afterRemoveBatchLocked;
 
         TestableTieredStore(String url, String dbName, String login, String password, String dataStoreName,
                             int idScope, IdProviderType idProviderType, TieredArchiveConfig config) {
@@ -1314,10 +1576,26 @@ public class TestDisposableTieredPostgresIntegration extends TestPostgisObsStore
             beforeRemoveBatch = action;
         }
 
+        void afterNextRemoveBatchLocked(Runnable action) {
+            afterRemoveBatchLocked = action;
+        }
+
+        void limitObservationPool(int maximumPoolSize) {
+            connectionManager.setMaximumPoolSize(maximumPoolSize);
+        }
+
         @Override
         protected void beforeRemoveBatchRevalidation(List<BigId> candidateIds) {
             Runnable action = beforeRemoveBatch;
             beforeRemoveBatch = null;
+            if (action != null)
+                action.run();
+        }
+
+        @Override
+        protected void afterRemoveBatchLocked(List<BigId> candidateIds) {
+            Runnable action = afterRemoveBatchLocked;
+            afterRemoveBatchLocked = null;
             if (action != null)
                 action.run();
         }
@@ -1469,6 +1747,20 @@ public class TestDisposableTieredPostgresIntegration extends TestPostgisObsStore
         }
     }
 
+    private UUID tombstoneGeneration(long observationId) throws Exception {
+        try (Connection connection = open(); PreparedStatement statement = connection.prepareStatement(
+                "SELECT generation_id FROM oscar_tombstone WHERE store_key=? AND id_scope=? " +
+                        "AND subject_type='OBSERVATION' AND subject_id=?")) {
+            statement.setString(1, TABLE);
+            statement.setInt(2, DATABASE_NUM);
+            statement.setString(3, Long.toString(observationId));
+            try (ResultSet result = statement.executeQuery()) {
+                assertTrue(result.next());
+                return result.getObject(1, UUID.class);
+            }
+        }
+    }
+
     private static long regularArchiveFiles(Path root) throws Exception {
         try (var paths = Files.walk(root)) {
             return paths.filter(Files::isRegularFile).count();
@@ -1504,6 +1796,21 @@ public class TestDisposableTieredPostgresIntegration extends TestPostgisObsStore
             Thread.sleep(20);
         }
         throw new AssertionError("Archive activation did not reach the PostgreSQL barrier");
+    }
+
+    private void waitForAdvisoryWaiters(int minimum) throws Exception {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
+        while (System.nanoTime() < deadline) {
+            try (Connection connection = open(); Statement statement = connection.createStatement();
+                 ResultSet result = statement.executeQuery(
+                         "SELECT count(*) FROM pg_locks WHERE locktype='advisory' AND NOT granted")) {
+                assertTrue(result.next());
+                if (result.getLong(1) >= minimum)
+                    return;
+            }
+            Thread.sleep(20);
+        }
+        throw new AssertionError("Expected at least " + minimum + " waiting advisory locks");
     }
 
     private void dropActivationBarrier() throws Exception {

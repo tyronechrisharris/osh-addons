@@ -1,5 +1,6 @@
 package org.sensorhub.impl.datastore.postgis.archive;
 
+import com.google.common.collect.BoundType;
 import org.sensorhub.api.common.BigId;
 import org.sensorhub.api.datastore.TemporalFilter;
 import org.sensorhub.api.datastore.obs.ObsFilter;
@@ -13,6 +14,7 @@ import java.sql.SQLException;
 import java.sql.Statement;
 import java.sql.Types;
 import java.time.Instant;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashSet;
@@ -49,6 +51,28 @@ public final class ArchiveCatalog {
     private final AtomicInteger openOverlayCursors = new AtomicInteger();
     private final AtomicLong overlayRowsRead = new AtomicLong();
 
+    /*
+     * Lock ordering for every observation mutation is deliberately fixed:
+     *
+     *  1. shared store mutation lock;
+     *  2. observation locks in ascending numeric ID order;
+     *  3. hot observation row, overlay row, then tombstone/generation rows;
+     *  4. the retention-hold table, when lifecycle deletion needs it.
+     *
+     * Archive activation takes the exclusive form of the store lock before it
+     * marks hot rows.  It never takes an observation lock.  Consequently it
+     * cannot form a store-lock/row-lock cycle with an observation mutation.
+     * hashtextextended collisions are conservative (extra serialization), not
+     * a correctness failure.
+     */
+    private String storeMutationLockKey() {
+        return "oscar:archive-store:" + storeKey + ':' + idScope;
+    }
+
+    private String observationMutationLockPrefix() {
+        return "oscar:archive-observation:" + storeKey + ':' + idScope + ':';
+    }
+
     public ArchiveCatalog(SqlConnectionProvider connections, String storeKey, int idScope) {
         this.connections = connections;
         this.storeKey = safeIdentifier(storeKey);
@@ -61,6 +85,56 @@ public final class ArchiveCatalog {
 
     public int idScope() {
         return idScope;
+    }
+
+    public void lockForActivation(Connection connection) throws SQLException {
+        requireTransaction(connection);
+        try (PreparedStatement statement = connection.prepareStatement(
+                "SELECT pg_advisory_xact_lock(hashtextextended(?, 0))")) {
+            statement.setString(1, storeMutationLockKey());
+            statement.execute();
+        }
+    }
+
+    public void lockForMutation(Connection connection, long observationId) throws SQLException {
+        lockForMutation(connection, List.of(observationId));
+    }
+
+    public void lockForMutation(Connection connection, Collection<Long> observationIds) throws SQLException {
+        requireTransaction(connection);
+        try (PreparedStatement storeLock = connection.prepareStatement(
+                "SELECT pg_advisory_xact_lock_shared(hashtextextended(?, 0))")) {
+            storeLock.setString(1, storeMutationLockKey());
+            storeLock.execute();
+        }
+        List<Long> ordered = observationIds.stream().distinct().sorted().toList();
+        if (ordered.isEmpty())
+            return;
+        java.sql.Array ids = connection.createArrayOf("bigint", ordered.toArray(Long[]::new));
+        try (PreparedStatement observationLock = connection.prepareStatement(
+                "SELECT count(*) FROM (" +
+                        "SELECT pg_advisory_xact_lock(hashtextextended(? || observation_id::text, 0)) " +
+                        "FROM unnest(?::bigint[]) WITH ORDINALITY requested(observation_id, ordinal) " +
+                        "ORDER BY ordinal) acquired")) {
+            // One server round trip acquires every per-ID lock.  The Java-side
+            // sort plus WITH ORDINALITY makes the evaluation order explicit;
+            // the volatile lock call cannot be elided from the ordered derived
+            // table.  This preserves deadlock avoidance without turning a
+            // 10,000-row JDBC batch into 10,000 network round trips.
+            observationLock.setString(1, observationMutationLockPrefix());
+            observationLock.setArray(2, ids);
+            try (ResultSet result = observationLock.executeQuery()) {
+                if (!result.next() || result.getLong(1) != ordered.size())
+                    throw new SQLException("PostgreSQL did not acquire every requested observation lock");
+            }
+        } finally {
+            ids.free();
+        }
+    }
+
+    private static void requireTransaction(Connection connection) throws SQLException {
+        if (connection == null || connection.getAutoCommit())
+            throw new IllegalArgumentException("Archive mutation locks require a caller-owned transaction");
     }
 
     public void migrate() {
@@ -410,6 +484,12 @@ public final class ArchiveCatalog {
                 String observations = safeIdentifier(observationTable);
                 String dataStreams = safeIdentifier(dataStreamTable);
                 stageExportedRows(connection, parquetPath, generation);
+                // Staging does not touch mutable PostgreSQL rows.  Acquire the
+                // exclusive store lock only for the activation transaction's
+                // critical section so ordinary ingestion is not blocked by
+                // Parquet decoding.  Exact row predicates below still reject
+                // every mutation that committed before this lock was granted.
+                lockForActivation(connection);
                 try (PreparedStatement mark = connection.prepareStatement(
                         "UPDATE " + observations + " o SET archivegenerationid=? " +
                                 "FROM oscar_archive_activation_row exported, " + dataStreams + " d " +
@@ -628,6 +708,21 @@ public final class ArchiveCatalog {
     }
 
     public List<ArchiveGeneration> candidates(Instant start, Instant end, Long observationId) {
+        try (Connection connection = connections.open()) {
+            return candidates(connection, start, end, observationId);
+        } catch (SQLException e) {
+            throw new IllegalStateException("Cannot plan archive query", e);
+        }
+    }
+
+    /**
+     * Connection-scoped candidate lookup for callers already holding archive
+     * mutation locks.  Reusing that transaction avoids nested pool borrows and
+     * the resulting pool-exhaustion deadlock under concurrent cold mutations.
+     */
+    public List<ArchiveGeneration> candidates(Connection connection, Instant start,
+                                               Instant end, Long observationId)
+            throws SQLException {
         String sql = "SELECT DISTINCT g.id, g.profile, g.window_start, g.window_end, g.object_path, g.sha256, " +
                 "g.row_count, g.min_id, g.max_id, g.state, g.parity_verified FROM oscar_archive_generation g ";
         if (observationId != null)
@@ -639,7 +734,7 @@ public final class ArchiveCatalog {
         sql += "ORDER BY g.window_start, g.id";
 
         List<ArchiveGeneration> generations = new ArrayList<>();
-        try (Connection connection = connections.open(); PreparedStatement statement = connection.prepareStatement(sql)) {
+        try (PreparedStatement statement = connection.prepareStatement(sql)) {
             statement.setString(1, storeKey);
             statement.setInt(2, idScope);
             UtcJdbcTime.setInstant(statement, 3, end);
@@ -654,8 +749,6 @@ public final class ArchiveCatalog {
                             result.getLong(7), result.getLong(8), result.getLong(9), result.getString(10), result.getBoolean(11)));
                 }
             }
-        } catch (SQLException e) {
-            throw new IllegalStateException("Cannot plan archive query", e);
         }
         return generations;
     }
@@ -696,6 +789,27 @@ public final class ArchiveCatalog {
             }
         } catch (SQLException e) {
             throw new IllegalStateException("Cannot inspect archive high-water mark", e);
+        }
+    }
+
+    /**
+     * Durable observation ID high-water for this exact store namespace.  All
+     * catalog states are included so IDs are never reused after a generation
+     * is sealed or purged and an external reference may still exist.
+     */
+    public Optional<Long> maximumObservationId() {
+        try (Connection connection = connections.open(); PreparedStatement statement = connection.prepareStatement(
+                "SELECT max(max_id) FROM oscar_archive_generation WHERE store_key=? AND id_scope=?")) {
+            statement.setString(1, storeKey);
+            statement.setInt(2, idScope);
+            try (ResultSet result = statement.executeQuery()) {
+                if (!result.next())
+                    return Optional.empty();
+                Long value = result.getObject(1, Long.class);
+                return Optional.ofNullable(value);
+            }
+        } catch (SQLException e) {
+            throw new IllegalStateException("Cannot inspect archived observation ID high-water", e);
         }
     }
 
@@ -793,15 +907,31 @@ public final class ArchiveCatalog {
     }
 
     public void markSealed(UUID generationId) {
-        try (Connection connection = connections.open(); PreparedStatement statement = connection.prepareStatement(
-                "UPDATE oscar_archive_generation SET state='SEALED', sealed_at=now() " +
-                        "WHERE id=? AND store_key=? AND id_scope=? AND state='ACTIVE' AND parity_verified=true")) {
-            statement.setObject(1, generationId);
-            statement.setString(2, storeKey);
-            statement.setInt(3, idScope);
-            if (statement.executeUpdate() != 1)
-                throw new IllegalStateException("Generation is not eligible to seal: " + generationId);
-        } catch (SQLException e) {
+        try (Connection connection = connections.open()) {
+            boolean oldAutoCommit = connection.getAutoCommit();
+            connection.setAutoCommit(false);
+            try {
+                // Sealing is a store-wide lifecycle boundary.  Serialize it
+                // with all logical mutations just like activation, after all
+                // per-ID hot-deletion transactions have completed.
+                lockForActivation(connection);
+                try (PreparedStatement statement = connection.prepareStatement(
+                        "UPDATE oscar_archive_generation SET state='SEALED', sealed_at=now() " +
+                                "WHERE id=? AND store_key=? AND id_scope=? AND state='ACTIVE' AND parity_verified=true")) {
+                    statement.setObject(1, generationId);
+                    statement.setString(2, storeKey);
+                    statement.setInt(3, idScope);
+                    if (statement.executeUpdate() != 1)
+                        throw new IllegalStateException("Generation is not eligible to seal: " + generationId);
+                }
+                connection.commit();
+            } catch (Exception error) {
+                connection.rollback();
+                throw error;
+            } finally {
+                connection.setAutoCommit(oldAutoCommit);
+            }
+        } catch (Exception e) {
             throw new IllegalStateException("Cannot seal archive generation", e);
         }
     }
@@ -822,7 +952,16 @@ public final class ArchiveCatalog {
     }
 
     public Optional<String> schemaJson(UUID generationId, long dataStreamId) {
-        try (Connection connection = connections.open(); PreparedStatement statement = connection.prepareStatement(
+        try (Connection connection = connections.open()) {
+            return schemaJson(connection, generationId, dataStreamId);
+        } catch (SQLException e) {
+            throw new IllegalStateException("Cannot load archived datastream schema", e);
+        }
+    }
+
+    public Optional<String> schemaJson(Connection connection, UUID generationId, long dataStreamId)
+            throws SQLException {
+        try (PreparedStatement statement = connection.prepareStatement(
                 "SELECT schema.schema_json::text FROM oscar_archive_schema schema " +
                         "JOIN oscar_archive_generation generation ON generation.id=schema.generation_id " +
                         "WHERE schema.generation_id=? AND schema.datastream_id=? " +
@@ -834,8 +973,6 @@ public final class ArchiveCatalog {
             try (ResultSet result = statement.executeQuery()) {
                 return result.next() ? Optional.of(result.getString(1)) : Optional.empty();
             }
-        } catch (SQLException e) {
-            throw new IllegalStateException("Cannot load archived datastream schema", e);
         }
     }
 
@@ -844,14 +981,26 @@ public final class ArchiveCatalog {
     }
 
     public Optional<ArchivedOverlay> overlayWithGeneration(long observationId, int scope, String profile) {
-        try (Connection connection = connections.open(); PreparedStatement statement = connection.prepareStatement(
+        try (Connection connection = connections.open()) {
+            return overlayWithGeneration(connection, observationId, scope, profile, false);
+        } catch (SQLException e) {
+            throw new IllegalStateException("Cannot read archive overlay", e);
+        }
+    }
+
+    public Optional<ArchivedOverlay> overlayWithGeneration(Connection connection, long observationId,
+                                                            int scope, String profile,
+                                                            boolean forUpdate) throws SQLException {
+        String sql =
                 "SELECT overlay_row.generation_id, datastream_id, foi_id, phenomenon_time, result_time, " +
                         "result_json::text, schema_json::text " +
                         "FROM oscar_obs_overlay overlay_row JOIN oscar_archive_generation generation " +
                         "ON generation.id=overlay_row.generation_id " +
                         "WHERE overlay_row.store_key=? AND overlay_row.id_scope=? AND observation_id=? " +
                         "AND generation.store_key=overlay_row.store_key AND generation.id_scope=overlay_row.id_scope " +
-                        "AND generation.state IN ('ACTIVE','SEALED')")) {
+                        "AND generation.state IN ('ACTIVE','SEALED')" +
+                        (forUpdate ? " FOR UPDATE OF overlay_row" : "");
+        try (PreparedStatement statement = connection.prepareStatement(sql)) {
             statement.setString(1, storeKey);
             statement.setInt(2, idScope);
             statement.setLong(3, observationId);
@@ -868,8 +1017,6 @@ public final class ArchiveCatalog {
                         resultTime == null ? null : resultTime, result.getString(6), profile);
                 return Optional.of(new ArchivedOverlay(generationId, result.getString(7), observation));
             }
-        } catch (SQLException e) {
-            throw new IllegalStateException("Cannot read archive overlay", e);
         }
     }
 
@@ -877,8 +1024,21 @@ public final class ArchiveCatalog {
         if (schemaJson == null || schemaJson.isBlank())
             throw new IllegalArgumentException("Archived observation overlays require an immutable schema snapshot");
         try (Connection connection = connections.open()) {
-            upsertOverlay(connection, generationId, observation, schemaJson);
-        } catch (SQLException e) {
+            boolean oldAutoCommit = connection.getAutoCommit();
+            connection.setAutoCommit(false);
+            try {
+                lockForMutation(connection, observation.id());
+                upsertOverlay(connection, generationId, observation, schemaJson);
+                connection.commit();
+            } catch (Exception error) {
+                connection.rollback();
+                throw error;
+            } finally {
+                connection.setAutoCommit(oldAutoCommit);
+            }
+        } catch (RuntimeException e) {
+            throw e;
+        } catch (Exception e) {
             throw new IllegalStateException("Cannot update archived observation overlay", e);
         }
     }
@@ -886,7 +1046,8 @@ public final class ArchiveCatalog {
     /**
      * Transaction-scoped overlay upsert used when ingestion discovers that a
      * natural-key correction targets an immutable generation-owned hot row.
-     * The caller owns commit/rollback and connection lifecycle.
+     * The caller owns commit/rollback and connection lifecycle and must have
+     * acquired {@link #lockForMutation(Connection, Collection)} for this ID.
      */
     public void upsertOverlay(Connection connection, UUID generationId,
                               ArchivedObservation observation, String schemaJson) throws SQLException {
@@ -921,7 +1082,15 @@ public final class ArchiveCatalog {
     }
 
     public boolean isTombstoned(long observationId) {
-        try (Connection connection = connections.open(); PreparedStatement statement = connection.prepareStatement(
+        try (Connection connection = connections.open()) {
+            return isTombstoned(connection, observationId);
+        } catch (SQLException e) {
+            throw new IllegalStateException("Cannot read archive tombstone", e);
+        }
+    }
+
+    public boolean isTombstoned(Connection connection, long observationId) throws SQLException {
+        try (PreparedStatement statement = connection.prepareStatement(
                 "SELECT 1 FROM oscar_tombstone tombstone " +
                         "WHERE tombstone.store_key=? AND tombstone.id_scope=? " +
                         "AND subject_type='OBSERVATION' AND subject_id=? AND generation_id IS NOT NULL " +
@@ -934,8 +1103,6 @@ public final class ArchiveCatalog {
             try (ResultSet result = statement.executeQuery()) {
                 return result.next();
             }
-        } catch (SQLException e) {
-            throw new IllegalStateException("Cannot read archive tombstone", e);
         }
     }
 
@@ -1050,33 +1217,17 @@ public final class ArchiveCatalog {
         appendTime(sql, "overlay_row.result_time", filter.getResultTime(), parameters);
         boolean descending = filter.getPhenomenonTime() != null &&
                 filter.getPhenomenonTime().descendingOrder();
-        sql.append(" ORDER BY overlay_row.phenomenon_time ")
-                .append(descending ? "DESC" : "ASC")
-                .append(" NULLS FIRST, overlay_row.observation_id ASC");
-
-        Connection connection = null;
-        PreparedStatement statement = null;
-        ResultSet result = null;
-        try {
-            connection = connections.open();
-            connection.setReadOnly(true);
-            connection.setAutoCommit(false);
-            statement = connection.prepareStatement(sql.toString());
-            statement.setFetchSize(1_000);
-            for (int i = 0; i < parameters.size(); i++)
-                parameters.get(i).bind(connection, statement, i + 1);
-            result = statement.executeQuery();
-            OverlayCursor cursor = new OverlayCursor(scope, connection, statement, result);
-            openOverlayCursors.incrementAndGet();
-            return StreamSupport.stream(Spliterators.spliteratorUnknownSize(cursor,
-                            Spliterator.ORDERED | Spliterator.NONNULL), false)
-                    .onClose(cursor::close);
-        } catch (Exception error) {
-            closeQuietly(result);
-            closeQuietly(statement);
-            closeQuietly(connection);
-            throw new IllegalStateException("Cannot stream observation overlays", error);
-        }
+        // Do not retain a PostgreSQL connection while the tier merge invokes
+        // the hot iterator or a base-row mutation lookup: those callbacks use
+        // the same bounded pool and a retained cursor can deadlock at pool size
+        // one (or when every pool connection is serving a concurrent merge).
+        // Keyset pages keep memory bounded without OFFSET's quadratic rescans.
+        OverlayCursor cursor = new OverlayCursor(scope, sql.toString(),
+                List.copyOf(parameters), descending);
+        openOverlayCursors.incrementAndGet();
+        return StreamSupport.stream(Spliterators.spliteratorUnknownSize(cursor,
+                        Spliterator.ORDERED | Spliterator.NONNULL), false)
+                .onClose(cursor::close);
     }
 
     public int getOpenOverlayCursorCount() {
@@ -1104,22 +1255,14 @@ public final class ArchiveCatalog {
         Instant minimum = filter.getMin();
         Instant maximum = filter.getMax();
         if (minimum != null && !Instant.MIN.equals(minimum)) {
-            sql.append(" AND ").append(column).append(">=?");
+            String operator = filter.getRange().lowerBoundType() == BoundType.CLOSED ? ">=" : ">";
+            sql.append(" AND ").append(column).append(operator).append('?');
             parameters.add(new InstantParameter(minimum));
         }
         if (maximum != null && !Instant.MAX.equals(maximum)) {
-            sql.append(" AND ").append(column).append("<=?");
+            String operator = filter.getRange().upperBoundType() == BoundType.CLOSED ? "<=" : "<";
+            sql.append(" AND ").append(column).append(operator).append('?');
             parameters.add(new InstantParameter(maximum));
-        }
-    }
-
-    private static void closeQuietly(AutoCloseable resource) {
-        if (resource == null)
-            return;
-        try {
-            resource.close();
-        } catch (Exception ignored) {
-            // Preserve the primary query/decoding error and continue closing.
         }
     }
 
@@ -1156,41 +1299,40 @@ public final class ArchiveCatalog {
     }
 
     private final class OverlayCursor implements Iterator<ArchivedOverlay>, AutoCloseable {
-        private final int scope;
-        private final Connection connection;
-        private final PreparedStatement statement;
-        private final ResultSet result;
-        private final AtomicBoolean closed = new AtomicBoolean();
-        private ArchivedOverlay next;
-        private boolean prefetched;
+        private static final int PAGE_SIZE = 1_000;
 
-        OverlayCursor(int scope, Connection connection, PreparedStatement statement, ResultSet result) {
+        private final int scope;
+        private final String baseSql;
+        private final List<QueryParameter> baseParameters;
+        private final boolean descending;
+        private final ArrayDeque<ArchivedOverlay> ready = new ArrayDeque<>(PAGE_SIZE);
+        private final AtomicBoolean closed = new AtomicBoolean();
+        private Instant lastPhenomenonTime;
+        private long lastObservationId;
+        private boolean hasContinuation;
+        private boolean exhausted;
+
+        OverlayCursor(int scope, String baseSql, List<QueryParameter> baseParameters,
+                      boolean descending) {
             this.scope = scope;
-            this.connection = connection;
-            this.statement = statement;
-            this.result = result;
+            this.baseSql = baseSql;
+            this.baseParameters = baseParameters;
+            this.descending = descending;
         }
 
         @Override
         public boolean hasNext() {
-            if (prefetched)
+            if (!ready.isEmpty())
                 return true;
             if (closed.get())
                 return false;
             try {
-                if (!result.next()) {
+                if (!exhausted)
+                    fetchPage();
+                if (ready.isEmpty()) {
                     close();
                     return false;
                 }
-                UUID generationId = result.getObject(1, UUID.class);
-                long id = result.getLong(2);
-                Long foi = result.getObject(4, Long.class);
-                next = new ArchivedOverlay(generationId, result.getString(8), new ArchivedObservation(
-                        scope, id, scope, result.getLong(3), foi == null ? null : scope, foi,
-                        UtcJdbcTime.getInstant(result, 5), UtcJdbcTime.getInstant(result, 6),
-                        result.getString(7), "OVERLAY"));
-                overlayRowsRead.incrementAndGet();
-                prefetched = true;
                 return true;
             } catch (Exception error) {
                 close();
@@ -1202,28 +1344,72 @@ public final class ArchiveCatalog {
         public ArchivedOverlay next() {
             if (!hasNext())
                 throw new NoSuchElementException();
-            ArchivedOverlay value = next;
-            next = null;
-            prefetched = false;
-            return value;
+            return ready.removeFirst();
+        }
+
+        private void fetchPage() throws SQLException {
+            StringBuilder sql = new StringBuilder(baseSql);
+            if (hasContinuation) {
+                if (lastPhenomenonTime == null) {
+                    sql.append(" AND ((overlay_row.phenomenon_time IS NULL " +
+                            "AND overlay_row.observation_id>?) " +
+                            "OR overlay_row.phenomenon_time IS NOT NULL)");
+                } else {
+                    sql.append(" AND overlay_row.phenomenon_time IS NOT NULL AND (")
+                            .append("overlay_row.phenomenon_time")
+                            .append(descending ? "<?" : ">?")
+                            .append(" OR (overlay_row.phenomenon_time=? " +
+                                    "AND overlay_row.observation_id>?))");
+                }
+            }
+            sql.append(" ORDER BY overlay_row.phenomenon_time ")
+                    .append(descending ? "DESC" : "ASC")
+                    .append(" NULLS FIRST, overlay_row.observation_id ASC LIMIT ?");
+
+            int fetched = 0;
+            try (Connection connection = connections.open();
+                 PreparedStatement statement = connection.prepareStatement(sql.toString())) {
+                connection.setReadOnly(true);
+                int parameter = 1;
+                for (QueryParameter baseParameter : baseParameters)
+                    baseParameter.bind(connection, statement, parameter++);
+                if (hasContinuation) {
+                    if (lastPhenomenonTime == null) {
+                        statement.setLong(parameter++, lastObservationId);
+                    } else {
+                        UtcJdbcTime.setInstant(statement, parameter++, lastPhenomenonTime);
+                        UtcJdbcTime.setInstant(statement, parameter++, lastPhenomenonTime);
+                        statement.setLong(parameter++, lastObservationId);
+                    }
+                }
+                statement.setInt(parameter, PAGE_SIZE);
+                try (ResultSet result = statement.executeQuery()) {
+                    while (result.next()) {
+                        UUID generationId = result.getObject(1, UUID.class);
+                        long id = result.getLong(2);
+                        Long foi = result.getObject(4, Long.class);
+                        Instant phenomenonTime = UtcJdbcTime.getInstant(result, 5);
+                        ready.addLast(new ArchivedOverlay(generationId, result.getString(8),
+                                new ArchivedObservation(scope, id, scope, result.getLong(3),
+                                        foi == null ? null : scope, foi, phenomenonTime,
+                                        UtcJdbcTime.getInstant(result, 6), result.getString(7), "OVERLAY")));
+                        lastPhenomenonTime = phenomenonTime;
+                        lastObservationId = id;
+                        fetched++;
+                    }
+                }
+            }
+            overlayRowsRead.addAndGet(fetched);
+            hasContinuation = fetched > 0;
+            exhausted = fetched < PAGE_SIZE;
         }
 
         @Override
         public void close() {
             if (!closed.compareAndSet(false, true))
                 return;
-            closeQuietly(result);
-            closeQuietly(statement);
-            try {
-                connection.rollback();
-            } catch (Exception ignored) {
-                // The cursor resources are already closed; pool close below
-                // performs its own reset as a final safeguard.
-            }
-            closeQuietly(connection);
             openOverlayCursors.decrementAndGet();
-            next = null;
-            prefetched = false;
+            ready.clear();
         }
     }
 
@@ -1277,26 +1463,41 @@ public final class ArchiveCatalog {
     public void tombstone(long observationId, UUID generationId, String reason, String policy) {
         if (generationId == null)
             throw new IllegalArgumentException("Archived observation tombstones require an exact generation ID");
-        try (Connection connection = connections.open(); PreparedStatement statement = connection.prepareStatement(
-                "INSERT INTO oscar_tombstone(store_key, id_scope, subject_type, subject_id, generation_id, reason, policy) " +
-                        "SELECT ?, ?, 'OBSERVATION', ?, generation.id, ?, ? " +
-                        "FROM oscar_archive_generation generation WHERE generation.id=? " +
-                        "AND generation.store_key=? AND generation.id_scope=? " +
-                        "AND generation.state IN ('ACTIVE','SEALED') " +
-                        "ON CONFLICT (subject_type, store_key, id_scope, subject_id) DO UPDATE SET " +
-                        "generation_id=EXCLUDED.generation_id, reason=EXCLUDED.reason, policy=EXCLUDED.policy, " +
-                        "deleted_at=now()")) {
-            statement.setString(1, storeKey);
-            statement.setInt(2, idScope);
-            statement.setString(3, Long.toString(observationId));
-            statement.setString(4, reason);
-            statement.setString(5, policy);
-            statement.setObject(6, generationId);
-            statement.setString(7, storeKey);
-            statement.setInt(8, idScope);
-            if (statement.executeUpdate() != 1)
-                throw new IllegalArgumentException("Archive generation does not belong to this observation store: " + generationId);
-        } catch (SQLException e) {
+        try (Connection connection = connections.open()) {
+            boolean oldAutoCommit = connection.getAutoCommit();
+            connection.setAutoCommit(false);
+            try {
+                lockForMutation(connection, observationId);
+                try (PreparedStatement statement = connection.prepareStatement(
+                        "INSERT INTO oscar_tombstone(store_key, id_scope, subject_type, subject_id, generation_id, reason, policy) " +
+                                "SELECT ?, ?, 'OBSERVATION', ?, generation.id, ?, ? " +
+                                "FROM oscar_archive_generation generation WHERE generation.id=? " +
+                                "AND generation.store_key=? AND generation.id_scope=? " +
+                                "AND generation.state IN ('ACTIVE','SEALED') " +
+                                "ON CONFLICT (subject_type, store_key, id_scope, subject_id) DO UPDATE SET " +
+                                "generation_id=EXCLUDED.generation_id, reason=EXCLUDED.reason, policy=EXCLUDED.policy, " +
+                                "deleted_at=now()")) {
+                    statement.setString(1, storeKey);
+                    statement.setInt(2, idScope);
+                    statement.setString(3, Long.toString(observationId));
+                    statement.setString(4, reason);
+                    statement.setString(5, policy);
+                    statement.setObject(6, generationId);
+                    statement.setString(7, storeKey);
+                    statement.setInt(8, idScope);
+                    if (statement.executeUpdate() != 1)
+                        throw new IllegalArgumentException("Archive generation does not belong to this observation store: " + generationId);
+                }
+                connection.commit();
+            } catch (Exception error) {
+                connection.rollback();
+                throw error;
+            } finally {
+                connection.setAutoCommit(oldAutoCommit);
+            }
+        } catch (RuntimeException e) {
+            throw e;
+        } catch (Exception e) {
             throw new IllegalStateException("Cannot tombstone archived observation", e);
         }
     }
@@ -1305,7 +1506,8 @@ public final class ArchiveCatalog {
      * Creates an observation tombstone on a caller-owned transaction and
      * reports whether this call performed the logical visible-to-deleted
      * transition.  A concurrent or repeated deletion returns {@code false}
-     * instead of being double-counted.
+     * instead of being double-counted. The caller must have acquired
+     * {@link #lockForMutation(Connection, Collection)} for this ID.
      */
     public boolean tombstoneIfAbsent(Connection connection, long observationId,
                                      UUID generationId, String reason, String policy)

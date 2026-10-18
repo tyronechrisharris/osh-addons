@@ -1,5 +1,6 @@
 package org.sensorhub.impl.datastore.postgis.archive;
 
+import com.google.common.collect.BoundType;
 import org.sensorhub.api.common.BigId;
 import org.sensorhub.api.datastore.TemporalFilter;
 import org.sensorhub.api.datastore.obs.ObsFilter;
@@ -428,11 +429,13 @@ public final class ParquetArchiveReader {
         Instant minimum = filter.getMin();
         Instant maximum = filter.getMax();
         if (minimum != null && !Instant.MIN.equals(minimum)) {
-            sql.append(" AND ").append(column).append(" >= ?");
+            String operator = filter.getRange().lowerBoundType() == BoundType.CLOSED ? ">=" : ">";
+            sql.append(" AND ").append(column).append(' ').append(operator).append(" ?");
             parameters.add(minimum);
         }
         if (maximum != null && !Instant.MAX.equals(maximum)) {
-            sql.append(" AND ").append(column).append(" <= ?");
+            String operator = filter.getRange().upperBoundType() == BoundType.CLOSED ? "<=" : "<";
+            sql.append(" AND ").append(column).append(' ').append(operator).append(" ?");
             parameters.add(maximum);
         }
     }
