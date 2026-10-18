@@ -556,17 +556,30 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
         Set<Long> dataStreams = resolveDataStreams(filter.getDataStreamFilter());
         Set<Long> fois = resolveFois(filter.getFoiFilter());
         boolean latest = hasLatestSelection(filter);
+        boolean pushDownLatest = latest && !hasMutations &&
+                queryBuilder.supportsLatestResultPerDataStreamQuery(filter);
 
         // The top N of a union can only contain rows from the top N of either
         // ordered tier. Push the bound into both engines in the common,
         // mutation-free case; fall back to a complete merge when a predicate,
         // overlay, tombstone, or latest-per-stream reduction can invalidate a
-        // pre-limit row.
+        // pre-limit row. Latest-per-stream is also safe to push into both tiers
+        // when there are no sparse mutations: the final union only needs the
+        // one hot and one cold candidate for each stream. This preserves exact
+        // hot/cold semantics without scanning the complete hot observation
+        // history for every Viewer health refresh.
         boolean boundedMerge = !latest && filter.getLimit() != Long.MAX_VALUE &&
                 filter.getCQLFilter() == null && filter.getValuePredicate() == null &&
                 filter.getPhenomenonLocation() == null && !hasMutations;
+        // Do not push the caller's final LIMIT into latest-per-stream tiers.
+        // The PostgreSQL and Parquet plans already reduce to one row per
+        // explicitly selected stream, but they order those rows differently
+        // from the final logical union. Applying (for example) LIMIT 1 in each
+        // tier could discard a different stream that belongs in the union's
+        // final top row. Leaving this small, stream-bounded candidate set
+        // unbounded preserves the public ordering/limit contract.
         long tierLimit = boundedMerge ? filter.getLimit() : Long.MAX_VALUE;
-        ObsFilter tierFilter = latest ? withoutLatestSelection(filter, tierLimit) :
+        ObsFilter tierFilter = latest && !pushDownLatest ? withoutLatestSelection(filter, tierLimit) :
                 ObsFilter.Builder.from(filter).withLimit(tierLimit).build();
         Comparator<Entry<BigId, IObsData>> comparator = entryComparator(filter);
 

@@ -56,6 +56,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 import static org.junit.Assert.assertEquals;
@@ -543,6 +544,98 @@ public class TestDisposableTieredPostgresIntegration extends TestPostgisObsStore
         assertEquals(0, tiered.getNumRecords());
         assertTrue(catalog.overlay(overlayId, DATABASE_NUM, "OVERLAY").isEmpty());
         assertFalse(catalog.isTombstoned(deletedId));
+    }
+
+    @Test
+    public void latestResultPushdownPreservesFinalLimitAcrossHotAndColdTiers() throws Exception {
+        OscarTieredObsStore tiered = (OscarTieredObsStore) postgisObsStore;
+        Instant start = Instant.parse("2026-01-03T00:00:00Z");
+        BigId first = addSimpleDataStream(bigId(701), "gammaCounts");
+        BigId second = addSimpleDataStream(bigId(702), "gammaCounts");
+        BigId third = addSimpleDataStream(bigId(703), "gammaCounts");
+
+        addSimpleObsWithoutResultTime(first, BigId.NONE, start.plusSeconds(10), 1, 0);
+        addSimpleObsWithoutResultTime(second, BigId.NONE, start.plusSeconds(20), 1, 0);
+        addSimpleObsWithoutResultTime(third, BigId.NONE, start.plusSeconds(30), 1, 0);
+        forceReadBackFromStorage();
+        tiered.archiveWindow(start, start.plus(1, ChronoUnit.HOURS), "RAW_GATED").orElseThrow();
+
+        // Result time selects these hot rows as latest for each stream, while
+        // phenomenon time deliberately puts the highest stream ID first in
+        // the final public ordering. A tier-local LIMIT 1 would incorrectly
+        // keep only the lowest ID before the hot/cold union.
+        BigId[] streams = {first, second, third};
+        long[] phenomenonMinutes = {30, 20, 10};
+        for (int index = 0; index < streams.length; index++) {
+            DataBlock result = new DataBlockDouble(5);
+            tiered.add(new ObsData.Builder()
+                    .withDataStream(streams[index])
+                    .withPhenomenonTime(start.plus(phenomenonMinutes[index], ChronoUnit.MINUTES))
+                    .withResultTime(start.plus(2, ChronoUnit.HOURS).plusSeconds(index))
+                    .withResult(result)
+                    .build());
+        }
+        forceReadBackFromStorage();
+
+        ObsFilter latestOne = new ObsFilter.Builder()
+                .withDataStreams(first, second, third)
+                .withLatestResult()
+                .withLimit(1)
+                .build();
+        try (var rows = tiered.selectEntries(latestOne)) {
+            var selected = rows.toList();
+            assertEquals(1, selected.size());
+            assertEquals(third, selected.get(0).getValue().getDataStreamID());
+            assertEquals(start.plus(10, ChronoUnit.MINUTES),
+                    selected.get(0).getValue().getPhenomenonTime());
+        }
+        assertEquals(0, tiered.getOpenArchiveCursorCount());
+    }
+
+    @Test
+    public void latestResultProbeUsesGreatestIdForNullAndEqualResultTimes() throws Exception {
+        OscarTieredObsStore tiered = (OscarTieredObsStore) postgisObsStore;
+        Instant start = Instant.parse("2026-01-04T00:00:00Z");
+        BigId allNull = addSimpleDataStream(bigId(711), "gammaCounts");
+        BigId equalTime = addSimpleDataStream(bigId(712), "gammaCounts");
+        Map<BigId, org.sensorhub.api.data.IObsData> nullRows =
+                addSimpleObsWithoutResultTime(allNull, BigId.NONE, start.plusSeconds(20), 2, 1_000);
+        Map<BigId, org.sensorhub.api.data.IObsData> tiedRows =
+                addSimpleObsWithoutResultTime(equalTime, BigId.NONE, start, 2, 1_000);
+        forceReadBackFromStorage();
+
+        Instant sharedResultTime = start.plus(1, ChronoUnit.HOURS);
+        try (Connection connection = open()) {
+            try (PreparedStatement statement = connection.prepareStatement(
+                    "UPDATE " + TABLE + " SET resulttime=NULL WHERE datastreamid=?")) {
+                statement.setLong(1, allNull.getIdAsLong());
+                assertEquals(2, statement.executeUpdate());
+            }
+            try (PreparedStatement statement = connection.prepareStatement(
+                    "UPDATE " + TABLE + " SET resulttime=? WHERE datastreamid=?")) {
+                UtcJdbcTime.setInstant(statement, 1, sharedResultTime);
+                statement.setLong(2, equalTime.getIdAsLong());
+                assertEquals(2, statement.executeUpdate());
+            }
+        }
+
+        ObsFilter latest = new ObsFilter.Builder()
+                .withDataStreams(allNull, equalTime)
+                .withLatestResult()
+                .build();
+        try (var rows = tiered.selectEntries(latest)) {
+            var selected = rows.toList();
+            assertEquals(2, selected.size());
+            assertEquals("The optimized probe must retain public phenomenon-time ordering",
+                    List.of(equalTime, allNull), selected.stream()
+                            .map(entry -> entry.getValue().getDataStreamID()).toList());
+            Map<BigId, BigId> selectedIds = selected.stream().collect(Collectors.toMap(
+                    entry -> entry.getValue().getDataStreamID(), Map.Entry::getKey));
+            assertEquals(tiedRows.keySet().stream().max(Comparator.comparingLong(BigId::getIdAsLong)).orElseThrow(),
+                    selectedIds.get(equalTime));
+            assertEquals(nullRows.keySet().stream().max(Comparator.comparingLong(BigId::getIdAsLong)).orElseThrow(),
+                    selectedIds.get(allNull));
+        }
     }
 
     @Test

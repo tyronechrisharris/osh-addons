@@ -194,9 +194,12 @@ public class TestParameterizedQueryBuilder {
 
         assertTrue(query.sql().contains("unnest(ARRAY[?,?,?]::bigint[])"));
         assertTrue(query.sql().contains("CROSS JOIN LATERAL"));
-        assertTrue(query.sql().contains("candidate.dataStreamID = requested.dataStreamID"));
-        assertTrue(query.sql().contains("ORDER BY candidate.resultTime DESC, candidate.phenomenonTime ASC FETCH FIRST 1 ROW ONLY"));
-        assertTrue(query.sql().endsWith("ORDER BY latest.dataStreamID, latest.resultTime DESC, latest.phenomenonTime ASC LIMIT 2"));
+        assertTrue(query.sql().contains("non_null.dataStreamID = requested.dataStreamID"));
+        assertTrue(query.sql().contains("null_only.dataStreamID = requested.dataStreamID"));
+        assertTrue(query.sql().contains("non_null.resultTime IS NOT NULL ORDER BY non_null.resultTime DESC, non_null.id DESC FETCH FIRST 1 ROW ONLY"));
+        assertTrue(query.sql().contains("null_only.resultTime IS NULL ORDER BY null_only.id DESC FETCH FIRST 1 ROW ONLY"));
+        assertTrue(query.sql().contains("ORDER BY candidate.resultTime DESC NULLS LAST, candidate.id DESC FETCH FIRST 1 ROW ONLY"));
+        assertTrue(query.sql().endsWith("ORDER BY latest.phenomenonTime ASC NULLS FIRST, latest.id ASC LIMIT 2"));
         assertTrue(query.sql().startsWith("SELECT latest.phenomenonTime,latest.result,latest.id"));
         assertEquals(Arrays.asList(101L, 202L, 303L), query.parameters());
     }
