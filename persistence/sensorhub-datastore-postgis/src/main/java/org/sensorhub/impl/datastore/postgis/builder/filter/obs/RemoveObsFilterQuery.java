@@ -14,6 +14,7 @@
 
 package org.sensorhub.impl.datastore.postgis.builder.filter.obs;
 
+import com.google.common.collect.BoundType;
 import org.geotools.api.filter.Filter;
 import org.sensorhub.api.common.BigId;
 import org.sensorhub.api.datastore.TemporalFilter;
@@ -25,8 +26,6 @@ import org.sensorhub.impl.datastore.postgis.builder.filter.feature.RemoveFoiFilt
 import org.sensorhub.impl.datastore.postgis.builder.generator.RemoveFilterQueryGenerator;
 import org.sensorhub.impl.datastore.postgis.utils.PostgisUtils;
 import org.vast.util.Asserts;
-
-import java.util.stream.Collectors;
 
 import static org.sensorhub.api.datastore.obs.IObsStore.ObsField.FOI_ID;
 
@@ -61,10 +60,7 @@ public class RemoveObsFilterQuery extends BaseObsFilterQuery<RemoveFilterQueryGe
             } else {
                 String min = PostgisUtils.checkAndGetValidInstant(temporalFilter.getMin());
                 String max = PostgisUtils.checkAndGetValidInstant(temporalFilter.getMax());
-                addCondition(
-                        "tsrange(?::timestamp, ?::timestamp, '[]') @> "+this.tableName+".phenomenonTime");
-                addParameter(min);
-                addParameter(max);
+                addTimeRangeCondition(this.tableName + ".phenomenonTime", temporalFilter, min, max);
             }
         }
     }
@@ -76,12 +72,34 @@ public class RemoveObsFilterQuery extends BaseObsFilterQuery<RemoveFilterQueryGe
             } else {
                 String min = PostgisUtils.checkAndGetValidInstant(temporalFilter.getMin());
                 String max = PostgisUtils.checkAndGetValidInstant(temporalFilter.getMax());
-                addCondition(
-                        "tsrange(?::timestamp, ?::timestamp, '[]') @> "+this.tableName+".resultTime");
-                addParameter(min);
-                addParameter(max);
+                addTimeRangeCondition(this.tableName + ".resultTime", temporalFilter, min, max);
             }
         }
+    }
+
+    /** Keep REMOVE range semantics equivalent to {@link TemporalFilter#test}. */
+    private void addTimeRangeCondition(String columnName, TemporalFilter temporalFilter,
+                                       String min, String max) {
+        boolean hasMin = isFiniteBound(min);
+        boolean hasMax = isFiniteBound(max);
+        String lowerOperator = temporalFilter.getRange().lowerBoundType() == BoundType.CLOSED ? ">=" : ">";
+        String upperOperator = temporalFilter.getRange().upperBoundType() == BoundType.CLOSED ? "<=" : "<";
+
+        if (hasMin) {
+            addCondition(columnName + " " + lowerOperator + " ?::timestamp");
+            addParameter(min);
+        }
+        if (hasMax) {
+            addCondition(columnName + " " + upperOperator + " ?::timestamp");
+            addParameter(max);
+        }
+    }
+
+    private static boolean isFiniteBound(String bound) {
+        if (bound == null || bound.isBlank())
+            return false;
+        String normalized = bound.trim().toLowerCase();
+        return !"-infinity".equals(normalized) && !"infinity".equals(normalized);
     }
 
     protected void handleFoiFilter(FoiFilter foiFilter, ObsFilter obsFilter) {

@@ -1301,6 +1301,57 @@ public final class ArchiveCatalog {
         }
     }
 
+    /**
+     * Creates an observation tombstone on a caller-owned transaction and
+     * reports whether this call performed the logical visible-to-deleted
+     * transition.  A concurrent or repeated deletion returns {@code false}
+     * instead of being double-counted.
+     */
+    public boolean tombstoneIfAbsent(Connection connection, long observationId,
+                                     UUID generationId, String reason, String policy)
+            throws SQLException {
+        if (connection == null)
+            throw new IllegalArgumentException("A transaction connection is required");
+        if (generationId == null)
+            throw new IllegalArgumentException("Archived observation tombstones require an exact generation ID");
+        try (PreparedStatement statement = connection.prepareStatement(
+                "INSERT INTO oscar_tombstone(store_key, id_scope, subject_type, subject_id, generation_id, reason, policy) " +
+                        "SELECT ?, ?, 'OBSERVATION', ?, generation.id, ?, ? " +
+                        "FROM oscar_archive_generation generation WHERE generation.id=? " +
+                        "AND generation.store_key=? AND generation.id_scope=? " +
+                        "AND generation.state IN ('ACTIVE','SEALED') " +
+                        "ON CONFLICT (subject_type, store_key, id_scope, subject_id) DO NOTHING")) {
+            statement.setString(1, storeKey);
+            statement.setInt(2, idScope);
+            statement.setString(3, Long.toString(observationId));
+            statement.setString(4, reason);
+            statement.setString(5, policy);
+            statement.setObject(6, generationId);
+            statement.setString(7, storeKey);
+            statement.setInt(8, idScope);
+            int inserted = statement.executeUpdate();
+            if (inserted == 1)
+                return true;
+        }
+
+        // Zero rows is valid only for an already deleted observation.  Do not
+        // silently convert a stale/cross-store generation reference into a
+        // successful removal.
+        try (PreparedStatement existing = connection.prepareStatement(
+                "SELECT generation_id FROM oscar_tombstone WHERE store_key=? AND id_scope=? " +
+                        "AND subject_type='OBSERVATION' AND subject_id=?")) {
+            existing.setString(1, storeKey);
+            existing.setInt(2, idScope);
+            existing.setString(3, Long.toString(observationId));
+            try (ResultSet result = existing.executeQuery()) {
+                if (result.next())
+                    return false;
+            }
+        }
+        throw new IllegalArgumentException(
+                "Archive generation is not query-visible for this observation store: " + generationId);
+    }
+
     private static String safeIdentifier(String identifier) {
         if (identifier == null || !identifier.matches("[A-Za-z_][A-Za-z0-9_]*"))
             throw new IllegalArgumentException("Unsafe SQL identifier: " + identifier);

@@ -71,6 +71,7 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
     private static final Instant MIN_ARCHIVE_TIME = Instant.parse("1000-01-01T00:00:00Z");
     private static final Instant MAX_ARCHIVE_TIME = Instant.parse("3000-01-01T00:00:00Z");
     private static final Duration MINIMUM_ARCHIVE_WINDOW = Duration.ofSeconds(1);
+    private static final int REMOVE_BATCH_SIZE = 512;
 
     private final TieredArchiveConfig archiveConfig;
     private final ArchiveCatalog archiveCatalog;
@@ -1387,15 +1388,237 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
     public long removeEntries(ObsFilter filter) {
         if (!archiveConfig.enabled)
             return super.removeEntries(filter);
-        long[] removed = {0L};
-        try (Stream<BigId> stream = selectKeys(filter)) {
-            stream.forEach(id -> {
-                if (remove(id) != null)
-                    removed[0] = Math.addExact(removed[0], 1L);
-            });
+
+        if ((filter.getPhenomenonTime() != null && filter.getPhenomenonTime().isLatestTime()) ||
+                (filter.getResultTime() != null && filter.getResultTime().isLatestTime())) {
+            throw new UnsupportedOperationException("Latest-time filters do not support REMOVE operations");
         }
-        return removed[0];
+        if (filter.getLimit() == 0)
+            return 0;
+
+        Set<Long> dataStreams = resolveDataStreams(filter.getDataStreamFilter());
+        Set<Long> fois = resolveFois(filter.getFoiFilter());
+        long removed = 0;
+        List<Long> previousStalledBatch = null;
+        while (removed < filter.getLimit()) {
+            long remaining = filter.getLimit() == Long.MAX_VALUE
+                    ? REMOVE_BATCH_SIZE : filter.getLimit() - removed;
+            long batchLimit = Math.min(REMOVE_BATCH_SIZE, remaining);
+            ObsFilter candidateFilter = ObsFilter.Builder.from(filter)
+                    .withLimit(batchLimit)
+                    .build();
+            List<BigId> candidates;
+            try (Stream<BigId> stream = selectKeys(candidateFilter)) {
+                candidates = stream.toList();
+            }
+            if (candidates.isEmpty())
+                break;
+
+            // Test subclasses use this hook to reproduce a mutation in the
+            // former select-then-delete race window. Production does nothing.
+            beforeRemoveBatchRevalidation(List.copyOf(candidates));
+            long batchRemoved = removeRevalidatedBatch(filter, candidates, dataStreams, fois);
+            removed = Math.addExact(removed, batchRemoved);
+
+            List<Long> batchIds = candidates.stream()
+                    .map(BigId::getIdAsLong)
+                    .distinct()
+                    .sorted()
+                    .toList();
+            if (batchRemoved == 0 && batchIds.equals(previousStalledBatch)) {
+                throw new IllegalStateException(
+                        "Tiered observation removal made no progress after predicate revalidation");
+            }
+            previousStalledBatch = batchRemoved == 0 ? batchIds : null;
+        }
+        return removed;
     }
+
+    /** Visible only to deterministic concurrency tests. */
+    protected void beforeRemoveBatchRevalidation(List<BigId> candidateIds) {
+        // no-op
+    }
+
+    private long removeRevalidatedBatch(ObsFilter filter, List<BigId> candidates,
+                                        Set<Long> dataStreams, Set<Long> fois) {
+        List<BigId> ordered = candidates.stream()
+                .distinct()
+                .sorted(Comparator.comparingLong(BigId::getIdAsLong))
+                .toList();
+        try (Connection connection = connectionManager.getConnection()) {
+            boolean oldAutoCommit = connection.getAutoCommit();
+            connection.setAutoCommit(false);
+            try {
+                long removed = 0;
+                for (BigId key : ordered) {
+                    long id = key.getIdAsLong();
+                    java.util.Optional<LockedLogicalObservation> hot =
+                            lockHotLogicalObservation(connection, id);
+                    if (hot.isPresent()) {
+                        LockedLogicalObservation current = hot.get();
+                        if (!matchesObservation(filter, dataStreams, fois, id,
+                                current.resultJson(), current.observation())) {
+                            continue;
+                        }
+                        if (current.generationId() != null) {
+                            if (archiveCatalog.tombstoneIfAbsent(connection, id,
+                                    current.generationId(), "Removed through IObsStore filter",
+                                    "USER_OR_SYSTEM_DELETE")) {
+                                removed = Math.addExact(removed, 1L);
+                            }
+                        } else {
+                            try (PreparedStatement delete = connection.prepareStatement(
+                                    "DELETE FROM " + getDatastoreName() +
+                                            " WHERE id=? AND archivegenerationid IS NULL")) {
+                                delete.setLong(1, id);
+                                if (delete.executeUpdate() == 1)
+                                    removed = Math.addExact(removed, 1L);
+                            }
+                        }
+                        continue;
+                    }
+
+                    // Once hot rows have aged out, an overlay is the only
+                    // mutable representation. Lock and recheck it just like a
+                    // hot row. An unmodified Parquet base is immutable, so its
+                    // original candidate match remains valid.
+                    java.util.Optional<LockedLogicalObservation> overlay =
+                            lockColdOverlay(connection, id);
+                    if (overlay.isPresent()) {
+                        LockedLogicalObservation current = overlay.get();
+                        if (!matchesObservation(filter, dataStreams, fois, id,
+                                current.resultJson(), current.observation())) {
+                            continue;
+                        }
+                        if (archiveCatalog.tombstoneIfAbsent(connection, id,
+                                current.generationId(), "Removed through IObsStore filter",
+                                "USER_OR_SYSTEM_DELETE")) {
+                            removed = Math.addExact(removed, 1L);
+                        }
+                        continue;
+                    }
+
+                    java.util.Optional<UUID> generation = findArchiveGeneration(id);
+                    if (generation.isPresent() && archiveCatalog.tombstoneIfAbsent(
+                            connection, id, generation.get(), "Removed through IObsStore filter",
+                            "USER_OR_SYSTEM_DELETE")) {
+                        removed = Math.addExact(removed, 1L);
+                    }
+                }
+                connection.commit();
+                return removed;
+            } catch (Exception error) {
+                connection.rollback();
+                throw error;
+            } finally {
+                connection.setAutoCommit(oldAutoCommit);
+            }
+        } catch (Exception error) {
+            throw new IllegalStateException("Cannot atomically remove tiered observations", error);
+        }
+    }
+
+    private java.util.Optional<LockedLogicalObservation> lockHotLogicalObservation(
+            Connection connection, long observationId) throws Exception {
+        try (PreparedStatement statement = connection.prepareStatement(
+                "SELECT datastreamid, foiid, phenomenontime, resulttime, result::text, archivegenerationid " +
+                        "FROM " + getDatastoreName() + " WHERE id=? FOR UPDATE")) {
+            statement.setLong(1, observationId);
+            try (ResultSet result = statement.executeQuery()) {
+                if (!result.next())
+                    return java.util.Optional.empty();
+                long dataStreamId = result.getLong(1);
+                Long foiId = result.getObject(2, Long.class);
+                Instant phenomenonTime = UtcJdbcTime.getInstant(result, 3);
+                Instant resultTime = UtcJdbcTime.getInstant(result, 4);
+                String resultJson = result.getString(5);
+                UUID generationId = result.getObject(6, UUID.class);
+
+                if (generationId != null) {
+                    java.util.Optional<LockedLogicalObservation> overlay =
+                            lockOverlay(connection, observationId, generationId);
+                    if (overlay.isPresent())
+                        return overlay;
+                }
+
+                ArchivedObservation archived = new ArchivedObservation(
+                        idScope, observationId, idScope, dataStreamId,
+                        foiId == null ? null : idScope, foiId,
+                        phenomenonTime, resultTime, resultJson, "HOT");
+                IObsData observation = generationId == null
+                        ? decodeLiveObservation(archived)
+                        : toObservation(generationId, null, archived);
+                return java.util.Optional.of(new LockedLogicalObservation(
+                        generationId, resultJson, observation));
+            }
+        }
+    }
+
+    private java.util.Optional<LockedLogicalObservation> lockColdOverlay(
+            Connection connection, long observationId) throws Exception {
+        return lockOverlay(connection, observationId, null);
+    }
+
+    private java.util.Optional<LockedLogicalObservation> lockOverlay(
+            Connection connection, long observationId, UUID expectedGeneration) throws Exception {
+        String generationClause = expectedGeneration == null ? "" : " AND overlay_row.generation_id=?";
+        String sql = "SELECT overlay_row.generation_id, overlay_row.datastream_id, overlay_row.foi_id, " +
+                "overlay_row.phenomenon_time, overlay_row.result_time, overlay_row.result_json::text, " +
+                "overlay_row.schema_json::text FROM oscar_obs_overlay overlay_row " +
+                "JOIN oscar_archive_generation generation ON generation.id=overlay_row.generation_id " +
+                "WHERE overlay_row.store_key=? AND overlay_row.id_scope=? AND overlay_row.observation_id=? " +
+                "AND generation.store_key=overlay_row.store_key AND generation.id_scope=overlay_row.id_scope " +
+                "AND generation.state IN ('ACTIVE','SEALED')" + generationClause +
+                " FOR UPDATE OF overlay_row";
+        try (PreparedStatement statement = connection.prepareStatement(sql)) {
+            statement.setString(1, getDatastoreName());
+            statement.setInt(2, idScope);
+            statement.setLong(3, observationId);
+            if (expectedGeneration != null)
+                statement.setObject(4, expectedGeneration);
+            try (ResultSet result = statement.executeQuery()) {
+                if (!result.next())
+                    return java.util.Optional.empty();
+                UUID generationId = result.getObject(1, UUID.class);
+                long dataStreamId = result.getLong(2);
+                Long foiId = result.getObject(3, Long.class);
+                Instant phenomenonTime = UtcJdbcTime.getInstant(result, 4);
+                Instant resultTime = UtcJdbcTime.getInstant(result, 5);
+                String resultJson = result.getString(6);
+                String schemaJson = result.getString(7);
+                ArchivedObservation archived = new ArchivedObservation(
+                        idScope, observationId, idScope, dataStreamId,
+                        foiId == null ? null : idScope, foiId,
+                        phenomenonTime, resultTime, resultJson, "OVERLAY");
+                return java.util.Optional.of(new LockedLogicalObservation(
+                        generationId, resultJson,
+                        toObservation(generationId, schemaJson, archived)));
+            }
+        }
+    }
+
+    private IObsData decodeLiveObservation(ArchivedObservation archived) {
+        BigId dataStreamId = BigId.fromLong(idScope, archived.dataStreamId());
+        IDataStreamInfo schema = dataStreamStore.get(new DataStreamKey(dataStreamId));
+        if (schema == null)
+            throw new IllegalStateException(
+                    "Cannot revalidate observation without datastream schema " + archived.dataStreamId());
+        DataBlock result = SerializerUtils.readDataBlockFromJson(
+                schema.getRecordStructure(), archived.resultJson());
+        ObsData.Builder builder = new ObsData.Builder()
+                .withDataStream(dataStreamId)
+                .withResult(result);
+        if (archived.foiId() != null)
+            builder.withFoi(BigId.fromLong(idScope, archived.foiId()));
+        if (archived.phenomenonTime() != null)
+            builder.withPhenomenonTime(archived.phenomenonTime());
+        if (archived.resultTime() != null)
+            builder.withResultTime(archived.resultTime());
+        return builder.build();
+    }
+
+    private record LockedLogicalObservation(UUID generationId, String resultJson,
+                                            IObsData observation) {}
 
     @Override
     public long countMatchingEntries(ObsFilter filter) {

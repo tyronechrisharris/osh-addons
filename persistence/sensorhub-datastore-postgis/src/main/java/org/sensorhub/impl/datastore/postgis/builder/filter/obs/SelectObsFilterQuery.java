@@ -14,6 +14,7 @@
 
 package org.sensorhub.impl.datastore.postgis.builder.filter.obs;
 
+import com.google.common.collect.BoundType;
 import org.geotools.api.filter.Filter;
 import org.sensorhub.api.common.BigId;
 import org.sensorhub.api.datastore.TemporalFilter;
@@ -102,7 +103,7 @@ public class SelectObsFilterQuery extends BaseObsFilterQuery<SelectFilterQueryGe
             } else {
                 String min = PostgisUtils.checkAndGetValidInstant(temporalFilter.getMin());
                 String max = PostgisUtils.checkAndGetValidInstant(temporalFilter.getMax());
-                addTimeRangeCondition(this.tableName + ".phenomenonTime", min, max);
+                addTimeRangeCondition(this.tableName + ".phenomenonTime", temporalFilter, min, max);
             }
         }
     }
@@ -116,32 +117,29 @@ public class SelectObsFilterQuery extends BaseObsFilterQuery<SelectFilterQueryGe
             } else {
                 String min = PostgisUtils.checkAndGetValidInstant(temporalFilter.getMin());
                 String max = PostgisUtils.checkAndGetValidInstant(temporalFilter.getMax());
-                addTimeRangeCondition(this.tableName + ".resultTime", min, max);
+                addTimeRangeCondition(this.tableName + ".resultTime", temporalFilter, min, max);
             }
         }
     }
 
-    /**
-     * Adds optimized time range conditions using >= and <= operators
-     * instead of tsrange containment for better B-tree index utilization.
-     */
-    private void addTimeRangeCondition(String columnName, String min, String max) {
+    /** Adds bound-aware comparisons instead of tsrange containment for B-tree index use. */
+    private void addTimeRangeCondition(String columnName, TemporalFilter temporalFilter,
+                                       String min, String max) {
         boolean hasMin = isValidBound(min);
         boolean hasMax = isValidBound(max);
+        String lowerOperator = temporalFilter.getRange().lowerBoundType() == BoundType.CLOSED ? ">=" : ">";
+        String upperOperator = temporalFilter.getRange().upperBoundType() == BoundType.CLOSED ? "<=" : "<";
 
         if (hasMin && hasMax) {
-            // Both bounds: use >= AND <=
-            addCondition(columnName + " >= ?::timestamp");
+            addCondition(columnName + " " + lowerOperator + " ?::timestamp");
             addParameter(min);
-            addCondition(columnName + " <= ?::timestamp");
+            addCondition(columnName + " " + upperOperator + " ?::timestamp");
             addParameter(max);
         } else if (hasMin) {
-            // Only lower bound
-            addCondition(columnName + " >= ?::timestamp");
+            addCondition(columnName + " " + lowerOperator + " ?::timestamp");
             addParameter(min);
         } else if (hasMax) {
-            // Only upper bound
-            addCondition(columnName + " <= ?::timestamp");
+            addCondition(columnName + " " + upperOperator + " ?::timestamp");
             addParameter(max);
         }
         // If neither bound is valid, no condition is added (matches all times)

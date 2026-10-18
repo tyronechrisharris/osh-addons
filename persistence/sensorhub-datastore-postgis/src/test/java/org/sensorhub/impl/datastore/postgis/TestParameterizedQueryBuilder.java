@@ -12,8 +12,10 @@
 
 package org.sensorhub.impl.datastore.postgis;
 
+import com.google.common.collect.Range;
 import org.junit.Test;
 import org.sensorhub.api.common.BigId;
+import org.sensorhub.api.datastore.TemporalFilter;
 import org.sensorhub.api.datastore.command.CommandStreamFilter;
 import org.sensorhub.api.datastore.obs.DataStreamFilter;
 import org.sensorhub.api.datastore.obs.IObsStore;
@@ -29,6 +31,7 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 
+import java.time.Instant;
 import java.util.Arrays;
 import java.util.Set;
 
@@ -103,6 +106,37 @@ public class TestParameterizedQueryBuilder {
         assertSqlDoesNotContainInjection(query);
         assertTrue(query.sql().contains("result @> ?::jsonb"));
         assertTrue(query.parameters().get(0).toString().contains(INJECTION));
+    }
+
+    @Test
+    public void testObservationTimeBoundsArePreservedForSelectAndRemove() {
+        Instant start = Instant.parse("2026-01-01T00:00:00Z");
+        Instant end = Instant.parse("2026-01-02T00:00:00Z");
+        ObsFilter halfOpen = new ObsFilter.Builder()
+                .withPhenomenonTime(new TemporalFilter.Builder()
+                        .withRange(Range.closedOpen(start, end))
+                        .build())
+                .build();
+        QueryBuilderObsStore builder = new QueryBuilderObsStore("obs");
+
+        ParameterizedQuery select = builder.createParameterizedSelectEntriesQuery(halfOpen, null);
+        ParameterizedQuery remove = builder.createParameterizedRemoveEntriesQuery(halfOpen);
+
+        for (ParameterizedQuery query : Arrays.asList(select, remove)) {
+            assertTrue(query.sql().contains("obs.phenomenonTime >= ?::timestamp"));
+            assertTrue(query.sql().contains("obs.phenomenonTime < ?::timestamp"));
+            assertFalse(query.sql().contains("obs.phenomenonTime <= ?::timestamp"));
+            assertEquals(2, query.parameters().size());
+        }
+
+        ObsFilter inverse = new ObsFilter.Builder()
+                .withResultTime(new TemporalFilter.Builder()
+                        .withRange(Range.openClosed(start, end))
+                        .build())
+                .build();
+        ParameterizedQuery inverseRemove = builder.createParameterizedRemoveEntriesQuery(inverse);
+        assertTrue(inverseRemove.sql().contains("obs.resultTime > ?::timestamp"));
+        assertTrue(inverseRemove.sql().contains("obs.resultTime <= ?::timestamp"));
     }
 
     @Test

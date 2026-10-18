@@ -1,5 +1,6 @@
 package org.sensorhub.impl.datastore.postgis;
 
+import com.google.common.collect.Range;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import net.opengis.swe.v20.DataBlock;
@@ -442,6 +443,85 @@ public class TestDisposableTieredPostgresIntegration extends TestPostgisObsStore
         assertEquals(0, tiered.getNumRecords());
         assertTrue(catalog.overlay(overlayId, DATABASE_NUM, "OVERLAY").isEmpty());
         assertFalse(catalog.isTombstoned(deletedId));
+    }
+
+    @Test
+    public void tieredRemoveRevalidatesHalfOpenPredicateAgainstRealPostgres() throws Exception {
+        TestableTieredStore tiered = (TestableTieredStore) postgisObsStore;
+        Instant start = Instant.parse("2026-02-01T00:00:00Z");
+        Instant endExclusive = start.plus(10, ChronoUnit.MINUTES);
+        BigId stream = addSimpleDataStream(bigId(60), "gammaCounts");
+        Map<BigId, org.sensorhub.api.data.IObsData> inserted =
+                addSimpleObsWithoutResultTime(stream, BigId.NONE, start, 3, 60_000);
+        forceReadBackFromStorage();
+
+        long movedId = inserted.keySet().stream()
+                .mapToLong(BigId::getIdAsLong)
+                .min()
+                .orElseThrow();
+        tiered.beforeNextRemoveBatch(() -> {
+            try (Connection connection = open(); PreparedStatement statement = connection.prepareStatement(
+                    "UPDATE " + TABLE + " SET phenomenontime=? WHERE id=?")) {
+                UtcJdbcTime.setInstant(statement, 1, endExclusive);
+                statement.setLong(2, movedId);
+                assertEquals(1, statement.executeUpdate());
+            } catch (Exception error) {
+                throw new IllegalStateException(error);
+            }
+        });
+
+        ObsFilter halfOpen = new ObsFilter.Builder()
+                .withPhenomenonTime(new TemporalFilter.Builder()
+                        .withRange(Range.closedOpen(start, endExclusive))
+                        .build())
+                .build();
+
+        // The hook moves one already-selected row exactly onto the open upper
+        // endpoint. The final locked predicate check must spare it.
+        assertEquals(2, tiered.removeEntries(halfOpen));
+        assertEquals(1, tiered.getNumRecords());
+        assertEquals(endExclusive,
+                tiered.get(BigId.fromLong(DATABASE_NUM, movedId)).getPhenomenonTime());
+        assertEquals(0, tiered.removeEntries(halfOpen));
+        try (var endpoint = tiered.selectEntries(new ObsFilter.Builder()
+                .withPhenomenonTime(new TemporalFilter.Builder()
+                        .withSingleValue(endExclusive)
+                        .build())
+                .build())) {
+            assertEquals(1, endpoint.count());
+        }
+    }
+
+    @Test
+    public void tieredRemoveTombstonesArchivedRowsExactlyOnce() throws Exception {
+        OscarTieredObsStore tiered = (OscarTieredObsStore) postgisObsStore;
+        Instant start = Instant.parse("2026-02-02T00:00:00Z");
+        BigId stream = addSimpleDataStream(bigId(61), "gammaCounts");
+        addSimpleObsWithoutResultTime(stream, BigId.NONE, start, 2, 60_000);
+        forceReadBackFromStorage();
+        tiered.archiveWindow(start, start.plus(1, ChronoUnit.HOURS), "RAW_GATED").orElseThrow();
+
+        ObsFilter filter = new ObsFilter.Builder()
+                .withPhenomenonTime(new TemporalFilter.Builder()
+                        .withRange(Range.closedOpen(start, start.plus(1, ChronoUnit.HOURS)))
+                        .build())
+                .build();
+        assertEquals(2, tiered.removeEntries(filter));
+        assertEquals(0, tiered.getNumRecords());
+        assertEquals(0, selectAll(tiered));
+        assertEquals(2, hotRows());
+        assertEquals(0, tiered.removeEntries(filter));
+
+        try (Connection connection = open(); PreparedStatement statement = connection.prepareStatement(
+                "SELECT count(*) FROM oscar_tombstone WHERE store_key=? AND id_scope=? " +
+                        "AND subject_type='OBSERVATION'")) {
+            statement.setString(1, TABLE);
+            statement.setInt(2, DATABASE_NUM);
+            try (ResultSet result = statement.executeQuery()) {
+                assertTrue(result.next());
+                assertEquals(2, result.getLong(1));
+            }
+        }
     }
 
     @Test
@@ -1223,9 +1303,23 @@ public class TestDisposableTieredPostgresIntegration extends TestPostgisObsStore
     }
 
     private static final class TestableTieredStore extends OscarTieredObsStore {
+        private Runnable beforeRemoveBatch;
+
         TestableTieredStore(String url, String dbName, String login, String password, String dataStoreName,
                             int idScope, IdProviderType idProviderType, TieredArchiveConfig config) {
             super(url, dbName, login, password, dataStoreName, idScope, idProviderType, config);
+        }
+
+        void beforeNextRemoveBatch(Runnable action) {
+            beforeRemoveBatch = action;
+        }
+
+        @Override
+        protected void beforeRemoveBatchRevalidation(List<BigId> candidateIds) {
+            Runnable action = beforeRemoveBatch;
+            beforeRemoveBatch = null;
+            if (action != null)
+                action.run();
         }
 
         void insertVerified(Connection connection, long id, long streamId, Long foiId,
