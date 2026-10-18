@@ -2,11 +2,13 @@ package org.sensorhub.impl.datastore.postgis.connection;
 
 import com.zaxxer.hikari.HikariConfig;
 import com.zaxxer.hikari.HikariDataSource;
+import org.sensorhub.api.datastore.ICancellableDataStore;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.sql.*;
 import java.util.*;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.ConcurrentLinkedDeque;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.stream.Collectors;
@@ -91,6 +93,9 @@ public class ConnectionManager {
         config.addDataSourceProperty("tcpKeepAlive", "true");
         config.addDataSourceProperty("socketTimeout", "300");
         config.addDataSourceProperty("networkTimeout", "60");
+        // Bounds only PostgreSQL's separate query-cancellation signal. It does
+        // not impose a statement timeout on normal application queries.
+        config.addDataSourceProperty("cancelSignalTimeout", "2");
         config.setAutoCommit(true);
 
         return new HikariDataSource(config);
@@ -98,11 +103,23 @@ public class ConnectionManager {
 
     public Connection getConnection() {
         try {
-            return hikariDataSourceInstance.getConnection();
+            return CancellableConnectionScope.track(hikariDataSourceInstance.getConnection());
+        } catch (CancellationException ex) {
+            throw ex;
         } catch (Exception ex) {
             ex.printStackTrace();
             throw new RuntimeException(ex);
         }
+    }
+
+    /**
+     * Opens a thread-bound operation that can abort only the PostgreSQL
+     * connections borrowed by that operation. The static scope deliberately
+     * spans connection-manager instances so linked observation and metadata
+     * stores participate in one logical cancellation boundary.
+     */
+    public static ICancellableDataStore.CancellableOperation beginCancellableOperation() {
+        return CancellableConnectionScope.open();
     }
 
     public void addBatch(String sqlQuery) {

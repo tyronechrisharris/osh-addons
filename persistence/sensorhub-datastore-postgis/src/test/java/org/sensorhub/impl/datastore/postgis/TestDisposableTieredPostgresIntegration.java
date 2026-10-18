@@ -7,6 +7,7 @@ import net.opengis.swe.v20.DataBlock;
 import org.junit.Test;
 import org.sensorhub.api.common.BigId;
 import org.sensorhub.api.data.ObsData;
+import org.sensorhub.api.datastore.ICancellableDataStore;
 import org.sensorhub.api.datastore.obs.IObsStore;
 import org.sensorhub.api.datastore.obs.DataStreamKey;
 import org.sensorhub.api.datastore.obs.ObsFilter;
@@ -19,6 +20,7 @@ import org.sensorhub.impl.datastore.postgis.archive.ParquetArchiveReader;
 import org.sensorhub.impl.datastore.postgis.archive.TieredArchiveConfig;
 import org.sensorhub.impl.datastore.postgis.archive.UtcJdbcTime;
 import org.sensorhub.impl.datastore.postgis.database.OscarTieredObsSystemDatabase;
+import org.sensorhub.impl.datastore.postgis.connection.ConnectionManager;
 import org.sensorhub.impl.datastore.postgis.store.obs.OscarTieredObsStore;
 import org.sensorhub.impl.datastore.postgis.store.obs.PostgisDataStreamStoreImpl;
 import org.sensorhub.impl.datastore.postgis.store.obs.PostgisObsStoreImpl;
@@ -45,15 +47,19 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 
@@ -81,6 +87,95 @@ public class TestDisposableTieredPostgresIntegration extends TestPostgisObsStore
         this.postgisObsStore = new TestableTieredStore(url, DB_NAME, login, password, TABLE,
                 DATABASE_NUM, IdProviderType.SEQUENTIAL, archiveConfig);
         return this.postgisObsStore;
+    }
+
+    @Test
+    public void scopedAbortCancelsRealPostgresWorkWithoutTouchingAnotherConnection() throws Exception {
+        ConnectionManager manager = new ConnectionManager(url, DB_NAME, login, password);
+        String mutationTable = "codex_cancel_scope_" + UUID.randomUUID().toString().replace("-", "");
+        AtomicReference<ICancellableDataStore.CancellableOperation> operation = new AtomicReference<>();
+        AtomicReference<Throwable> workerFailure = new AtomicReference<>();
+        AtomicInteger backendPid = new AtomicInteger();
+        AtomicBoolean completedNormally = new AtomicBoolean();
+        CountDownLatch statementEntered = new CountDownLatch(1);
+        CountDownLatch workerExited = new CountDownLatch(1);
+        Thread worker = null;
+
+        try (Connection unrelated = manager.getConnection();
+             Statement setup = unrelated.createStatement()) {
+            setup.execute("CREATE TABLE " + mutationTable + " (value integer NOT NULL)");
+
+            worker = new Thread(() -> {
+                try (ICancellableDataStore.CancellableOperation scope =
+                             ConnectionManager.beginCancellableOperation();
+                     Connection scoped = manager.getConnection()) {
+                    operation.set(scope);
+                    scoped.setAutoCommit(false);
+                    try (Statement statement = scoped.createStatement()) {
+                        statement.executeUpdate("INSERT INTO " + mutationTable + " VALUES (1)");
+                        try (ResultSet result = statement.executeQuery("SELECT pg_backend_pid()")) {
+                            assertTrue(result.next());
+                            backendPid.set(result.getInt(1));
+                        }
+                        statementEntered.countDown();
+                        statement.execute("SELECT pg_sleep(30)");
+                    }
+                    scoped.commit();
+                    completedNormally.set(true);
+                } catch (Throwable error) {
+                    workerFailure.set(error);
+                } finally {
+                    workerExited.countDown();
+                }
+            }, "real-postgres-cancellable-operation");
+            worker.setDaemon(true);
+            worker.start();
+
+            assertTrue("The worker must reach the blocking PostgreSQL statement",
+                    statementEntered.await(5, TimeUnit.SECONDS));
+            waitForActivePgSleep(unrelated, backendPid.get());
+            assertEquals("An unrelated pooled connection must remain usable while the worker blocks",
+                    41L, queryLong(unrelated, "SELECT 41"));
+
+            long cancelStarted = System.nanoTime();
+            operation.get().cancel();
+            operation.get().cancel(); // Explicitly verify idempotency against the real driver.
+            assertTrue("Connection.abort must release the blocked JDBC worker promptly",
+                    workerExited.await(5, TimeUnit.SECONDS));
+            waitForBackendExit(unrelated, backendPid.get());
+            long cancelMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - cancelStarted);
+            worker.join(1_000L);
+
+            assertFalse("The cancelled transaction must not reach commit", completedNormally.get());
+            assertNotNull("The blocked statement must observe connection cancellation", workerFailure.get());
+            assertTrue("Cancellation must leave headroom inside the core 10 second stop budget: "
+                    + cancelMillis + " ms", cancelMillis < 5_000L);
+            assertEquals("The unrelated connection must survive scoped cancellation",
+                    42L, queryLong(unrelated, "SELECT 42"));
+            assertEquals("Aborting the scoped transaction must roll back its mutation",
+                    0L, queryLong(unrelated, "SELECT count(*) FROM " + mutationTable));
+            Thread.sleep(100L);
+            assertEquals("No cancelled worker may mutate after termination",
+                    0L, queryLong(unrelated, "SELECT count(*) FROM " + mutationTable));
+
+            try (Connection replacement = manager.getConnection()) {
+                assertEquals("The Hikari pool must remain healthy after evicting the aborted connection",
+                        43L, queryLong(replacement, "SELECT 43"));
+            }
+        } finally {
+            ICancellableDataStore.CancellableOperation active = operation.get();
+            if (worker != null && worker.isAlive() && active != null)
+                active.cancel();
+            if (worker != null)
+                worker.join(5_000L);
+            try (Connection cleanup = DriverManager.getConnection(
+                    "jdbc:postgresql://" + url + "/" + DB_NAME, login, password);
+                 Statement statement = cleanup.createStatement()) {
+                statement.execute("DROP TABLE IF EXISTS " + mutationTable);
+            } finally {
+                manager.close();
+            }
+        }
     }
 
     @Override
@@ -1839,6 +1934,47 @@ public class TestDisposableTieredPostgresIntegration extends TestPostgisObsStore
                 return result.next();
             }
         }
+    }
+
+    private static void waitForActivePgSleep(Connection observer, int backendPid) throws Exception {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        while (System.nanoTime() < deadline) {
+            try (PreparedStatement statement = observer.prepareStatement(
+                    "SELECT 1 FROM pg_stat_activity WHERE pid=? AND state='active' " +
+                            "AND query LIKE '%pg_sleep%'") ) {
+                statement.setInt(1, backendPid);
+                try (ResultSet result = statement.executeQuery()) {
+                    if (result.next())
+                        return;
+                }
+            }
+            Thread.sleep(20L);
+        }
+        throw new AssertionError("Worker did not enter pg_sleep on PostgreSQL backend " + backendPid);
+    }
+
+    private static long queryLong(Connection connection, String sql) throws Exception {
+        try (Statement statement = connection.createStatement();
+             ResultSet result = statement.executeQuery(sql)) {
+            assertTrue(result.next());
+            return result.getLong(1);
+        }
+    }
+
+    private static void waitForBackendExit(Connection observer, int backendPid) throws Exception {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        while (System.nanoTime() < deadline) {
+            try (PreparedStatement statement = observer.prepareStatement(
+                    "SELECT 1 FROM pg_stat_activity WHERE pid=?")) {
+                statement.setInt(1, backendPid);
+                try (ResultSet result = statement.executeQuery()) {
+                    if (!result.next())
+                        return;
+                }
+            }
+            Thread.sleep(20L);
+        }
+        throw new AssertionError("Cancelled PostgreSQL backend remained active: " + backendPid);
     }
 
     private Connection open() throws Exception {

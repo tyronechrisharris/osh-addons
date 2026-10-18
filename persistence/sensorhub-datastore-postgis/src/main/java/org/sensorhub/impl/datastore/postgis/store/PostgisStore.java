@@ -15,6 +15,7 @@
 package org.sensorhub.impl.datastore.postgis.store;
 
 import org.sensorhub.api.datastore.DataStoreException;
+import org.sensorhub.api.datastore.ICancellableDataStore;
 import org.sensorhub.api.datastore.IdProvider;
 import org.sensorhub.api.datastore.command.ICommandStatusStore;
 import org.sensorhub.api.datastore.command.ICommandStore;
@@ -43,7 +44,7 @@ import java.util.TimerTask;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantLock;
 
-public abstract class PostgisStore<T extends QueryBuilder> {
+public abstract class PostgisStore<T extends QueryBuilder> implements ICancellableDataStore {
     private static final Logger logger = LoggerFactory.getLogger(PostgisStore.class);
     protected static final Calendar UTC_LOCAL = Calendar.getInstance(TimeZone.getTimeZone("UTC"));
 
@@ -64,6 +65,11 @@ public abstract class PostgisStore<T extends QueryBuilder> {
         this.idScope = idScope;
         this.queryBuilder = queryBuilder;
         this.useBatch = useBatch;
+    }
+
+    @Override
+    public CancellableOperation beginCancellableOperation() {
+        return ConnectionManager.beginCancellableOperation();
     }
 
     protected void init(String url, String dbName, String login, String password, String[] initScripts) {
