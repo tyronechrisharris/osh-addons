@@ -60,6 +60,21 @@ public class TestCancellableConnectionScope {
     }
 
     @Test
+    public void cancellationDoesNotTouchConnectionAcquiredBeforeTheScope() throws Exception {
+        ConnectionProbe unscoped = new ConnectionProbe();
+        Connection connection = CancellableConnectionScope.track(unscoped.connection());
+
+        try (CancellableConnectionScope scope = CancellableConnectionScope.open()) {
+            scope.cancel();
+        }
+
+        assertEquals(0, unscoped.abortCount.get());
+        assertEquals(0, unscoped.closeCount.get());
+        connection.close();
+        assertEquals(1, unscoped.closeCount.get());
+    }
+
+    @Test
     public void completedConnectionIsNotAbortedByLaterCancellation() throws Exception {
         ConnectionProbe completed = new ConnectionProbe();
         try (CancellableConnectionScope scope = CancellableConnectionScope.open()) {
@@ -156,25 +171,44 @@ public class TestCancellableConnectionScope {
     }
 
     @Test
-    public void failedConnectionCloseRemainsTrackedAndScopeCloseCanBeRetried() {
+    public void persistentCloseFailureIsReportedAfterBestEffortAbortAndDoesNotPinThreadLocal() {
         ConnectionProbe probe = new ConnectionProbe();
-        probe.closeFailures.set(1);
+        probe.closeFailures.set(Integer.MAX_VALUE);
         CancellableConnectionScope scope = CancellableConnectionScope.open();
         CancellableConnectionScope.track(probe.connection());
 
-        assertThrows(IllegalStateException.class, scope::close);
-        assertThrows("A failed close must leave the original scope current",
-                IllegalStateException.class, CancellableConnectionScope::open);
+        IllegalStateException failure = assertThrows(IllegalStateException.class, scope::close);
+        assertTrue(scope.isCancellationRequested());
+        assertEquals("A failed close must trigger the mandatory abort fallback",
+                1, probe.abortCount.get());
+        assertEquals(2, probe.closeAttempts.get());
+        assertEquals(0, probe.closeCount.get());
+        assertSame("A terminal cleanup failure must never be forgotten",
+                failure, assertThrows(IllegalStateException.class, scope::close));
+        assertSame("Cancel must report the same terminal cleanup failure",
+                failure, assertThrows(IllegalStateException.class, scope::cancel));
+
+        try (CancellableConnectionScope ignored = CancellableConnectionScope.open()) {
+            // Terminal failure was surfaced but did not leak the old scope.
+        }
+    }
+
+    @Test
+    public void closeFailureAfterSuccessfulAbortRemainsSticky() throws Exception {
+        ConnectionProbe probe = new ConnectionProbe();
+        probe.closeFailures.set(Integer.MAX_VALUE);
+        CancellableConnectionScope scope = CancellableConnectionScope.open();
+        CancellableConnectionScope.track(probe.connection());
 
         scope.cancel();
-        assertEquals("The connection whose close failed must still be cancellable",
-                1, probe.abortCount.get());
-        scope.close();
+        IllegalStateException failure = assertThrows(IllegalStateException.class, scope::close);
 
-        assertEquals(2, probe.closeAttempts.get());
-        assertEquals(1, probe.closeCount.get());
+        assertEquals(1, probe.abortCount.get());
+        assertEquals(1, probe.closeAttempts.get());
+        assertSame(failure, assertThrows(IllegalStateException.class, scope::close));
         try (CancellableConnectionScope ignored = CancellableConnectionScope.open()) {
-            // Successful retry removed the old thread-local scope.
+            // An aborted connection's close error remains visible without
+            // retaining a failed scope in this thread.
         }
     }
 
@@ -206,25 +240,148 @@ public class TestCancellableConnectionScope {
     public void connectionAbortStillRunsWhenStatementCancellationFails() throws Exception {
         ConnectionProbe probe = new ConnectionProbe();
         probe.statement.cancelFailures.set(1);
-        try (CancellableConnectionScope scope = CancellableConnectionScope.open();
-             Connection connection = CancellableConnectionScope.track(probe.connection());
-             Statement statement = connection.createStatement()) {
-            assertThrows(IllegalStateException.class, scope::cancel);
+        CancellableConnectionScope scope = CancellableConnectionScope.open();
+        Connection connection = CancellableConnectionScope.track(probe.connection());
+        Statement statement = connection.createStatement();
+        try {
+            IllegalStateException failure = assertThrows(IllegalStateException.class, scope::cancel);
             assertTrue(scope.isCancellationRequested());
             assertEquals(1, probe.statement.cancelCount.get());
             assertEquals("Connection.abort is the mandatory fallback",
                     1, probe.abortCount.get());
+            assertSame("Cancellation failure must be sticky",
+                    failure, assertThrows(IllegalStateException.class, scope::cancel));
+        } finally {
+            statement.close();
+            connection.close();
         }
+        IllegalStateException closeFailure =
+                assertThrows(IllegalStateException.class, scope::close);
+        assertSame("Scope close failure must remain sticky",
+                closeFailure, assertThrows(IllegalStateException.class, scope::close));
+    }
+
+    @Test
+    public void failedConnectionAbortPoisonsScopeEvenWhenConnectionLaterCloses() throws Exception {
+        ConnectionProbe probe = new ConnectionProbe();
+        probe.abortFailures.set(1);
+        CancellableConnectionScope scope = CancellableConnectionScope.open();
+        Connection connection = CancellableConnectionScope.track(probe.connection());
+
+        IllegalStateException failure = assertThrows(IllegalStateException.class, scope::cancel);
+        assertTrue(scope.isCancellationRequested());
+        assertEquals(1, probe.abortAttempts.get());
+        assertEquals(0, probe.abortCount.get());
+        assertSame(failure, assertThrows(IllegalStateException.class, scope::cancel));
+
+        connection.close();
+        IllegalStateException closeFailure =
+                assertThrows(IllegalStateException.class, scope::close);
+        assertSame(closeFailure, assertThrows(IllegalStateException.class, scope::close));
+    }
+
+    @Test
+    public void cancellationUsesOneDeadlineAcrossMultipleSlowResources() throws Exception {
+        CountDownLatch started = new CountDownLatch(4);
+        CountDownLatch release = new CountDownLatch(1);
+        CountDownLatch finished = new CountDownLatch(4);
+        ConnectionProbe first = new ConnectionProbe();
+        ConnectionProbe second = new ConnectionProbe();
+        first.blockCancellation(started, release, finished);
+        second.blockCancellation(started, release, finished);
+
+        CancellableConnectionScope scope =
+                CancellableConnectionScope.open(150L, TimeUnit.MILLISECONDS);
+        Connection firstConnection = CancellableConnectionScope.track(first.connection());
+        Connection secondConnection = CancellableConnectionScope.track(second.connection());
+        Statement firstStatement = firstConnection.createStatement();
+        Statement secondStatement = secondConnection.createStatement();
+
+        long startedAt = System.nanoTime();
+        IllegalStateException failure = assertThrows(IllegalStateException.class, scope::cancel);
+        long elapsedMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAt);
+
+        assertTrue("All independent cancellation actions must start concurrently",
+                started.await(1, TimeUnit.SECONDS));
+        assertTrue("Four blocked resources must share one deadline, not four serial budgets: "
+                        + elapsedMillis + " ms",
+                elapsedMillis < 500L);
+        assertTrue(scope.isCancellationRequested());
+        assertSame("A timed-out cancellation result must be persistent",
+                failure, assertThrows(IllegalStateException.class, scope::cancel));
+
+        release.countDown();
+        assertTrue(finished.await(2, TimeUnit.SECONDS));
+        firstStatement.close();
+        secondStatement.close();
+        firstConnection.close();
+        secondConnection.close();
+        assertThrows(IllegalStateException.class, scope::close);
+        assertEquals(1, first.abortCount.get());
+        assertEquals(1, second.abortCount.get());
+        assertEquals(1, first.statement.cancelCount.get());
+        assertEquals(1, second.statement.cancelCount.get());
+    }
+
+    @Test
+    public void statementCreatedDuringCancellationCannotEscapeTheScope() throws Exception {
+        ConnectionProbe probe = new ConnectionProbe();
+        CountDownLatch createStarted = new CountDownLatch(1);
+        CountDownLatch releaseCreate = new CountDownLatch(1);
+        probe.statementCreateStarted = createStarted;
+        probe.releaseStatementCreate = releaseCreate;
+
+        CancellableConnectionScope scope = CancellableConnectionScope.open();
+        Connection connection = CancellableConnectionScope.track(probe.connection());
+        AtomicReference<Throwable> cancellerFailure = new AtomicReference<>();
+        Thread canceller = new Thread(() -> {
+            try {
+                assertTrue(createStarted.await(2, TimeUnit.SECONDS));
+                scope.cancel();
+            } catch (Throwable error) {
+                cancellerFailure.set(error);
+            } finally {
+                releaseCreate.countDown();
+            }
+        }, "late-statement-canceller");
+        canceller.start();
+
+        assertThrows(CancellationException.class, connection::createStatement);
+        canceller.join(2_000L);
+        assertFalse(canceller.isAlive());
+        assertNull(cancellerFailure.get());
+        assertEquals(1, probe.abortCount.get());
+        assertEquals(1, probe.statement.cancelCount.get());
+        assertEquals(1, probe.statement.closeCount.get());
+        connection.close();
+        scope.close();
     }
 
     private static final class ConnectionProbe {
         final AtomicInteger abortCount = new AtomicInteger();
+        final AtomicInteger abortAttempts = new AtomicInteger();
+        final AtomicInteger abortFailures = new AtomicInteger();
         final AtomicInteger closeAttempts = new AtomicInteger();
         final AtomicInteger closeCount = new AtomicInteger();
         final AtomicInteger closeFailures = new AtomicInteger();
         final AtomicInteger statementCreateCount = new AtomicInteger();
         final AtomicBoolean closed = new AtomicBoolean();
         final StatementProbe statement = new StatementProbe();
+        volatile CountDownLatch abortStarted;
+        volatile CountDownLatch releaseAbort;
+        volatile CountDownLatch abortFinished;
+        volatile CountDownLatch statementCreateStarted;
+        volatile CountDownLatch releaseStatementCreate;
+
+        void blockCancellation(
+                CountDownLatch started, CountDownLatch release, CountDownLatch finished) {
+            abortStarted = started;
+            releaseAbort = release;
+            abortFinished = finished;
+            statement.cancelStarted = started;
+            statement.releaseCancel = release;
+            statement.cancelFinished = finished;
+        }
 
         Connection connection() {
             return (Connection) Proxy.newProxyInstance(
@@ -232,8 +389,16 @@ public class TestCancellableConnectionScope {
                     new Class<?>[]{Connection.class},
                     (proxy, method, args) -> switch (method.getName()) {
                         case "abort" -> {
-                            ((Executor) args[0]).execute(abortCount::incrementAndGet);
-                            closed.set(true);
+                            abortAttempts.incrementAndGet();
+                            if (abortFailures.getAndUpdate(value -> Math.max(0, value - 1)) > 0)
+                                throw new SQLException("fixture abort failure");
+                            ((Executor) args[0]).execute(() -> {
+                                abortCount.incrementAndGet();
+                                countDown(abortStarted);
+                                awaitUninterruptibly(releaseAbort);
+                                closed.set(true);
+                                countDown(abortFinished);
+                            });
                             yield null;
                         }
                         case "close" -> {
@@ -246,6 +411,8 @@ public class TestCancellableConnectionScope {
                         }
                         case "createStatement" -> {
                             statementCreateCount.incrementAndGet();
+                            countDown(statementCreateStarted);
+                            awaitUninterruptibly(releaseStatementCreate);
                             yield statement.statement();
                         }
                         case "isClosed" -> closed.get();
@@ -283,6 +450,9 @@ public class TestCancellableConnectionScope {
         final AtomicInteger cancelCount = new AtomicInteger();
         final AtomicInteger cancelFailures = new AtomicInteger();
         final AtomicInteger closeCount = new AtomicInteger();
+        volatile CountDownLatch cancelStarted;
+        volatile CountDownLatch releaseCancel;
+        volatile CountDownLatch cancelFinished;
 
         Statement statement() {
             return (Statement) Proxy.newProxyInstance(
@@ -290,8 +460,11 @@ public class TestCancellableConnectionScope {
                     (proxy, method, args) -> switch (method.getName()) {
                         case "cancel" -> {
                             cancelCount.incrementAndGet();
+                            countDown(cancelStarted);
+                            awaitUninterruptibly(releaseCancel);
                             if (cancelFailures.getAndUpdate(value -> Math.max(0, value - 1)) > 0)
                                 throw new SQLException("fixture statement cancellation failure");
+                            countDown(cancelFinished);
                             yield null;
                         }
                         case "close" -> {
@@ -302,7 +475,28 @@ public class TestCancellableConnectionScope {
                         case "hashCode" -> System.identityHashCode(proxy);
                         case "toString" -> "StatementProbe";
                         default -> ConnectionProbe.defaultValue(method.getReturnType());
-                    });
+            });
         }
+    }
+
+    private static void countDown(CountDownLatch latch) {
+        if (latch != null)
+            latch.countDown();
+    }
+
+    private static void awaitUninterruptibly(CountDownLatch latch) {
+        if (latch == null)
+            return;
+        boolean interrupted = false;
+        while (true) {
+            try {
+                latch.await();
+                break;
+            } catch (InterruptedException ignored) {
+                interrupted = true;
+            }
+        }
+        if (interrupted)
+            Thread.currentThread().interrupt();
     }
 }
