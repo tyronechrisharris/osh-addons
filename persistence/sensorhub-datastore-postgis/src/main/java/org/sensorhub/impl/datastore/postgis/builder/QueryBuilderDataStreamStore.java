@@ -108,28 +108,41 @@ public class QueryBuilderDataStreamStore extends QueryBuilder {
     }
 
     public String createMinMaxTimeTriggerQuery() {
-        return "CREATE OR REPLACE FUNCTION update_datastream_time_ranges()\n" +
+        // Trigger functions are schema-wide. Give each observation store its
+        // own function so starting a second database cannot silently redirect
+        // range maintenance to the first store's datastream table.
+        String functionName = "update_datastream_ranges_" +
+                Integer.toUnsignedString(obsStore.getDatastoreName().hashCode(), 16);
+        return "DROP TRIGGER IF EXISTS obs_update_datastream_ranges ON " + obsStore.getDatastoreName() + ";\n" +
+                "CREATE OR REPLACE FUNCTION " + functionName + "()\n" +
                 "RETURNS TRIGGER AS $$\n" +
                 "BEGIN\n" +
-                "    UPDATE " + this.getStoreTableName() + " \n" +
+                "    UPDATE " + this.getStoreTableName() + " target\n" +
                 "    SET \n" +
-                "        min_phenomenon_time = LEAST(COALESCE(min_phenomenon_time, NEW.phenomenonTime), NEW.phenomenonTime),\n" +
-                "        max_phenomenon_time = GREATEST(COALESCE(max_phenomenon_time, NEW.phenomenonTime), NEW.phenomenonTime),\n" +
-                "        min_result_time = LEAST(COALESCE(min_result_time, NEW.resultTime), NEW.resultTime),\n" +
-                "        max_result_time = GREATEST(COALESCE(max_result_time, NEW.resultTime), NEW.resultTime)\n" +
-                "    WHERE id = NEW.dataStreamID;\n" +
-                "    RETURN NEW;\n" +
+                "        min_phenomenon_time = LEAST(COALESCE(target.min_phenomenon_time, ranges.min_phenomenon_time), ranges.min_phenomenon_time),\n" +
+                "        max_phenomenon_time = GREATEST(COALESCE(target.max_phenomenon_time, ranges.max_phenomenon_time), ranges.max_phenomenon_time),\n" +
+                "        min_result_time = LEAST(COALESCE(target.min_result_time, ranges.min_result_time), ranges.min_result_time),\n" +
+                "        max_result_time = GREATEST(COALESCE(target.max_result_time, ranges.max_result_time), ranges.max_result_time)\n" +
+                "    FROM (\n" +
+                "        SELECT dataStreamID, MIN(phenomenonTime) min_phenomenon_time, MAX(phenomenonTime) max_phenomenon_time,\n" +
+                "               MIN(resultTime) min_result_time, MAX(resultTime) max_result_time\n" +
+                "        FROM inserted_observations GROUP BY dataStreamID\n" +
+                "    ) ranges\n" +
+                "    WHERE target.id = ranges.dataStreamID;\n" +
+                "    RETURN NULL;\n" +
                 "END;\n" +
                 "$$ LANGUAGE plpgsql;\n" +
                 "\n" +
                 "CREATE TRIGGER obs_update_datastream_ranges\n" +
                 "AFTER INSERT ON " + obsStore.getDatastoreName() + "\n" +
-                "FOR EACH ROW\n" +
-                "EXECUTE FUNCTION update_datastream_time_ranges()";
+                "REFERENCING NEW TABLE AS inserted_observations\n" +
+                "FOR EACH STATEMENT\n" +
+                "EXECUTE FUNCTION " + functionName + "()";
     }
 
     public String createIdIndex() {
-        return "CREATE INDEX obs_datastreams_id_idx ON " + this.getStoreTableName() + "(id)";
+        return "CREATE INDEX " + this.getStoreTableName() + "_id_idx ON " +
+                this.getStoreTableName() + "(id)";
     }
 
     public String createSelectEntriesQuery(DataStreamFilter filter, Set<IDataStreamStore.DataStreamInfoField> fields) {

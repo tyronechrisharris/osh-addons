@@ -76,6 +76,11 @@ public class ConnectionManager {
         config.addDataSourceProperty("cachePrepStmts", "true");
         config.addDataSourceProperty("prepStmtCacheSize", "250");
         config.addDataSourceProperty("prepStmtCacheSqlLimit", "2048");
+        // Allow the PostgreSQL driver to turn a PreparedStatement batch into
+        // a bounded multi-values INSERT.  Besides reducing protocol overhead,
+        // this lets statement-level range maintenance run once per batch
+        // instead of once per observation.
+        config.addDataSourceProperty("reWriteBatchedInserts", "true");
         config.addDataSourceProperty("tcpKeepAlive", "true");
         config.addDataSourceProperty("socketTimeout", "300");
         config.addDataSourceProperty("networkTimeout", "60");

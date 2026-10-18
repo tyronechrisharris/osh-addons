@@ -13,6 +13,7 @@
 
 package org.sensorhub.impl.datastore.postgis.store.obs;
 
+import com.google.gson.JsonParser;
 import com.google.common.collect.Range;
 import net.opengis.swe.v20.DataBlock;
 import org.apache.commons.text.StringSubstitutor;
@@ -25,6 +26,7 @@ import org.sensorhub.api.datastore.feature.IFoiStore;
 import org.sensorhub.api.datastore.obs.*;
 import org.sensorhub.api.datastore.system.ISystemDescStore;
 import org.sensorhub.impl.datastore.postgis.IdProviderType;
+import org.sensorhub.impl.datastore.postgis.archive.UtcJdbcTime;
 import org.sensorhub.impl.datastore.postgis.builder.IteratorResultSet;
 import org.sensorhub.impl.datastore.postgis.builder.ParameterizedQuery;
 import org.sensorhub.impl.datastore.postgis.builder.QueryBuilderObsStore;
@@ -52,6 +54,35 @@ public class PostgisObsStoreImpl extends PostgisStore<QueryBuilderObsStore> impl
     protected PostgisDataStreamStoreImpl dataStreamStore;
     protected ISystemDescStore systemDescStore;
     protected IFoiStore foiStore;
+
+    /** Immutable insert payload used to verify every upsert before commit. */
+    protected static final class PreparedObservation {
+        final long id;
+        final long dataStreamId;
+        final Long foiId;
+        final Instant phenomenonTime;
+        final Instant resultTime;
+        final String resultJson;
+
+        protected PreparedObservation(long id, long dataStreamId, Long foiId, Instant phenomenonTime,
+                                      Instant resultTime, String resultJson) {
+            this.id = id;
+            this.dataStreamId = dataStreamId;
+            this.foiId = foiId;
+            this.phenomenonTime = UtcJdbcTime.toDatabasePrecision(phenomenonTime);
+            this.resultTime = UtcJdbcTime.toDatabasePrecision(resultTime);
+            this.resultJson = resultJson;
+        }
+    }
+
+    /** A deterministic integrity conflict, as distinct from a transient JDBC failure. */
+    protected static class ObservationConflictException extends SQLException {
+        private static final long serialVersionUID = 1L;
+
+        ObservationConflictException(String message) {
+            super(message, "23505");
+        }
+    }
 
     public PostgisObsStoreImpl(String url, String dbName, String login, String password, int idScope, IdProviderType dsIdProviderType) {
         this(url,dbName,login,password,DEFAULT_TABLE_NAME,idScope,dsIdProviderType);
@@ -84,9 +115,42 @@ public class PostgisObsStoreImpl extends PostgisStore<QueryBuilderObsStore> impl
     @Override
     protected void init(String url, String dbName, String login, String password, String[] initScripts) {
         super.init(url, dbName, login, password, initScripts);
+        ensureNaturalKeyConstraint();
         ensureEventFilterIndexes();
         this.dataStreamStore = new PostgisDataStreamStoreImpl(this, url, dbName, login, password, idScope, idProviderType, false);
         queryBuilder.linkTo(dataStreamStore);
+    }
+
+    /**
+     * Base store initialization runs table DDL only for a new table. Apply the
+     * corrected NULL-safe natural key to upgraded tables as a separate online
+     * migration so ordinary observation retries cannot create duplicates.
+     */
+    private void ensureNaturalKeyConstraint() {
+        String indexName = queryBuilder.uniqueConstraintName();
+        try (Connection connection = connectionManager.getConnection()) {
+            boolean invalid = false;
+            try (PreparedStatement statement = connection.prepareStatement(
+                    "SELECT NOT index_state.indisvalid FROM pg_index index_state " +
+                            "WHERE index_state.indexrelid=to_regclass(?)")) {
+                statement.setString(1, indexName);
+                try (ResultSet result = statement.executeQuery()) {
+                    invalid = result.next() && result.getBoolean(1);
+                }
+            }
+            if (invalid) {
+                try (Statement statement = connection.createStatement()) {
+                    statement.execute("DROP INDEX CONCURRENTLY IF EXISTS " + indexName);
+                }
+            }
+            try (Statement statement = connection.createStatement()) {
+                statement.execute(queryBuilder.createUniqueConstraintConcurrently());
+            }
+        } catch (SQLException error) {
+            String detail = "Cannot install the NULL-safe observation natural-key index " + indexName +
+                    ". Existing duplicate observations must be reviewed and resolved before startup.";
+            throw new IllegalStateException(detail, error);
+        }
     }
 
     private void ensureEventFilterIndexes() {
@@ -108,9 +172,15 @@ public class PostgisObsStoreImpl extends PostgisStore<QueryBuilderObsStore> impl
             hashSet = null;
         }
 
-        ParameterizedQuery query = queryBuilder.supportsLatestResultPerDataStreamQuery(filter)
-                ? queryBuilder.createParameterizedLatestResultPerDataStreamQuery(filter, hashSet)
-                : queryBuilder.createParameterizedSelectEntriesQuery(filter, hashSet);
+        // IteratorResultSet performs stable, bounded paging. Keep the final
+        // OSH limit outside SQL so a large SQL LIMIT is not repeated with
+        // overlapping OFFSET pages, and so Java value predicates run before
+        // the caller-visible limit.
+        ObsFilter queryFilter = filter.getLimit() == Long.MAX_VALUE ? filter :
+                ObsFilter.Builder.from(filter).withLimit(Long.MAX_VALUE).build();
+        ParameterizedQuery query = queryBuilder.supportsLatestResultPerDataStreamQuery(queryFilter)
+                ? queryBuilder.createParameterizedLatestResultPerDataStreamQuery(queryFilter, hashSet)
+                : queryBuilder.createParameterizedSelectEntriesQuery(queryFilter, hashSet);
         logger.debug(query.sql());
 
         IteratorResultSet<Entry<BigId, IObsData>> iteratorResultSet =
@@ -120,7 +190,9 @@ public class PostgisObsStoreImpl extends PostgisStore<QueryBuilderObsStore> impl
                         STREAM_FETCH_SIZE,
                         (resultSet) -> resultSetToEntry(resultSet, fields),
                         (entry) -> (filter.getValuePredicate() == null || filter.getValuePredicate().test(entry.getValue())));
-        return StreamSupport.stream(Spliterators.spliteratorUnknownSize(iteratorResultSet, Spliterator.ORDERED), false);
+        Stream<Entry<BigId, IObsData>> entries = StreamSupport.stream(
+                Spliterators.spliteratorUnknownSize(iteratorResultSet, Spliterator.ORDERED), false);
+        return filter.getLimit() == Long.MAX_VALUE ? entries : entries.limit(filter.getLimit());
     }
 
     private Entry<BigId, IObsData> resultSetToEntry(ResultSet resultSet, Set<ObsField> fields) {
@@ -145,16 +217,14 @@ public class PostgisObsStoreImpl extends PostgisStore<QueryBuilderObsStore> impl
                 }
             }
             // required
-            var val = resultSet.getString(String.valueOf(PHENOMENON_TIME));
-            if (!resultSet.wasNull()) {
-                obsDataBuilder = obsDataBuilder.withPhenomenonTime(PostgisUtils.pgDateToInstant(val));
-            }
+            Instant phenomenonTime = UtcJdbcTime.getInstant(resultSet, String.valueOf(PHENOMENON_TIME));
+            if (phenomenonTime != null)
+                obsDataBuilder = obsDataBuilder.withPhenomenonTime(phenomenonTime);
 
             if (!noFields || fields.contains(RESULT_TIME)) {
-                val = resultSet.getString(String.valueOf(RESULT_TIME));
-                if (!resultSet.wasNull()) {
-                    obsDataBuilder = obsDataBuilder.withResultTime(PostgisUtils.pgDateToInstant(val));
-                }
+                Instant resultTime = UtcJdbcTime.getInstant(resultSet, String.valueOf(RESULT_TIME));
+                if (resultTime != null)
+                    obsDataBuilder = obsDataBuilder.withResultTime(resultTime);
             }
 
             // get datastream schema from datastreamId
@@ -232,52 +302,186 @@ public class PostgisObsStoreImpl extends PostgisStore<QueryBuilderObsStore> impl
         DataStreamKey dataStreamKey = new DataStreamKey(obs.getDataStreamID());
         if (!dataStreamStore.containsKey(dataStreamKey))
             throw new IllegalStateException("Unknown datastream with ID: " + obs.getDataStreamID().getIdAsLong());
-        BigId id  = BigId.fromLong(idScope, idProvider.newInternalID(obs));
+        BigId requestedId = BigId.fromLong(idScope, idProvider.newInternalID(obs));
+        long storedId;
         try (Connection connection1 = this.connectionManager.getConnection()) {
-            try (PreparedStatement ps = connection1.prepareStatement(queryBuilder.insertObsPreparedQuery())) {
-                fillPreparedAddStatement(ps, id, dataStreamKey.getInternalID().getIdAsLong(), obs);
+            boolean previousAutoCommit = connection1.getAutoCommit();
+            connection1.setAutoCommit(false);
+            try (PreparedStatement ps = connection1.prepareStatement(preparedObservationUpsertQuery())) {
+                PreparedObservation prepared = prepareObservation(requestedId, dataStreamKey.getInternalID().getIdAsLong(), obs);
+                bindPreparedObservation(ps, prepared);
                 ps.executeUpdate();
+                storedId = validateInsertOutcome(connection1, prepared);
+                connection1.commit();
             } catch (Exception e) {
+                connection1.rollback();
                 throw new IllegalStateException("Cannot insert obs", e);
+            } finally {
+                connection1.setAutoCommit(previousAutoCommit);
             }
         } catch (Exception e) {
             throw new IllegalStateException("Cannot insert obs", e);
         }
-        return id;
+        // A replay/correction of an existing logical observation retains its
+        // stable row ID, just as the reference MVStore retains its time-series
+        // key when replacing the value at the same timestamp.
+        return BigId.fromLong(idScope, storedId);
     }
 
     protected void fillPreparedAddStatement(PreparedStatement ps, BigId id, long dataStreamKey, IObsData obs) throws SQLException {
+        bindPreparedObservation(ps, prepareObservation(id, dataStreamKey, obs));
+    }
+
+    protected PreparedObservation prepareObservation(BigId id, long dataStreamKey, IObsData obs) {
         IDataStreamInfo dataStreamInfo = dataStreamStore.get(new DataStreamKey(obs.getDataStreamID()));
         String serializedBlock = SerializerUtils.writeDataBlockToJson(dataStreamInfo.getRecordStructure(),
                 dataStreamInfo.getRecordEncoding(), obs.getResult());
 
-        String phenomenonTimeStr = obs.getPhenomenonTime() != null
-                ? PostgisUtils.getPgDate(obs.getPhenomenonTime()) : null;
-        String resultTimeStr = obs.getResultTime() != null
-                ? PostgisUtils.getPgDate(obs.getResultTime()) : null;
         Long foiId = obs.hasFoi() ? obs.getFoiID().getIdAsLong() : null;
 
-        // INSERT values (params 1-6)
-        ps.setLong(1, id.getIdAsLong());
-        ps.setLong(2, dataStreamKey);
-        if (foiId != null) {
-            ps.setLong(3, foiId);
+        return new PreparedObservation(id.getIdAsLong(), dataStreamKey, foiId,
+                obs.getPhenomenonTime(), obs.getResultTime(), serializedBlock);
+    }
+
+    /** Creates an already-serialized insert payload for focused store probes. */
+    protected static PreparedObservation preparedObservation(long id, long dataStreamId, Long foiId,
+                                                              Instant phenomenonTime, Instant resultTime,
+                                                              String resultJson) {
+        return new PreparedObservation(id, dataStreamId, foiId, phenomenonTime, resultTime, resultJson);
+    }
+
+    protected void bindPreparedObservation(PreparedStatement ps, PreparedObservation observation) throws SQLException {
+        ps.setLong(1, observation.id);
+        ps.setLong(2, observation.dataStreamId);
+        if (observation.foiId != null) {
+            ps.setLong(3, observation.foiId);
         } else {
             ps.setNull(3, Types.BIGINT);
         }
-        if (phenomenonTimeStr != null) {
-            ps.setString(4, phenomenonTimeStr);
+        if (observation.phenomenonTime != null) {
+            UtcJdbcTime.setInstant(ps, 4, observation.phenomenonTime);
         } else {
             ps.setNull(4, Types.TIMESTAMP);
         }
-        if (resultTimeStr != null) {
-            ps.setString(5, resultTimeStr);
+        if (observation.resultTime != null) {
+            UtcJdbcTime.setInstant(ps, 5, observation.resultTime);
         } else {
             ps.setNull(5, Types.TIMESTAMP);
         }
-        ps.setString(6, serializedBlock);
+        ps.setString(6, observation.resultJson);
     }
 
+    /** Allows the tiered store to protect immutable archive-owned hot rows. */
+    protected String preparedObservationUpsertQuery() {
+        return queryBuilder.insertObsPreparedQuery();
+    }
+
+    /**
+     * Verify that every logical observation now contains the submitted value.
+     * The returned/stored ID can differ from the newly requested sequential ID
+     * when this was an idempotent replay or a last-write-wins correction.
+     */
+    protected void validateInsertOutcomes(Connection connection, List<PreparedObservation> observations)
+            throws SQLException {
+        if (observations.isEmpty())
+            return;
+        Map<ObservationNaturalKey, PreparedObservation> expectedByKey = new LinkedHashMap<>();
+        // LinkedHashMap replacement intentionally selects the last submitted
+        // value for a repeated natural key, matching the batch coalescer and
+        // OSH's reference store semantics.
+        for (PreparedObservation observation : observations)
+            expectedByKey.put(ObservationNaturalKey.of(observation), observation);
+        for (PreparedObservation expected : expectedByKey.values())
+            validateInsertOutcome(connection, expected);
+    }
+
+    protected long validateInsertOutcome(Connection connection, PreparedObservation expected) throws SQLException {
+        try (PreparedStatement natural = connection.prepareStatement(
+                "SELECT id, result::text FROM " + getDatastoreName() + " WHERE datastreamid=? " +
+                        "AND foiid IS NOT DISTINCT FROM ? AND phenomenontime IS NOT DISTINCT FROM ?::timestamp " +
+                        "AND resulttime IS NOT DISTINCT FROM ?::timestamp LIMIT 1")) {
+            natural.setLong(1, expected.dataStreamId);
+            if (expected.foiId == null) natural.setNull(2, Types.BIGINT); else natural.setLong(2, expected.foiId);
+            if (expected.phenomenonTime == null) natural.setNull(3, Types.TIMESTAMP); else UtcJdbcTime.setInstant(natural, 3, expected.phenomenonTime);
+            if (expected.resultTime == null) natural.setNull(4, Types.TIMESTAMP); else UtcJdbcTime.setInstant(natural, 4, expected.resultTime);
+            try (ResultSet result = natural.executeQuery()) {
+                if (!result.next())
+                    throw new ObservationConflictException(
+                            "Observation upsert produced no row for requested ID " + expected.id);
+                if (!JsonParser.parseString(expected.resultJson).equals(
+                        JsonParser.parseString(result.getString(2))))
+                    throw new ObservationConflictException(
+                            "Observation upsert did not retain the submitted result for requested ID " + expected.id);
+                return result.getLong(1);
+            }
+        }
+    }
+
+    /** Resolve a logical observation already present in PostgreSQL, if any. */
+    protected Long findStoredObservationId(PreparedObservation observation) {
+        try (Connection connection = connectionManager.getConnection();
+             PreparedStatement natural = connection.prepareStatement(
+                     "SELECT id FROM " + getDatastoreName() + " WHERE datastreamid=? " +
+                             "AND foiid IS NOT DISTINCT FROM ? AND phenomenontime IS NOT DISTINCT FROM ?::timestamp " +
+                             "AND resulttime IS NOT DISTINCT FROM ?::timestamp LIMIT 1")) {
+            natural.setLong(1, observation.dataStreamId);
+            if (observation.foiId == null) natural.setNull(2, Types.BIGINT); else natural.setLong(2, observation.foiId);
+            if (observation.phenomenonTime == null) natural.setNull(3, Types.TIMESTAMP); else UtcJdbcTime.setInstant(natural, 3, observation.phenomenonTime);
+            if (observation.resultTime == null) natural.setNull(4, Types.TIMESTAMP); else UtcJdbcTime.setInstant(natural, 4, observation.resultTime);
+            try (ResultSet result = natural.executeQuery()) {
+                return result.next() ? result.getLong(1) : null;
+            }
+        } catch (SQLException error) {
+            throw new IllegalStateException("Cannot resolve existing observation identity", error);
+        }
+    }
+
+    /** Read the committed high-water mark used by the batch store's collision fast path. */
+    protected Instant getStoredPhenomenonTimeHighWater(long dataStreamId) {
+        try (Connection connection = connectionManager.getConnection();
+             PreparedStatement statement = connection.prepareStatement(
+                     "SELECT max(phenomenontime) FROM " + getDatastoreName() + " WHERE datastreamid=?")) {
+            statement.setLong(1, dataStreamId);
+            try (ResultSet result = statement.executeQuery()) {
+                return result.next() ? UtcJdbcTime.getInstant(result, 1) : null;
+            }
+        } catch (SQLException error) {
+            throw new IllegalStateException("Cannot read observation high-water mark", error);
+        }
+    }
+
+    protected static final class ObservationNaturalKey {
+        final long dataStreamId;
+        final Long foiId;
+        final Instant phenomenonTime;
+        final Instant resultTime;
+
+        private ObservationNaturalKey(long dataStreamId, Long foiId, Instant phenomenonTime, Instant resultTime) {
+            this.dataStreamId = dataStreamId;
+            this.foiId = foiId;
+            this.phenomenonTime = phenomenonTime;
+            this.resultTime = resultTime;
+        }
+
+        static ObservationNaturalKey of(PreparedObservation observation) {
+            return new ObservationNaturalKey(observation.dataStreamId, observation.foiId,
+                    observation.phenomenonTime, observation.resultTime);
+        }
+
+        @Override
+        public boolean equals(Object value) {
+            if (!(value instanceof ObservationNaturalKey other))
+                return false;
+            return dataStreamId == other.dataStreamId && Objects.equals(foiId, other.foiId) &&
+                    Objects.equals(phenomenonTime, other.phenomenonTime) &&
+                    Objects.equals(resultTime, other.resultTime);
+        }
+
+        @Override
+        public int hashCode() {
+            return Objects.hash(dataStreamId, foiId, phenomenonTime, resultTime);
+        }
+    }
 
     static class TimeParams {
         Range<Instant> phenomenonTimeRange;
@@ -383,14 +587,12 @@ public class PostgisObsStoreImpl extends PostgisStore<QueryBuilderObsStore> impl
                         obsDataBuilder = obsDataBuilder.withFoi(BigId.fromLong(idScope, foiId));
                     }
 
-                    Timestamp phenomenonTimestamp = resultSet.getTimestamp(String.valueOf(PHENOMENON_TIME), UTC_LOCAL);
-                    if (!resultSet.wasNull()) {
-                        obsDataBuilder = obsDataBuilder.withPhenomenonTime(phenomenonTimestamp.toInstant());
-                    }
-                    Timestamp resultTimestamp = resultSet.getTimestamp(String.valueOf(RESULT_TIME), UTC_LOCAL);
-                    if (!resultSet.wasNull()) {
-                        obsDataBuilder = obsDataBuilder.withResultTime(resultTimestamp.toInstant());
-                    }
+                    Instant phenomenonTime = UtcJdbcTime.getInstant(resultSet, String.valueOf(PHENOMENON_TIME));
+                    if (phenomenonTime != null)
+                        obsDataBuilder = obsDataBuilder.withPhenomenonTime(phenomenonTime);
+                    Instant resultTime = UtcJdbcTime.getInstant(resultSet, String.valueOf(RESULT_TIME));
+                    if (resultTime != null)
+                        obsDataBuilder = obsDataBuilder.withResultTime(resultTime);
 
                     // get datastream schema from datastreamId
                     IDataStreamInfo dataStreamInfo = dataStreamStore.get(new DataStreamKey(dataStreamId));
@@ -419,24 +621,24 @@ public class PostgisObsStoreImpl extends PostgisStore<QueryBuilderObsStore> impl
 
             try (PreparedStatement findStmt = connection.prepareStatement(queryBuilder.findByUniqueFieldsQuery())) {
 
+                findStmt.setLong(1, obs.getDataStreamID().getIdAsLong());
+
                 if (obs.hasFoi()) {
-                    findStmt.setLong(1, obs.getFoiID().getIdAsLong());
+                    findStmt.setLong(2, obs.getFoiID().getIdAsLong());
                 } else {
-                    findStmt.setNull(1, Types.BIGINT);
+                    findStmt.setNull(2, Types.BIGINT);
                 }
 
                 if (obs.getPhenomenonTime() != null) {
-                    String d = PostgisUtils.getPgTimestampFromInstant(obs.getPhenomenonTime());
-                    findStmt.setTimestamp(2, Timestamp.valueOf(d));
+                    UtcJdbcTime.setInstant(findStmt, 3, obs.getPhenomenonTime());
                 } else {
-                    findStmt.setNull(2, Types.TIMESTAMP);
+                    findStmt.setNull(3, Types.TIMESTAMP);
                 }
 
                 if (obs.getResultTime() != null) {
-                    String d = PostgisUtils.getPgTimestampFromInstant(obs.getResultTime());
-                    findStmt.setTimestamp(3, Timestamp.valueOf(d));
+                    UtcJdbcTime.setInstant(findStmt, 4, obs.getResultTime());
                 } else {
-                    findStmt.setNull(3, Types.TIMESTAMP);
+                    findStmt.setNull(4, Types.TIMESTAMP);
                 }
 
                 try (ResultSet rs = findStmt.executeQuery()) {
@@ -459,15 +661,13 @@ public class PostgisObsStoreImpl extends PostgisStore<QueryBuilderObsStore> impl
                 }
 
                 if (obs.getPhenomenonTime() != null) {
-                    String d = PostgisUtils.getPgTimestampFromInstant(obs.getPhenomenonTime());
-                    preparedStatement.setTimestamp(3, Timestamp.valueOf(d));
+                    UtcJdbcTime.setInstant(preparedStatement, 3, obs.getPhenomenonTime());
                 } else {
                     preparedStatement.setNull(3, Types.TIMESTAMP);
                 }
 
                 if (obs.getResultTime() != null) {
-                    String d = PostgisUtils.getPgTimestampFromInstant(obs.getResultTime());
-                    preparedStatement.setTimestamp(4, Timestamp.valueOf(d));
+                    UtcJdbcTime.setInstant(preparedStatement, 4, obs.getResultTime());
                 } else {
                     preparedStatement.setNull(4, Types.TIMESTAMP);
                 }
@@ -529,13 +729,13 @@ public class PostgisObsStoreImpl extends PostgisStore<QueryBuilderObsStore> impl
                 statement.setLong(1, dataStreamID);
                 try (ResultSet resultSet = statement.executeQuery()) {
                     if (resultSet.next()) {
-                        Timestamp min = resultSet.getTimestamp("min");
-                        Timestamp max = resultSet.getTimestamp("max");
+                        Instant min = UtcJdbcTime.getInstant(resultSet, "min");
+                        Instant max = UtcJdbcTime.getInstant(resultSet, "max");
                         if (min != null) {
-                            timeRange[0] = min.toInstant();
+                            timeRange[0] = min;
                         }
                         if (max != null) {
-                            timeRange[1] = max.toInstant();
+                            timeRange[1] = max;
                         }
 
                         if (timeRange[0] == Instant.MAX || timeRange[1] == Instant.MIN)
@@ -571,12 +771,12 @@ public class PostgisObsStoreImpl extends PostgisStore<QueryBuilderObsStore> impl
             try (ResultSet rs = ps.executeQuery()) {
                 while (rs.next()) {
                     long id = rs.getLong("datastreamID");
-                    Timestamp min = rs.getTimestamp("min");
-                    Timestamp max = rs.getTimestamp("max");
+                    Instant min = UtcJdbcTime.getInstant(rs, "min");
+                    Instant max = UtcJdbcTime.getInstant(rs, "max");
 
                     if (min != null && max != null) {
                         result.put(id,
-                                TimeExtent.period(min.toInstant(), max.toInstant())
+                                TimeExtent.period(min, max)
                         );
                     }
                 }
@@ -597,13 +797,13 @@ public class PostgisObsStoreImpl extends PostgisStore<QueryBuilderObsStore> impl
                 logger.debug(queryBuilder.getResultTimeRangeByDataStreamIdQuery());
                 try (ResultSet resultSet = statement.executeQuery()) {
                     while (resultSet.next()) {
-                        Timestamp min = resultSet.getTimestamp("min");
-                        Timestamp max = resultSet.getTimestamp("max");
+                        Instant min = UtcJdbcTime.getInstant(resultSet, "min");
+                        Instant max = UtcJdbcTime.getInstant(resultSet, "max");
                         if (min != null) {
-                            timeRange[0] = min.toInstant();
+                            timeRange[0] = min;
                         }
                         if (max != null) {
-                            timeRange[1] = max.toInstant();
+                            timeRange[1] = max;
                         }
 
                         if (timeRange[0] == Instant.MAX || timeRange[1] == Instant.MIN)
@@ -640,12 +840,12 @@ public class PostgisObsStoreImpl extends PostgisStore<QueryBuilderObsStore> impl
             try (ResultSet rs = ps.executeQuery()) {
                 while (rs.next()) {
                     long id = rs.getLong("datastreamID");
-                    Timestamp min = rs.getTimestamp("min");
-                    Timestamp max = rs.getTimestamp("max");
+                    Instant min = UtcJdbcTime.getInstant(rs, "min");
+                    Instant max = UtcJdbcTime.getInstant(rs, "max");
 
                     if (min != null && max != null) {
                         result.put(id,
-                                TimeExtent.period(min.toInstant(), max.toInstant())
+                                TimeExtent.period(min, max)
                         );
                     }
                 }

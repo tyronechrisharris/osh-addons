@@ -61,8 +61,12 @@ public class SelectObsFilterQuery extends BaseObsFilterQuery<SelectFilterQueryGe
     protected void handleSorted(boolean descending) {
         StringBuilder sb = new StringBuilder(this.tableName)
                 .append(".phenomenonTime ")
-                .append(descending ? "DESC" : "ASC");
+                .append(descending ? "DESC" : "ASC")
+                .append(" NULLS FIRST");
         this.filterQueryGenerator.addOrderBy(sb.toString());
+        // Stable tie-breaking is required by the tiered hot/cold merge and
+        // also prevents OFFSET pagination from skipping equal-time rows.
+        this.filterQueryGenerator.addOrderBy(this.tableName + ".id ASC");
     }
 
     protected void handleDataStreamFilter(DataStreamFilter dataStreamFilter) {

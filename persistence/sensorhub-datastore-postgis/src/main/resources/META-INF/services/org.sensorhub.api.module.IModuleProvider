@@ -1,1 +1,2 @@
 org.sensorhub.impl.datastore.postgis.database.PostgisObsSystemDatabaseDescriptor
+org.sensorhub.impl.datastore.postgis.database.OscarTieredObsSystemDatabaseDescriptor

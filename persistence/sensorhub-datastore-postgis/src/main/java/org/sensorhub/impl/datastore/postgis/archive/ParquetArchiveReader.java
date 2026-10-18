@@ -1,0 +1,697 @@
+package org.sensorhub.impl.datastore.postgis.archive;
+
+import org.sensorhub.api.common.BigId;
+import org.sensorhub.api.datastore.TemporalFilter;
+import org.sensorhub.api.datastore.obs.ObsFilter;
+import org.sensorhub.impl.datastore.postgis.builder.filter.JsonCqlEvaluator;
+
+import java.nio.file.Files;
+import java.nio.file.LinkOption;
+import java.nio.file.Path;
+import java.nio.file.attribute.BasicFileAttributes;
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.Iterator;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.NoSuchElementException;
+import java.util.Objects;
+import java.util.Set;
+import java.util.Spliterator;
+import java.util.Spliterators;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Consumer;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+import java.util.stream.StreamSupport;
+
+/** Reads only catalog-authorized Parquet objects and validates each object before first use. */
+public final class ParquetArchiveReader {
+    private static final long VERIFICATION_TTL_NANOS = java.time.Duration.ofMinutes(5).toNanos();
+    private static final String METADATA_COLUMNS =
+            "filename, id_scope, id_value, datastream_scope, datastream_id, " +
+                    "foi_scope, foi_id, phenomenon_time, result_time, profile";
+    private static final String FULL_COLUMNS =
+            "filename, id_scope, id_value, datastream_scope, datastream_id, " +
+                    "foi_scope, foi_id, phenomenon_time, result_time, result_json, profile";
+
+    private final Path root;
+    private final Map<Path, VerificationStamp> verifiedObjects = new ConcurrentHashMap<>();
+    private final AtomicInteger openCursors = new AtomicInteger();
+
+    public ParquetArchiveReader(Path root) {
+        this.root = root.toAbsolutePath().normalize();
+    }
+
+    public List<ArchivedRow> read(ArchiveGeneration generation, ObsFilter filter,
+                                  Set<Long> allowedDataStreams, Set<Long> allowedFois) {
+        return read(List.of(generation), filter, allowedDataStreams, allowedFois, Long.MAX_VALUE);
+    }
+
+    /** Executes one DuckDB query over an explicit catalog-authorized file list. */
+    public List<ArchivedRow> read(List<ArchiveGeneration> generations, ObsFilter filter,
+                                  Set<Long> allowedDataStreams, Set<Long> allowedFois, long limit) {
+        try (Stream<ArchivedRow> rows = stream(generations, filter, allowedDataStreams, allowedFois, limit)) {
+            return rows.toList();
+        }
+    }
+
+    /**
+     * Lazily streams one globally ordered DuckDB result set over the explicit,
+     * catalog-authorized object list. The cursor closes at exhaustion and is
+     * also attached to {@link Stream#close()} for short-circuiting callers.
+     */
+    public Stream<ArchivedRow> stream(List<ArchiveGeneration> generations, ObsFilter filter,
+                                      Set<Long> allowedDataStreams, Set<Long> allowedFois, long limit) {
+        if (limit < 0)
+            throw new IllegalArgumentException("Archive query limit cannot be negative");
+        if (limit == 0 || generations.isEmpty() ||
+                (allowedDataStreams != null && allowedDataStreams.isEmpty()) ||
+                (allowedFois != null && allowedFois.isEmpty()))
+            return Stream.empty();
+
+        boolean latestSelection = (filter.getPhenomenonTime() != null && filter.getPhenomenonTime().isLatestTime()) ||
+                (filter.getResultTime() != null && filter.getResultTime().isLatestTime());
+        if (limit != Long.MAX_VALUE && filter.getCQLFilter() == null && !latestSelection)
+            return streamWindowClusters(generations, filter, allowedDataStreams, allowedFois, limit);
+
+        AuthorizedObjects objects = authorize(generations);
+        if (objects.byFilename().isEmpty())
+            return Stream.empty();
+
+        // CQL is evaluated against the decoded JSON map. It must run before
+        // latest-per-stream selection and before LIMIT or matching rows can be
+        // silently lost. Structured predicates remain pushed into Parquet.
+        boolean javaCql = filter.getCQLFilter() != null;
+        boolean javaLatest = javaCql &&
+                ((filter.getPhenomenonTime() != null && filter.getPhenomenonTime().isLatestTime()) ||
+                        (filter.getResultTime() != null && filter.getResultTime().isLatestTime()));
+        QueryPlan plan = queryPlan(objects, filter, allowedDataStreams, allowedFois,
+                true, !javaCql, javaCql ? Long.MAX_VALUE : limit);
+        Stream<ArchivedRow> rows = openRowStream(objects, plan, generations.size());
+        if (javaCql)
+            rows = rows.filter(row -> matchesCql(filter, row.observation().resultJson()));
+
+        if (javaLatest) {
+            Map<Long, ArchivedRow> latest = new HashMap<>();
+            try (Stream<ArchivedRow> latestRows = rows) {
+                latestRows.forEach(row -> latest.merge(row.observation().dataStreamId(), row,
+                        (previous, candidate) -> later(candidate, previous,
+                                filter.getResultTime() != null && filter.getResultTime().isLatestTime())
+                                ? candidate : previous));
+            }
+            Stream<ArchivedRow> reduced = latest.values().stream().sorted(rowComparator(filter));
+            return limit == Long.MAX_VALUE ? reduced : reduced.limit(limit);
+        }
+        return javaCql && limit != Long.MAX_VALUE ? limitAndClose(rows, limit) : rows;
+    }
+
+    /**
+     * Opens and verifies only the time-window cluster needed by a bounded
+     * query. Revisions and genuinely overlapping windows stay in one DuckDB
+     * query; disjoint later windows are untouched when LIMIT is satisfied.
+     */
+    private Stream<ArchivedRow> streamWindowClusters(
+            List<ArchiveGeneration> generations, ObsFilter filter,
+            Set<Long> allowedDataStreams, Set<Long> allowedFois, long limit) {
+        List<List<ArchiveGeneration>> clusters = windowClusters(generations);
+        if (filter.getPhenomenonTime() != null && filter.getPhenomenonTime().descendingOrder())
+            java.util.Collections.reverse(clusters);
+        WindowClusterCursor cursor = new WindowClusterCursor(
+                clusters.iterator(), filter, allowedDataStreams, allowedFois, limit);
+        return StreamSupport.stream(Spliterators.spliteratorUnknownSize(cursor,
+                        Spliterator.ORDERED | Spliterator.NONNULL), false)
+                .onClose(cursor::close);
+    }
+
+    private static List<List<ArchiveGeneration>> windowClusters(List<ArchiveGeneration> generations) {
+        List<ArchiveGeneration> ordered = generations.stream()
+                .sorted(Comparator.comparing(ArchiveGeneration::start)
+                        .thenComparing(ArchiveGeneration::end)
+                        .thenComparing(ArchiveGeneration::id))
+                .toList();
+        List<List<ArchiveGeneration>> clusters = new ArrayList<>();
+        Instant clusterEnd = null;
+        for (ArchiveGeneration generation : ordered) {
+            if (clusters.isEmpty() || !generation.start().isBefore(clusterEnd)) {
+                clusters.add(new ArrayList<>());
+                clusterEnd = generation.end();
+            } else if (generation.end().isAfter(clusterEnd)) {
+                clusterEnd = generation.end();
+            }
+            clusters.get(clusters.size() - 1).add(generation);
+        }
+        return clusters;
+    }
+
+    private Stream<ArchivedRow> openRowStream(AuthorizedObjects objects, QueryPlan plan, int generationCount) {
+        Connection duck = null;
+        PreparedStatement statement = null;
+        ResultSet result = null;
+        try {
+            duck = DriverManager.getConnection("jdbc:duckdb:");
+            statement = duck.prepareStatement(plan.sql());
+            bind(statement, plan.parameters());
+            result = statement.executeQuery();
+            RowCursor cursor = new RowCursor(duck, statement, result, objects);
+            openCursors.incrementAndGet();
+            return StreamSupport.stream(Spliterators.spliteratorUnknownSize(cursor,
+                            Spliterator.ORDERED | Spliterator.NONNULL), false)
+                    .onClose(cursor::close);
+        } catch (Exception error) {
+            closeQuietly(result);
+            closeQuietly(statement);
+            closeQuietly(duck);
+            throw new IllegalStateException("Cannot query " + generationCount + " archive generation(s)", error);
+        }
+    }
+
+    /** Visible for health metrics and resource-lifecycle regression tests. */
+    public int getOpenCursorCount() {
+        return openCursors.get();
+    }
+
+    /**
+     * Streams only archive metadata. No observation result JSON is read or
+     * decoded, which keeps count/statistics scans bounded by Parquet metadata
+     * columns rather than payload size.
+     */
+    public void forEachMetadata(List<ArchiveGeneration> generations, ObsFilter filter,
+                                Set<Long> allowedDataStreams, Set<Long> allowedFois,
+                                long limit, Consumer<ArchivedMetadataRow> consumer) {
+        if (filter.getCQLFilter() != null || filter.getValuePredicate() != null ||
+                filter.getPhenomenonLocation() != null)
+            throw new IllegalArgumentException("Payload and spatial predicates require full observation decoding");
+        AuthorizedObjects objects = authorize(generations);
+        if (objects.byFilename().isEmpty())
+            return;
+        QueryPlan plan = queryPlan(objects, filter, allowedDataStreams, allowedFois, false, true, limit);
+        try (Connection duck = DriverManager.getConnection("jdbc:duckdb:");
+             PreparedStatement statement = duck.prepareStatement(plan.sql())) {
+            bind(statement, plan.parameters());
+            try (ResultSet result = statement.executeQuery()) {
+                while (result.next()) {
+                    ArchiveGeneration generation = generationForFilename(objects, result.getString(1));
+                    Integer foiScope = result.getObject(6, Integer.class);
+                    Long foiId = result.getObject(7, Long.class);
+                    Instant phenomenon = UtcJdbcTime.getDuckDbInstant(result, 8);
+                    Instant resultTime = UtcJdbcTime.getDuckDbInstant(result, 9);
+                    consumer.accept(new ArchivedMetadataRow(generation,
+                            result.getInt(2), result.getLong(3), result.getInt(4), result.getLong(5),
+                            foiScope, foiId, phenomenon,
+                            resultTime, result.getString(10)));
+                }
+            }
+        } catch (Exception e) {
+            throw new IllegalStateException("Cannot scan metadata from " + generations.size() +
+                    " archive generation(s)", e);
+        }
+    }
+
+    /** Counts structured matches entirely inside DuckDB without materializing payloads. */
+    public long count(List<ArchiveGeneration> generations, ObsFilter filter,
+                      Set<Long> allowedDataStreams, Set<Long> allowedFois) {
+        if (filter.getCQLFilter() != null || filter.getValuePredicate() != null ||
+                filter.getPhenomenonLocation() != null)
+            throw new IllegalArgumentException("Payload and spatial predicates require full observation decoding");
+        AuthorizedObjects objects = authorize(generations);
+        if (objects.byFilename().isEmpty())
+            return 0;
+        ObsFilter unbounded = ObsFilter.Builder.from(filter).withLimit(Long.MAX_VALUE).build();
+        QueryPlan plan = queryPlan(objects, unbounded, allowedDataStreams, allowedFois, false, true, Long.MAX_VALUE);
+        try (Connection duck = DriverManager.getConnection("jdbc:duckdb:");
+             PreparedStatement statement = duck.prepareStatement("SELECT count(*) FROM (" + plan.sql() + ") archive_matches")) {
+            bind(statement, plan.parameters());
+            try (ResultSet result = statement.executeQuery()) {
+                long count = result.next() ? result.getLong(1) : 0;
+                return filter.getLimit() == Long.MAX_VALUE ? count : Math.min(count, filter.getLimit());
+            }
+        } catch (Exception e) {
+            throw new IllegalStateException("Cannot count " + generations.size() + " archive generation(s)", e);
+        }
+    }
+
+    private AuthorizedObjects authorize(List<ArchiveGeneration> generations) {
+        Map<String, ArchiveGeneration> objects = new LinkedHashMap<>();
+        for (ArchiveGeneration generation : generations) {
+            Path object = resolveObject(generation.objectPath());
+            verifyOnce(object, generation.sha256());
+            String filename = canonicalFilename(object);
+            ArchiveGeneration previous = objects.putIfAbsent(filename, generation);
+            if (previous != null && !previous.id().equals(generation.id()))
+                throw new IllegalStateException("Multiple archive generations reference the same object: " + object);
+        }
+        return new AuthorizedObjects(objects);
+    }
+
+    private QueryPlan queryPlan(AuthorizedObjects objects, ObsFilter filter,
+                                Set<Long> allowedDataStreams, Set<Long> allowedFois,
+                                boolean includeResult, boolean applyLatest, long limit) {
+        String columns = includeResult ? FULL_COLUMNS : METADATA_COLUMNS;
+        String fileList = objects.byFilename().keySet().stream().map(path -> "'" + sqlLiteral(path) + "'")
+                .collect(Collectors.joining(","));
+        StringBuilder source = new StringBuilder("SELECT ").append(columns)
+                .append(" FROM read_parquet([").append(fileList).append("], filename=true) WHERE true");
+        List<Object> parameters = new ArrayList<>();
+
+        if (filter.getInternalIDs() != null && !filter.getInternalIDs().isEmpty())
+            appendIn(source, "id_value", filter.getInternalIDs().stream().map(BigId::getIdAsLong).toList(), parameters);
+        if (allowedDataStreams != null)
+            appendIn(source, "datastream_id", allowedDataStreams, parameters);
+        if (allowedFois != null) {
+            Set<Long> explicitFois = allowedFois.stream().filter(id -> id != 0L).collect(Collectors.toSet());
+            if (allowedFois.contains(0L)) {
+                source.append(" AND (foi_id IS NULL");
+                if (!explicitFois.isEmpty()) {
+                    source.append(" OR foi_id IN (");
+                    appendPlaceholders(source, explicitFois.size());
+                    source.append(')');
+                    parameters.addAll(explicitFois);
+                }
+                source.append(')');
+            } else {
+                appendIn(source, "foi_id", explicitFois, parameters);
+            }
+        }
+        appendTime(source, "phenomenon_time", filter.getPhenomenonTime(), parameters);
+        appendTime(source, "result_time", filter.getResultTime(), parameters);
+
+        boolean latestPhenomenon = applyLatest && filter.getPhenomenonTime() != null &&
+                filter.getPhenomenonTime().isLatestTime();
+        boolean latestResult = applyLatest && filter.getResultTime() != null && filter.getResultTime().isLatestTime();
+        StringBuilder sql;
+        if (latestPhenomenon || latestResult) {
+            String latestColumn = latestResult ? "result_time" : "phenomenon_time";
+            sql = new StringBuilder("SELECT ").append(columns).append(" FROM (SELECT ").append(columns)
+                    .append(", row_number() OVER (PARTITION BY datastream_id ORDER BY ")
+                    .append(latestColumn).append(" DESC NULLS LAST, id_value DESC) AS archive_rank FROM (")
+                    .append(source).append(") filtered) ranked WHERE archive_rank=1");
+        } else {
+            sql = source;
+        }
+        sql.append(" ORDER BY phenomenon_time ")
+                .append(filter.getPhenomenonTime() != null && filter.getPhenomenonTime().descendingOrder() ? "DESC" : "ASC")
+                .append(" NULLS FIRST, id_value");
+        if (limit != Long.MAX_VALUE) {
+            if (limit < 0)
+                throw new IllegalArgumentException("Archive query limit cannot be negative");
+            sql.append(" LIMIT ?");
+            parameters.add(limit);
+        }
+        return new QueryPlan(sql.toString(), parameters);
+    }
+
+    private static void bind(PreparedStatement statement, List<Object> parameters) throws Exception {
+        for (int i = 0; i < parameters.size(); i++) {
+            Object value = parameters.get(i);
+            if (value instanceof Instant instant)
+                UtcJdbcTime.setDuckDbInstant(statement, i + 1, instant);
+            else
+                statement.setObject(i + 1, value);
+        }
+    }
+
+    private static boolean later(ArchivedRow candidate, ArchivedRow previous, boolean resultTime) {
+        Instant candidateTime = resultTime ? candidate.observation().resultTime() : candidate.observation().phenomenonTime();
+        Instant previousTime = resultTime ? previous.observation().resultTime() : previous.observation().phenomenonTime();
+        if (candidateTime == null)
+            return false;
+        if (previousTime == null)
+            return true;
+        int compared = candidateTime.compareTo(previousTime);
+        return compared > 0 || (compared == 0 && candidate.observation().id() > previous.observation().id());
+    }
+
+    private static Comparator<ArchivedRow> rowComparator(ObsFilter filter) {
+        boolean descending = filter.getPhenomenonTime() != null && filter.getPhenomenonTime().descendingOrder();
+        Comparator<Instant> timeOrder = descending ? Comparator.nullsFirst(Comparator.reverseOrder()) :
+                Comparator.nullsFirst(Comparator.naturalOrder());
+        Comparator<ArchivedRow> comparator = Comparator.comparing(
+                row -> row.observation().phenomenonTime(), timeOrder);
+        return comparator.thenComparingLong(row -> row.observation().id());
+    }
+
+    private static boolean matchesCql(ObsFilter filter, String resultJson) {
+        return JsonCqlEvaluator.matches(filter.getCQLFilter(), resultJson);
+    }
+
+    private ArchiveGeneration generationForFilename(AuthorizedObjects objects, String returnedFilename) {
+        String filename = canonicalFilename(Path.of(returnedFilename));
+        ArchiveGeneration generation = objects.byFilename().get(filename);
+        if (generation == null)
+            throw new IllegalStateException("DuckDB returned an object outside the authorized file list: " + returnedFilename);
+        return generation;
+    }
+
+    private static String canonicalFilename(Path path) {
+        return path.toAbsolutePath().normalize().toString();
+    }
+
+    private Path resolveObject(Path relative) {
+        if (relative.isAbsolute())
+            throw new IllegalStateException("Archive catalog contains a non-portable absolute object path");
+        Path resolved = root.resolve(relative).normalize();
+        if (!resolved.startsWith(root))
+            throw new IllegalStateException("Archive object escapes configured root");
+        try {
+            Path realRoot = root.toRealPath();
+            Path current = root;
+            for (Path component : root.relativize(resolved)) {
+                current = current.resolve(component);
+                if (Files.isSymbolicLink(current))
+                    throw new IllegalStateException("Archive object path contains a symbolic link: " + current);
+            }
+            // Every component beneath the configured root was explicitly
+            // rejected if it was a symlink. Follow only aliases in the root
+            // itself (for example macOS /tmp -> /private/tmp) so both paths
+            // are compared in the same canonical namespace.
+            Path realObject = resolved.toRealPath();
+            if (!realObject.startsWith(realRoot))
+                throw new IllegalStateException("Archive object resolves outside configured root");
+            return realObject;
+        } catch (IllegalStateException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new IllegalStateException("Cannot resolve archive object " + resolved, e);
+        }
+    }
+
+    private void verifyOnce(Path object, String expectedSha256) {
+        try {
+            BasicFileAttributes before = readAttributes(object);
+            long now = System.nanoTime();
+            VerificationStamp cached = verifiedObjects.get(object);
+            if (cached != null && cached.matches(expectedSha256, before, now))
+                return;
+            String actual = ArchiveExporter.sha256(object);
+            if (!expectedSha256.equals(actual))
+                throw new IllegalStateException("Archive checksum mismatch: " + object);
+            BasicFileAttributes after = readAttributes(object);
+            if (!sameObject(before, after))
+                throw new IllegalStateException("Archive object changed while its checksum was being verified: " + object);
+            verifiedObjects.put(object, VerificationStamp.from(expectedSha256, after, now));
+        } catch (Exception e) {
+            verifiedObjects.remove(object);
+            throw new IllegalStateException("Cannot verify archive object " + object, e);
+        }
+    }
+
+    private static BasicFileAttributes readAttributes(Path object) throws Exception {
+        BasicFileAttributes attributes = Files.readAttributes(
+                object, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
+        if (!attributes.isRegularFile())
+            throw new IllegalStateException("Cataloged archive object is not a regular file: " + object);
+        return attributes;
+    }
+
+    private static boolean sameObject(BasicFileAttributes first, BasicFileAttributes second) {
+        return first.size() == second.size() &&
+                first.lastModifiedTime().equals(second.lastModifiedTime()) &&
+                Objects.equals(first.fileKey(), second.fileKey());
+    }
+
+    private static void appendTime(StringBuilder sql, String column, TemporalFilter filter, List<Object> parameters) {
+        // Current time is a concrete instant captured by TemporalFilter on
+        // first access and must be pushed to cold storage just like hot SQL.
+        if (filter == null || filter.isLatestTime())
+            return;
+        Instant minimum = filter.getMin();
+        Instant maximum = filter.getMax();
+        if (minimum != null && !Instant.MIN.equals(minimum)) {
+            sql.append(" AND ").append(column).append(" >= ?");
+            parameters.add(minimum);
+        }
+        if (maximum != null && !Instant.MAX.equals(maximum)) {
+            sql.append(" AND ").append(column).append(" <= ?");
+            parameters.add(maximum);
+        }
+    }
+
+    private static void appendIn(StringBuilder sql, String column, Collection<Long> values, List<Object> parameters) {
+        if (values.isEmpty()) {
+            sql.append(" AND false");
+            return;
+        }
+        sql.append(" AND ").append(column).append(" IN (");
+        appendPlaceholders(sql, values.size());
+        sql.append(')');
+        parameters.addAll(values);
+    }
+
+    private static void appendPlaceholders(StringBuilder sql, int count) {
+        for (int i = 0; i < count; i++) {
+            if (i > 0)
+                sql.append(',');
+            sql.append('?');
+        }
+    }
+
+    private static String sqlLiteral(String value) {
+        return value.replace("'", "''");
+    }
+
+    private static void closeQuietly(AutoCloseable closeable) {
+        if (closeable == null)
+            return;
+        try {
+            closeable.close();
+        } catch (Exception ignored) {
+            // Preserve the query/decoding failure. Cursor accounting and all
+            // remaining close attempts still run.
+        }
+    }
+
+    /**
+     * Unlike {@link Stream#limit(long)}, this wrapper closes a live DuckDB
+     * cursor immediately after returning the last requested row. It also
+     * closes on source exhaustion, failure, and an explicit stream close.
+     */
+    private static <T> Stream<T> limitAndClose(Stream<T> source, long limit) {
+        ClosingLimitIterator<T> iterator = new ClosingLimitIterator<>(source, limit);
+        return StreamSupport.stream(Spliterators.spliteratorUnknownSize(iterator,
+                        Spliterator.ORDERED | Spliterator.NONNULL), false)
+                .onClose(iterator::close);
+    }
+
+    private static final class ClosingLimitIterator<T> implements Iterator<T>, AutoCloseable {
+        private final Stream<T> source;
+        private final Iterator<T> iterator;
+        private final long limit;
+        private final AtomicBoolean closed = new AtomicBoolean();
+        private long emitted;
+
+        ClosingLimitIterator(Stream<T> source, long limit) {
+            this.source = source;
+            this.iterator = source.iterator();
+            this.limit = limit;
+            if (limit == 0)
+                close();
+        }
+
+        @Override
+        public boolean hasNext() {
+            if (closed.get() || emitted >= limit)
+                return false;
+            try {
+                boolean available = iterator.hasNext();
+                if (!available)
+                    close();
+                return available;
+            } catch (RuntimeException | Error error) {
+                close();
+                throw error;
+            }
+        }
+
+        @Override
+        public T next() {
+            if (!hasNext())
+                throw new NoSuchElementException();
+            T value = iterator.next();
+            emitted++;
+            if (emitted >= limit)
+                close();
+            return value;
+        }
+
+        @Override
+        public void close() {
+            if (closed.compareAndSet(false, true))
+                source.close();
+        }
+    }
+
+    private final class WindowClusterCursor implements Iterator<ArchivedRow>, AutoCloseable {
+        private final Iterator<List<ArchiveGeneration>> clusters;
+        private final ObsFilter filter;
+        private final Set<Long> allowedDataStreams;
+        private final Set<Long> allowedFois;
+        private final AtomicBoolean closed = new AtomicBoolean();
+        private Stream<ArchivedRow> currentStream;
+        private Iterator<ArchivedRow> currentRows;
+        private long remaining;
+
+        WindowClusterCursor(Iterator<List<ArchiveGeneration>> clusters, ObsFilter filter,
+                            Set<Long> allowedDataStreams, Set<Long> allowedFois, long limit) {
+            this.clusters = clusters;
+            this.filter = filter;
+            this.allowedDataStreams = allowedDataStreams;
+            this.allowedFois = allowedFois;
+            this.remaining = limit;
+        }
+
+        @Override
+        public boolean hasNext() {
+            if (closed.get() || remaining == 0)
+                return false;
+            try {
+                while (true) {
+                    if (currentRows != null && currentRows.hasNext())
+                        return true;
+                    closeCurrent();
+                    if (!clusters.hasNext()) {
+                        close();
+                        return false;
+                    }
+                    List<ArchiveGeneration> cluster = clusters.next();
+                    AuthorizedObjects objects = authorize(cluster);
+                    QueryPlan plan = queryPlan(objects, filter, allowedDataStreams, allowedFois,
+                            true, true, remaining);
+                    currentStream = openRowStream(objects, plan, cluster.size());
+                    currentRows = currentStream.iterator();
+                }
+            } catch (RuntimeException | Error error) {
+                close();
+                throw error;
+            }
+        }
+
+        @Override
+        public ArchivedRow next() {
+            if (!hasNext())
+                throw new NoSuchElementException();
+            ArchivedRow value = currentRows.next();
+            remaining--;
+            if (remaining == 0)
+                close();
+            return value;
+        }
+
+        @Override
+        public void close() {
+            if (!closed.compareAndSet(false, true))
+                return;
+            closeCurrent();
+        }
+
+        private void closeCurrent() {
+            if (currentStream != null)
+                currentStream.close();
+            currentStream = null;
+            currentRows = null;
+        }
+    }
+
+    private final class RowCursor implements Iterator<ArchivedRow>, AutoCloseable {
+        private final Connection connection;
+        private final PreparedStatement statement;
+        private final ResultSet result;
+        private final AuthorizedObjects objects;
+        private final AtomicBoolean closed = new AtomicBoolean();
+        private ArchivedRow next;
+        private boolean prefetched;
+
+        RowCursor(Connection connection, PreparedStatement statement, ResultSet result,
+                  AuthorizedObjects objects) {
+            this.connection = connection;
+            this.statement = statement;
+            this.result = result;
+            this.objects = objects;
+        }
+
+        @Override
+        public boolean hasNext() {
+            if (prefetched)
+                return true;
+            if (closed.get())
+                return false;
+            try {
+                if (!result.next()) {
+                    close();
+                    return false;
+                }
+                ArchiveGeneration generation = generationForFilename(objects, result.getString(1));
+                Integer foiScope = result.getObject(6, Integer.class);
+                Long foiId = result.getObject(7, Long.class);
+                next = new ArchivedRow(generation, new ArchivedObservation(
+                        result.getInt(2), result.getLong(3), result.getInt(4), result.getLong(5),
+                        foiScope, foiId, UtcJdbcTime.getDuckDbInstant(result, 8),
+                        UtcJdbcTime.getDuckDbInstant(result, 9), result.getString(10), result.getString(11)));
+                prefetched = true;
+                return true;
+            } catch (Exception error) {
+                close();
+                throw new IllegalStateException("Cannot decode archived observation", error);
+            }
+        }
+
+        @Override
+        public ArchivedRow next() {
+            if (!hasNext())
+                throw new NoSuchElementException();
+            ArchivedRow value = next;
+            next = null;
+            prefetched = false;
+            return value;
+        }
+
+        @Override
+        public void close() {
+            if (!closed.compareAndSet(false, true))
+                return;
+            closeQuietly(result);
+            closeQuietly(statement);
+            closeQuietly(connection);
+            openCursors.decrementAndGet();
+            next = null;
+            prefetched = false;
+        }
+    }
+
+    private record QueryPlan(String sql, List<Object> parameters) {}
+    private record AuthorizedObjects(Map<String, ArchiveGeneration> byFilename) {}
+    private record VerificationStamp(String expectedSha256, long size,
+                                     java.nio.file.attribute.FileTime lastModified,
+                                     Object fileKey, long verifiedAtNanos) {
+        static VerificationStamp from(String expectedSha256, BasicFileAttributes attributes,
+                                      long verifiedAtNanos) {
+            return new VerificationStamp(expectedSha256, attributes.size(),
+                    attributes.lastModifiedTime(), attributes.fileKey(), verifiedAtNanos);
+        }
+
+        boolean matches(String expected, BasicFileAttributes attributes, long now) {
+            long age = now - verifiedAtNanos;
+            return expectedSha256.equals(expected) && size == attributes.size() &&
+                    lastModified.equals(attributes.lastModifiedTime()) &&
+                    Objects.equals(fileKey, attributes.fileKey()) && age >= 0 &&
+                    age <= VERIFICATION_TTL_NANOS;
+        }
+    }
+
+    public record ArchivedRow(ArchiveGeneration generation, ArchivedObservation observation) {}
+
+    public record ArchivedMetadataRow(ArchiveGeneration generation, int idScope, long id,
+                                      int dataStreamScope, long dataStreamId,
+                                      Integer foiScope, Long foiId, Instant phenomenonTime,
+                                      Instant resultTime, String profile) {}
+}

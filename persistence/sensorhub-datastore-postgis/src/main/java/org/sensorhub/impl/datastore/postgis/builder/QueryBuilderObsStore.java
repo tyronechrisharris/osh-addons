@@ -55,6 +55,23 @@ public class QueryBuilderObsStore extends QueryBuilder {
                 ")";
     }
 
+    /** Marker used only by OSCAR's tiered store; harmless on ordinary stores. */
+    public String addArchiveGenerationColumnQuery() {
+        return "ALTER TABLE " + getStoreTableName() + " ADD COLUMN IF NOT EXISTS archivegenerationid uuid";
+    }
+
+    public String createUnarchivedTimeIndexQuery() {
+        return "CREATE INDEX IF NOT EXISTS " + getStoreTableName() +
+                "_unarchived_time_idx ON " + getStoreTableName() +
+                " (phenomenontime, id) WHERE archivegenerationid IS NULL";
+    }
+
+    public String createArchiveGenerationIndexQuery() {
+        return "CREATE INDEX IF NOT EXISTS " + getStoreTableName() +
+                "_archive_generation_idx ON " + getStoreTableName() +
+                " (archivegenerationid, id) WHERE archivegenerationid IS NOT NULL";
+    }
+
     public String createDataIndexQuery() {
         return "CREATE INDEX IF NOT EXISTS "+this.getStoreTableName()+"_data_idx on "+this.getStoreTableName()+" USING GIN("+RESULT+")";
     }
@@ -120,17 +137,69 @@ public class QueryBuilderObsStore extends QueryBuilder {
     public String insertObsQuery() {
         return "INSERT INTO "+this.getStoreTableName()+" " +
                 "(id,"+DATASTREAM_ID+", "+FOI_ID+", "+PHENOMENON_TIME+", "+RESULT_TIME+", "+RESULT+") VALUES (${1},${2},${3},${4},${5},${6}) "+
-                "ON CONFLICT ("+DATASTREAM_ID+", COALESCE("+FOI_ID+", -1::bigint), "+PHENOMENON_TIME+", "+RESULT_TIME+") DO NOTHING";
+                naturalKeyUpsertClause();
     }
 
     public String insertObsPreparedQuery() {
         return "INSERT INTO "+this.getStoreTableName()+" " +
                 "(id,"+DATASTREAM_ID+", "+FOI_ID+", "+PHENOMENON_TIME+", "+RESULT_TIME+", "+RESULT+") VALUES (?::int8,?::int8,?::int8,?::timestamp,?::timestamp,?::jsonb) "+
-                "ON CONFLICT ("+DATASTREAM_ID+", COALESCE("+FOI_ID+", -1::bigint), "+PHENOMENON_TIME+", "+RESULT_TIME+") DO NOTHING";
+                naturalKeyUpsertClause();
+    }
+
+    /**
+     * Tiered rows already assigned to an immutable generation cannot be
+     * changed in place. The store writes a generation-owned overlay for such
+     * conflicts before committing the batch.
+     */
+    public String insertTieredObsPreparedQuery() {
+        return "INSERT INTO "+this.getStoreTableName()+" " +
+                "(id,"+DATASTREAM_ID+", "+FOI_ID+", "+PHENOMENON_TIME+", "+RESULT_TIME+", "+RESULT+") VALUES (?::int8,?::int8,?::int8,?::timestamp,?::timestamp,?::jsonb) "+
+                naturalKeyUpsertClause("(" + getStoreTableName() + ".archivegenerationid IS NULL OR " +
+                        "NOT EXISTS (SELECT 1 FROM oscar_archive_generation generation " +
+                        "WHERE generation.id=" + getStoreTableName() + ".archivegenerationid " +
+                        "AND generation.state IN ('ACTIVE','SEALED'))) AND ");
+    }
+
+    /**
+     * Match the observation identity used by OSH's reference MVStore:
+     * datastream, FOI, phenomenon time and result time identify one logical
+     * observation. Replaying the same value is a no-op; a corrected value for
+     * that identity replaces the result while retaining the original row ID.
+     */
+    private String naturalKeyUpsertClause() {
+        return naturalKeyUpsertClause("");
+    }
+
+    private String naturalKeyUpsertClause(String updateGuard) {
+        return "ON CONFLICT (" + DATASTREAM_ID + ", COALESCE(" + FOI_ID +
+                ", -1::bigint), COALESCE(" + PHENOMENON_TIME +
+                ", '-infinity'::timestamp), COALESCE(" + RESULT_TIME +
+                ", '-infinity'::timestamp)) DO UPDATE SET " + RESULT + "=EXCLUDED." + RESULT +
+                " WHERE " + updateGuard + getStoreTableName() + "." + RESULT +
+                " IS DISTINCT FROM EXCLUDED." + RESULT;
     }
 
     public String createUniqueConstraint() {
-        return "CREATE UNIQUE INDEX IF NOT EXISTS "+this.getStoreTableName()+"_unique_constraint on "+this.getStoreTableName()+" (" + DATASTREAM_ID + ", COALESCE(" + FOI_ID + ", -1::bigint), " + PHENOMENON_TIME + ", " + RESULT_TIME + ")";
+        // PostgreSQL considers NULL values distinct in a normal unique index.
+        // Most OSCAR observations have no result time, so the former index did
+        // not actually enforce the documented natural observation key. A new
+        // index name also makes existing installations add the corrected
+        // constraint instead of retaining the old definition via IF NOT EXISTS.
+        return "CREATE UNIQUE INDEX IF NOT EXISTS "+this.getStoreTableName()+"_unique_constraint_v2 on "+
+                this.getStoreTableName()+" (" + DATASTREAM_ID + ", COALESCE(" + FOI_ID +
+                ", -1::bigint), COALESCE(" + PHENOMENON_TIME +
+                ", '-infinity'::timestamp), COALESCE(" + RESULT_TIME +
+                ", '-infinity'::timestamp))";
+    }
+
+    /** Online variant used to upgrade an already populated observation table. */
+    public String createUniqueConstraintConcurrently() {
+        return createUniqueConstraint().replace("CREATE UNIQUE INDEX IF NOT EXISTS",
+                "CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS");
+    }
+
+    public String uniqueConstraintName() {
+        return getStoreTableName() + "_unique_constraint_v2";
     }
 
     public String updateByIdQuery() {
@@ -145,9 +214,10 @@ public class QueryBuilderObsStore extends QueryBuilder {
 
     public String findByUniqueFieldsQuery() {
         return "SELECT id FROM " + this.getStoreTableName() + " WHERE " +
-                FOI_ID + " = ? AND " +
-                PHENOMENON_TIME + " = ? AND " +
-                RESULT_TIME + " = ?";
+                DATASTREAM_ID + " = ? AND " +
+                FOI_ID + " IS NOT DISTINCT FROM ? AND " +
+                PHENOMENON_TIME + " IS NOT DISTINCT FROM ?::timestamp AND " +
+                RESULT_TIME + " IS NOT DISTINCT FROM ?::timestamp";
     }
 
     public String getPhenomenonTimeRangeByDataStreamIdQuery(long dataStreamID) {

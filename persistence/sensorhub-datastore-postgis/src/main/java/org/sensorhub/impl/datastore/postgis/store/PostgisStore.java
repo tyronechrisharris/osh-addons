@@ -204,12 +204,15 @@ public abstract class PostgisStore<T extends QueryBuilder> {
     public void close() {
         try {
             commit();
-
-            if(timerTask != null) {
-                timerTask.cancel();
-            }
         } catch (Exception ex) {
-            ex.printStackTrace();
+            // Never turn a failed final batch flush into apparent success.
+            // The timer remains active so an owner that catches this failure
+            // can restore connectivity and retry close/commit without losing
+            // the still-queued immutable snapshots.
+            throw new IllegalStateException("Cannot close datastore with uncommitted data", ex);
+        }
+        if(timerTask != null) {
+            timerTask.cancel();
         }
     }
 

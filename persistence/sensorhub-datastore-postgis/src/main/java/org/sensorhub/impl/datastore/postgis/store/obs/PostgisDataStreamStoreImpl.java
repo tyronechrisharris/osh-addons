@@ -29,6 +29,7 @@ import org.sensorhub.api.datastore.system.ISystemDescStore;
 import org.sensorhub.impl.datastore.DataStoreUtils;
 import org.sensorhub.impl.datastore.obs.DataStreamInfoWrapper;
 import org.sensorhub.impl.datastore.postgis.IdProviderType;
+import org.sensorhub.impl.datastore.postgis.archive.UtcJdbcTime;
 import org.sensorhub.impl.datastore.postgis.builder.ParameterizedQuery;
 import org.sensorhub.impl.datastore.postgis.store.PostgisStore;
 import org.sensorhub.impl.datastore.postgis.builder.QueryBuilderDataStreamStore;
@@ -81,6 +82,15 @@ public class PostgisDataStreamStoreImpl extends PostgisStore<QueryBuilderDataStr
                 queryBuilder.createMinMaxTimeTriggerQuery(),
                 queryBuilder.createIdIndex()
         });
+
+        // The base initializer only executes schema statements when the table
+        // is first created.  Re-apply this idempotent trigger definition so an
+        // upgrade replaces the legacy FOR EACH ROW trigger as well.
+        try (Connection connection = this.connectionManager.getConnection()) {
+            PostgisUtils.executeQueries(connection, new String[]{queryBuilder.createMinMaxTimeTriggerQuery()});
+        } catch (SQLException e) {
+            throw new IllegalStateException("Cannot install batched datastream range maintenance", e);
+        }
     }
 
     protected class DataStreamInfoWithTimeRanges extends DataStreamInfoWrapper
@@ -170,19 +180,19 @@ public class PostgisDataStreamStoreImpl extends PostgisStore<QueryBuilderDataStr
                         IDataStreamInfo dataStreamInfo = SerializerUtils.readIDataStreamInfoFromJson(data);
                         DataStreamInfoWithTimeRanges wrapper = new DataStreamInfoWithTimeRanges(id, dataStreamInfo);
 
-                        Timestamp minPhenomenonTime = resultSet.getTimestamp("min_phenomenon_time");
-                        Timestamp maxPhenomenonTime = resultSet.getTimestamp("max_phenomenon_time");
-                        Timestamp minResultTime = resultSet.getTimestamp("min_result_time");
-                        Timestamp maxResultTime = resultSet.getTimestamp("max_result_time");
+                        Instant minPhenomenonTime = UtcJdbcTime.getInstant(resultSet, "min_phenomenon_time");
+                        Instant maxPhenomenonTime = UtcJdbcTime.getInstant(resultSet, "max_phenomenon_time");
+                        Instant minResultTime = UtcJdbcTime.getInstant(resultSet, "min_result_time");
+                        Instant maxResultTime = UtcJdbcTime.getInstant(resultSet, "max_result_time");
 
                         wrapper.setPhenomenonTimeRange(TimeExtent.period(
-                                minPhenomenonTime != null ? minPhenomenonTime.toInstant() : Instant.MIN,
-                                maxPhenomenonTime != null ? maxPhenomenonTime.toInstant() : Instant.MAX
+                                minPhenomenonTime != null ? minPhenomenonTime : Instant.MIN,
+                                maxPhenomenonTime != null ? maxPhenomenonTime : Instant.MAX
                         ));
 
                         wrapper.setResultTimeRange(TimeExtent.period(
-                                minResultTime != null ? minResultTime.toInstant() : Instant.MIN,
-                                maxResultTime != null ? maxResultTime.toInstant() : Instant.MAX
+                                minResultTime != null ? minResultTime : Instant.MIN,
+                                maxResultTime != null ? maxResultTime : Instant.MAX
                         ));
 
                         results.put(new DataStreamKey(idScope, id), wrapper);

@@ -68,6 +68,7 @@ public class PostgisObsSystemDatabase extends AbstractModule<PostgisObsSystemDat
     protected PostgisDeploymentStoreImpl deploymentStore;
 
     protected TimerTask timerTask;
+    protected Timer commitTimer;
 
     @Override
     protected void beforeInit() throws SensorHubException {
@@ -103,20 +104,23 @@ public class PostgisObsSystemDatabase extends AbstractModule<PostgisObsSystemDat
             commandStore.getCommandStreams().linkTo(systemDescStore);
 
             if(config.useBatch) {
-                Timer t = new Timer();
+                commitTimer = new Timer("postgis-observation-batch-commit", true);
                 timerTask = new TimerTask() {
                     @Override
                     public void run() {
                         try {
                             obsStore.commit();
                             foiStore.commit();
-                        } catch (DataStoreException e) {
-                            throw new RuntimeException(e);
+                        } catch (Exception e) {
+                            // A Timer dies permanently when its task throws.
+                            // Keep retrying bounded pending batches while
+                            // surfacing the database outage to operators.
+                            getLogger().error("PostGIS observation batch commit failed; pending observations retained for retry", e);
                         }
                     }
                 };
 
-                t.scheduleAtFixedRate(timerTask, 0, config.autoCommitPeriod * 1000L);
+                commitTimer.scheduleAtFixedRate(timerTask, 0, config.autoCommitPeriod * 1000L);
             }
 
         } catch (Exception e) {
@@ -134,13 +138,26 @@ public class PostgisObsSystemDatabase extends AbstractModule<PostgisObsSystemDat
 
     @Override
     protected void beforeStop() {
-        // Try to close every store separately
+        // Flush the observation queue before disabling its retry timer. A
+        // failed final flush must abort stop visibly; otherwise the module can
+        // report a clean shutdown after silently abandoning pending samples.
         try {
             obsStore.close();
         } catch (Exception ex) {
-            getLogger().warn("Cannot close obsStore");
+            getLogger().error("Cannot stop PostGIS while observations remain uncommitted", ex);
+            throw new IllegalStateException(
+                    "PostGIS shutdown aborted because pending observations could not be committed", ex);
         }
 
+        if (timerTask != null)
+            timerTask.cancel();
+        if (commitTimer != null) {
+            commitTimer.cancel();
+            commitTimer.purge();
+            commitTimer = null;
+        }
+
+        // Try to close every non-observation store separately.
         try {
             foiStore.close();
         } catch (Exception ex) {
@@ -168,9 +185,7 @@ public class PostgisObsSystemDatabase extends AbstractModule<PostgisObsSystemDat
         if (hasParentHub() && config.databaseNum != null)
             getParentHub().getDatabaseRegistry().unregister(this);
 
-        if(timerTask != null) {
-            timerTask.cancel();
-        }
+        timerTask = null;
     }
 
     protected void closeStore() {

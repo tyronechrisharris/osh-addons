@@ -19,6 +19,9 @@ dependencies {
   embeddedImpl('com.github.ben-manes.caffeine:caffeine:3.1.7') {
     exclude group: 'checker-qual', module: 'org.checkerframework'
   }
+  // DuckDB is embedded only for explicit, catalog-authorized Parquet files.
+  // OSCAR does not load DuckDB's PostgreSQL or network extensions.
+  embeddedImpl('org.duckdb:duckdb_jdbc:1.5.6.0')
   testImplementation(testFixtures('org.sensorhub:sensorhub-core:' + oshCoreVersion))
 }
 
@@ -41,5 +44,4 @@ ext.pom >>= {
     }
   }
 }
-
 

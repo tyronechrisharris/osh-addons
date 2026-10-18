@@ -122,6 +122,25 @@ public class TestParameterizedQueryBuilder {
     }
 
     @Test
+    public void testObservationInsertUsesStableIdempotentNaturalKeyUpsert() {
+        QueryBuilderObsStore builder = new QueryBuilderObsStore("obs");
+
+        for (String query : Arrays.asList(builder.insertObsQuery(), builder.insertObsPreparedQuery())) {
+            assertTrue(query.startsWith("INSERT INTO obs"));
+            assertTrue(query.contains("ON CONFLICT (dataStreamID, COALESCE(foiID, -1::bigint)"));
+            assertTrue(query.contains("DO UPDATE SET result=EXCLUDED.result"));
+            assertTrue(query.endsWith("WHERE obs.result IS DISTINCT FROM EXCLUDED.result"));
+            assertFalse(query.contains("SET id="));
+        }
+
+        String naturalKeyLookup = builder.findByUniqueFieldsQuery();
+        assertTrue(naturalKeyLookup.contains("dataStreamID = ?"));
+        assertTrue(naturalKeyLookup.contains("foiID IS NOT DISTINCT FROM ?"));
+        assertTrue(naturalKeyLookup.contains("phenomenonTime IS NOT DISTINCT FROM ?::timestamp"));
+        assertTrue(naturalKeyLookup.contains("resultTime IS NOT DISTINCT FROM ?::timestamp"));
+    }
+
+    @Test
     public void testLatestResultsForExplicitDataStreamsUseParameterizedLateralProbes() {
         QueryBuilderObsStore builder = new QueryBuilderObsStore("obs");
         ObsFilter filter = new ObsFilter.Builder()
