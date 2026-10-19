@@ -63,6 +63,16 @@ public abstract class QueryBuilderBaseFeatureStore<V extends IFeature,VF extends
         return "SELECT EXISTS(SELECT 1 from "+this.getStoreTableName()+" WHERE id = ?)";
     }
 
+    /**
+     * Returns the stable parent relationship for a feature ID. A feature can have several
+     * temporal versions, but every version is required to keep the same parent; ordering by the
+     * newest version also makes this work for an ID whose description is no longer current.
+     */
+    public String selectParentByIdQuery() {
+        return "SELECT parentid FROM " + this.getStoreTableName() +
+                " WHERE id = ? ORDER BY lower(validTime) DESC LIMIT 1";
+    }
+
     public String existsByUidQuery() {
         return "SELECT EXISTS(SELECT 1 from "+this.getStoreTableName()+" WHERE (data->'properties'->>'uid') = ?)";
     }

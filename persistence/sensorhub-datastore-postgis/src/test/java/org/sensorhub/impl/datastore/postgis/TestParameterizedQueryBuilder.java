@@ -81,6 +81,14 @@ public class TestParameterizedQueryBuilder {
     }
 
     @Test
+    public void testFeatureParentLookupIsBoundedAndParameterized() {
+        String query = new QueryBuilderSystemDescStore("systems").selectParentByIdQuery();
+
+        assertEquals("SELECT parentid FROM systems WHERE id = ? " +
+                "ORDER BY lower(validTime) DESC LIMIT 1", query);
+    }
+
+    @Test
     public void testDataStreamOutputNameIsParameterized() {
         DataStreamFilter filter = new DataStreamFilter.Builder()
                 .withOutputNames(INJECTION)

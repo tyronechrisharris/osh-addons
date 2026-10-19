@@ -413,7 +413,21 @@ public abstract class PostgisBaseFeatureStoreImpl
 
     @Override
     public BigId getParent(BigId internalID) {
-        return null;
+        DataStoreUtils.checkInternalID(internalID);
+        try (Connection connection = connectionManager.getConnection();
+             PreparedStatement statement = connection.prepareStatement(
+                     queryBuilder.selectParentByIdQuery())) {
+            statement.setLong(1, internalID.getIdAsLong());
+            try (ResultSet result = statement.executeQuery()) {
+                if (!result.next())
+                    return null;
+                long parentID = result.getLong(1);
+                return !result.wasNull() && parentID != 0
+                        ? BigId.fromLong(idScope, parentID) : null;
+            }
+        } catch (SQLException error) {
+            throw new RuntimeException("Cannot resolve feature parent", error);
+        }
     }
 
     @Override
