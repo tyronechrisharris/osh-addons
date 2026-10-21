@@ -13,6 +13,7 @@
 
 package org.sensorhub.impl.datastore.postgis.store.obs;
 
+import org.postgresql.PGStatement;
 import org.sensorhub.impl.datastore.postgis.archive.UtcJdbcTime;
 import org.sensorhub.impl.datastore.postgis.builder.ParameterizedQuery;
 import org.sensorhub.impl.datastore.postgis.connection.ConnectionManager;
@@ -112,6 +113,7 @@ final class ObservationKeysetIterator<T> implements Iterator<T>, AutoCloseable {
         try (Connection connection = connections.getConnection();
              PreparedStatement statement = connection.prepareStatement(pageSql)) {
             connection.setReadOnly(true);
+            disableGenericPlanPromotion(statement);
             query.bind(statement);
             int parameter = query.parameters().size() + 1;
             if (hasContinuation) {
@@ -144,6 +146,17 @@ final class ObservationKeysetIterator<T> implements Iterator<T>, AutoCloseable {
         }
         if (fetched < requested || accepted >= resultLimit)
             exhausted = true;
+    }
+
+    /**
+     * Keyset query shapes are reused with very different stream-ID sets and time windows. After
+     * pgJDBC's normal threshold PostgreSQL may otherwise choose one generic server plan, which can
+     * turn a selective retention page into a global observation-time-index scan. Keep only these
+     * variable read pages unnamed; ordinary ingest and stable queries retain server preparation
+     * and binary transfer.
+     */
+    static void disableGenericPlanPromotion(PreparedStatement statement) throws SQLException {
+        statement.unwrap(PGStatement.class).setPrepareThreshold(0);
     }
 
     static String pageSql(String baseSql, boolean hasContinuation,

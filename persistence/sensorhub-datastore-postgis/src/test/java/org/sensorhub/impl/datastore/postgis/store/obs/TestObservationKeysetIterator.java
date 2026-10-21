@@ -13,10 +13,12 @@ package org.sensorhub.impl.datastore.postgis.store.obs;
 
 import org.junit.Assume;
 import org.junit.Test;
+import org.postgresql.PGStatement;
 import org.sensorhub.impl.datastore.postgis.archive.UtcJdbcTime;
 import org.sensorhub.impl.datastore.postgis.builder.ParameterizedQuery;
 import org.sensorhub.impl.datastore.postgis.connection.ConnectionManager;
 
+import java.lang.reflect.Proxy;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.PreparedStatement;
@@ -28,6 +30,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
@@ -65,6 +68,29 @@ public class TestObservationKeysetIterator {
         assertTrue(ascending.contains("page.phenomenontime=? AND page.id>?"));
         assertTrue(descending.endsWith(
                 "ORDER BY page.phenomenontime DESC NULLS FIRST, page.id ASC LIMIT ?"));
+    }
+
+    @Test
+    public void variableKeysetPagesDisableServerPreparePromotion() throws Exception {
+        AtomicInteger threshold = new AtomicInteger(Integer.MIN_VALUE);
+        PreparedStatement statement = (PreparedStatement) Proxy.newProxyInstance(
+                TestObservationKeysetIterator.class.getClassLoader(),
+                new Class<?>[]{PreparedStatement.class, PGStatement.class},
+                (proxy, method, args) -> {
+                    if (method.getName().equals("unwrap")) {
+                        assertEquals(PGStatement.class, args[0]);
+                        return proxy;
+                    }
+                    if (method.getName().equals("setPrepareThreshold")) {
+                        threshold.set((Integer) args[0]);
+                        return null;
+                    }
+                    throw new AssertionError("Unexpected proxy method: " + method.getName());
+                });
+
+        ObservationKeysetIterator.disableGenericPlanPromotion(statement);
+
+        assertEquals(0, threshold.get());
     }
 
     @Test
