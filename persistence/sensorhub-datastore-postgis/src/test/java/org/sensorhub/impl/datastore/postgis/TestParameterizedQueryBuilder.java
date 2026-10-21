@@ -17,7 +17,9 @@ import org.junit.Test;
 import org.sensorhub.api.common.BigId;
 import org.sensorhub.api.datastore.TemporalFilter;
 import org.sensorhub.api.datastore.command.CommandStreamFilter;
+import org.sensorhub.api.datastore.feature.IFoiStore;
 import org.sensorhub.api.datastore.obs.DataStreamFilter;
+import org.sensorhub.api.datastore.obs.IDataStreamStore;
 import org.sensorhub.api.datastore.obs.IObsStore;
 import org.sensorhub.api.datastore.obs.ObsFilter;
 import org.sensorhub.api.datastore.system.SystemFilter;
@@ -29,10 +31,13 @@ import org.sensorhub.impl.datastore.postgis.builder.QueryBuilderSystemDescStore;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 
+import java.lang.reflect.Proxy;
 import java.time.Instant;
 import java.util.Arrays;
+import java.util.List;
 import java.util.Set;
 
 public class TestParameterizedQueryBuilder {
@@ -145,6 +150,100 @@ public class TestParameterizedQueryBuilder {
         ParameterizedQuery inverseRemove = builder.createParameterizedRemoveEntriesQuery(inverse);
         assertTrue(inverseRemove.sql().contains("obs.resultTime > ?::timestamp"));
         assertTrue(inverseRemove.sql().contains("obs.resultTime <= ?::timestamp"));
+    }
+
+    @Test
+    public void testObservationOrderIsStableAndCanBeRemovedForOuterKeysetPaging() {
+        QueryBuilderObsStore builder = new QueryBuilderObsStore("obs");
+        ObsFilter ascending = new ObsFilter.Builder().build();
+        ParameterizedQuery ordered = builder.createParameterizedSelectEntriesQuery(
+                ascending, Set.of(IObsStore.ObsField.PHENOMENON_TIME));
+        ParameterizedQuery unordered = builder.createParameterizedUnorderedSelectEntriesQuery(
+                ascending, Set.of(IObsStore.ObsField.PHENOMENON_TIME));
+
+        assertTrue(ordered.sql().endsWith(
+                "ORDER BY obs.phenomenonTime ASC NULLS FIRST, obs.id ASC"));
+        assertFalse(unordered.sql().contains(" ORDER BY "));
+
+        ObsFilter descending = new ObsFilter.Builder()
+                .withPhenomenonTime(new TemporalFilter.Builder()
+                        .withAllTimes()
+                        .descendingOrder(true)
+                        .build())
+                .build();
+        assertTrue(builder.createParameterizedSelectEntriesQuery(descending, null).sql().endsWith(
+                "ORDER BY obs.phenomenonTime DESC NULLS FIRST, obs.id ASC"));
+
+        ObsFilter latest = new ObsFilter.Builder().withLatestResult().build();
+        assertThrows(IllegalArgumentException.class,
+                () -> builder.createParameterizedUnorderedSelectEntriesQuery(latest, null));
+    }
+
+    @Test
+    public void testOuterKeysetRetainsNestedDataStreamVersionOrdering() {
+        QueryBuilderObsStore builder = new QueryBuilderObsStore("obs");
+        builder.linkTo(dataStreamStoreNamed("datastreams"));
+
+        List<TemporalFilter> semanticVersions = List.of(
+                new TemporalFilter.Builder().withLatestTime().build(),
+                new TemporalFilter.Builder().withCurrentTime().build());
+        for (TemporalFilter validTime : semanticVersions) {
+            ObsFilter filter = new ObsFilter.Builder()
+                    .withDataStreams(new DataStreamFilter.Builder()
+                            .withOutputNames("gammaCounts")
+                            .withValidTime(validTime)
+                            .build())
+                    .build();
+
+            String sql = builder.createParameterizedUnorderedSelectEntriesQuery(
+                    filter, Set.of(IObsStore.ObsField.PHENOMENON_TIME)).sql();
+
+            assertTrue(sql.contains("DISTINCT on ((datastreams.data->>'name'),"));
+            assertTrue("DISTINCT ON version selection must retain its semantic order",
+                    sql.contains(" ORDER BY datastreams.data->>'name', " +
+                            "(datastreams.data->'system@id'->'internalID'->'id')::bigint"));
+        }
+    }
+
+    @Test
+    public void testExactFoiIdsAvoidVersionMultiplyingJoin() {
+        QueryBuilderObsStore builder = new QueryBuilderObsStore("obs");
+        builder.linkTo(foiStoreNamed("fois"));
+
+        ObsFilter filter = new ObsFilter.Builder()
+                .withFois(BigId.NONE, BigId.fromLong(1, 7))
+                .build();
+        ParameterizedQuery select = builder.createParameterizedSelectEntriesQuery(filter, null);
+        ParameterizedQuery count = builder.createParameterizedSelectEntriesCountQuery(filter);
+
+        for (ParameterizedQuery query : List.of(select, count)) {
+            assertFalse("Exact FOI IDs must not join temporal FOI versions",
+                    query.sql().contains("JOIN fois"));
+            assertTrue(query.sql().contains("(obs.foiID IS NULL OR obs.foiID = (?))"));
+            assertEquals(List.of(7L), query.parameters());
+        }
+    }
+
+    private static IDataStreamStore dataStreamStoreNamed(String tableName) {
+        return (IDataStreamStore)Proxy.newProxyInstance(
+                IDataStreamStore.class.getClassLoader(),
+                new Class<?>[]{IDataStreamStore.class},
+                (proxy, method, arguments) -> {
+                    if ("getDatastoreName".equals(method.getName()))
+                        return tableName;
+                    throw new UnsupportedOperationException(method.getName());
+                });
+    }
+
+    private static IFoiStore foiStoreNamed(String tableName) {
+        return (IFoiStore)Proxy.newProxyInstance(
+                IFoiStore.class.getClassLoader(),
+                new Class<?>[]{IFoiStore.class},
+                (proxy, method, arguments) -> {
+                    if ("getDatastoreName".equals(method.getName()))
+                        return tableName;
+                    throw new UnsupportedOperationException(method.getName());
+                });
     }
 
     @Test

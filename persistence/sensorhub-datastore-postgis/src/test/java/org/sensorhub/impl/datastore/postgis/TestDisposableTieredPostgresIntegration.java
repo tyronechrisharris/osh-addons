@@ -6,12 +6,16 @@ import com.google.gson.JsonParser;
 import net.opengis.swe.v20.DataBlock;
 import org.junit.Test;
 import org.sensorhub.api.common.BigId;
+import org.sensorhub.api.data.DataStreamInfo;
 import org.sensorhub.api.data.ObsData;
 import org.sensorhub.api.datastore.ICancellableDataStore;
-import org.sensorhub.api.datastore.obs.IObsStore;
+import org.sensorhub.api.datastore.feature.FoiFilter;
+import org.sensorhub.api.datastore.obs.DataStreamFilter;
 import org.sensorhub.api.datastore.obs.DataStreamKey;
+import org.sensorhub.api.datastore.obs.IObsStore;
 import org.sensorhub.api.datastore.obs.ObsFilter;
 import org.sensorhub.api.datastore.TemporalFilter;
+import org.sensorhub.api.feature.FeatureId;
 import org.sensorhub.impl.datastore.postgis.archive.ArchiveCatalog;
 import org.sensorhub.impl.datastore.postgis.archive.ArchiveExporter;
 import org.sensorhub.impl.datastore.postgis.archive.ArchiveGeneration;
@@ -21,12 +25,18 @@ import org.sensorhub.impl.datastore.postgis.archive.TieredArchiveConfig;
 import org.sensorhub.impl.datastore.postgis.archive.UtcJdbcTime;
 import org.sensorhub.impl.datastore.postgis.database.OscarTieredObsSystemDatabase;
 import org.sensorhub.impl.datastore.postgis.connection.ConnectionManager;
+import org.sensorhub.impl.datastore.postgis.store.feature.PostgisFoiStoreImpl;
 import org.sensorhub.impl.datastore.postgis.store.obs.OscarTieredObsStore;
 import org.sensorhub.impl.datastore.postgis.store.obs.PostgisDataStreamStoreImpl;
 import org.sensorhub.impl.datastore.postgis.store.obs.PostgisObsStoreImpl;
 import org.sensorhub.impl.datastore.postgis.utils.SerializerUtils;
 import org.vast.data.DataBlockDouble;
+import org.vast.data.TextEncodingImpl;
+import org.vast.ogc.gml.GenericTemporalFeatureImpl;
+import org.vast.swe.SWEHelper;
+import org.vast.util.TimeExtent;
 
+import javax.xml.namespace.QName;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.charset.StandardCharsets;
@@ -38,6 +48,7 @@ import java.sql.SQLException;
 import java.sql.Statement;
 import java.time.Instant;
 import java.time.LocalDateTime;
+import java.time.OffsetDateTime;
 import java.time.ZoneId;
 import java.time.ZoneOffset;
 import java.time.temporal.ChronoUnit;
@@ -72,6 +83,7 @@ public class TestDisposableTieredPostgresIntegration extends TestPostgisObsStore
     private static final int ACTIVATION_LOCK_CLASS = 0x4f534341;
     private static final int ACTIVATION_LOCK_OBJECT = 0x41524348;
     private TieredArchiveConfig archiveConfig;
+    private PostgisFoiStoreImpl disposableFoiStore;
 
     @Override
     protected PostgisObsStoreImpl initStore() throws Exception {
@@ -92,6 +104,183 @@ public class TestDisposableTieredPostgresIntegration extends TestPostgisObsStore
         this.postgisObsStore = new TestableTieredStore(url, DB_NAME, login, password, TABLE,
                 DATABASE_NUM, IdProviderType.SEQUENTIAL, archiveConfig);
         return this.postgisObsStore;
+    }
+
+    @Test
+    public void hotOnlyCountUsesSqlFastPathWithoutBypassingJavaPredicate() throws Exception {
+        OscarTieredObsStore tiered = (OscarTieredObsStore) postgisObsStore;
+        var stream = addSimpleDataStream(bigId(51), "hotOnlyCount");
+        Instant start = Instant.parse("2026-02-01T00:00:00Z");
+        addSimpleObsWithoutResultTime(stream, BigId.NONE, start, 6, 1_000L);
+        forceReadBackFromStorage();
+
+        assertEquals(6, tiered.countMatchingEntries(new ObsFilter.Builder()
+                .withDataStreams(stream)
+                .build()));
+        assertEquals("Exact FOI IDs must not require a linked FOI metadata store", 6,
+                tiered.countMatchingEntries(new ObsFilter.Builder()
+                        .withDataStreams(stream)
+                        .withFois(BigId.NONE)
+                        .build()));
+        assertEquals(3, tiered.countMatchingEntries(new ObsFilter.Builder()
+                .withDataStreams(stream)
+                .withValuePredicate(observation ->
+                        observation.getResult().getDoubleValue(0) >= 3.0)
+                .build()));
+    }
+
+    @Test
+    public void hotOnlyCountCapsSqlFastPathAtFiniteLimit() throws Exception {
+        OscarTieredObsStore tiered = (OscarTieredObsStore) postgisObsStore;
+        BigId stream = addSimpleDataStream(bigId(53), "finiteCount");
+        addSimpleObsWithoutResultTime(stream, BigId.NONE,
+                Instant.parse("2026-02-01T00:30:00Z"), 6, 1_000L);
+        forceReadBackFromStorage();
+
+        assertEquals(2, tiered.countMatchingEntries(new ObsFilter.Builder()
+                .withDataStreams(stream)
+                .withLimit(2)
+                .build()));
+    }
+
+    @Test
+    public void hotOnlyLatestCountRetainsOneObservationPerStream() throws Exception {
+        OscarTieredObsStore tiered = (OscarTieredObsStore) postgisObsStore;
+        BigId first = addSimpleDataStream(bigId(54), "latestCountFirst");
+        BigId second = addSimpleDataStream(bigId(55), "latestCountSecond");
+        Instant start = Instant.parse("2026-02-01T00:45:00Z");
+        addSimpleObsWithoutResultTime(first, BigId.NONE, start, 3, 1_000L);
+        addSimpleObsWithoutResultTime(second, BigId.NONE, start, 2, 1_000L);
+        forceReadBackFromStorage();
+
+        assertEquals(2, tiered.countMatchingEntries(new ObsFilter.Builder()
+                .withDataStreams(first, second)
+                .withLatestResult()
+                .build()));
+    }
+
+    @Test
+    public void hotOnlyCountResolvesNestedLatestAndCurrentDataStreamVersions() throws Exception {
+        OscarTieredObsStore tiered = (OscarTieredObsStore) postgisObsStore;
+        Instant now = Instant.now().truncatedTo(ChronoUnit.SECONDS);
+        BigId system = bigId(57);
+        String outputName = "versionedCount";
+        BigId oldVersion = addVersionedDataStream(system, outputName,
+                TimeExtent.period(now.minus(2, ChronoUnit.DAYS),
+                        now.minus(1, ChronoUnit.DAYS)));
+        BigId currentVersion = addVersionedDataStream(system, outputName,
+                TimeExtent.beginAt(now.minus(1, ChronoUnit.HOURS)));
+        addSimpleObsWithoutResultTime(oldVersion, BigId.NONE,
+                now.minus(2, ChronoUnit.DAYS), 5, 1_000L);
+        addSimpleObsWithoutResultTime(currentVersion, BigId.NONE,
+                now.minus(30, ChronoUnit.MINUTES), 3, 1_000L);
+        forceReadBackFromStorage();
+
+        for (TemporalFilter validTime : List.of(
+                new TemporalFilter.Builder().withLatestTime().build(),
+                new TemporalFilter.Builder().withCurrentTime().build())) {
+            ObsFilter filter = new ObsFilter.Builder()
+                    .withDataStreams(new DataStreamFilter.Builder()
+                            .withOutputNames(outputName)
+                            .withValidTime(validTime)
+                            .build())
+                    .build();
+            assertEquals(3, tiered.countMatchingEntries(filter));
+            try (var rows = tiered.selectEntries(filter)) {
+                assertEquals(3, rows.count());
+            }
+        }
+    }
+
+    @Test
+    public void hotOnlyCountDoesNotMultiplyObservationsAcrossFoiVersions() throws Exception {
+        OscarTieredObsStore tiered = (OscarTieredObsStore) postgisObsStore;
+        disposableFoiStore = new PostgisFoiStoreImpl(url, DB_NAME, login, password,
+                TABLE + "_fois", DATABASE_NUM, IdProviderType.SEQUENTIAL, false);
+        tiered.linkTo(disposableFoiStore);
+
+        String uid = "urn:oscar:test:versioned-foi";
+        OffsetDateTime now = OffsetDateTime.now(ZoneOffset.UTC).truncatedTo(ChronoUnit.SECONDS);
+        GenericTemporalFeatureImpl oldVersion = temporalFoi(uid, "old",
+                now.minusDays(2), now.minusDays(1));
+        GenericTemporalFeatureImpl currentVersion = temporalFoi(uid, "current",
+                now.minusHours(1), now.plusDays(1));
+        var oldKey = disposableFoiStore.add(BigId.NONE, oldVersion);
+        var currentKey = disposableFoiStore.add(BigId.NONE, currentVersion);
+        // Reproduce the normal temporal-version layout explicitly. The legacy
+        // feature writer can assign a fresh ID when adding the second version,
+        // while production migrations preserve the logical FOI ID.
+        try (Connection connection = open(); PreparedStatement statement = connection.prepareStatement(
+                "UPDATE " + TABLE + "_fois SET id=? WHERE id=?")) {
+            statement.setLong(1, oldKey.getInternalID().getIdAsLong());
+            statement.setLong(2, currentKey.getInternalID().getIdAsLong());
+            assertEquals(1, statement.executeUpdate());
+        }
+
+        BigId stream = addSimpleDataStream(bigId(58), "foiVersionCount");
+        addSimpleObsWithoutResultTime(stream, oldKey.getInternalID(),
+                now.toInstant().minus(30, ChronoUnit.MINUTES), 4, 1_000L);
+        forceReadBackFromStorage();
+
+        ObsFilter filter = new ObsFilter.Builder()
+                .withFois(new FoiFilter.Builder().withUniqueIDs(uid).build())
+                .build();
+        assertEquals(4, tiered.countMatchingEntries(filter));
+        try (var rows = tiered.selectEntries(filter)) {
+            assertEquals(4, rows.count());
+        }
+    }
+
+    @Test
+    public void keysetPagingCrossesTwentyThousandEqualTimesWithSparsePredicate() throws Exception {
+        BigId stream = addSimpleDataStream(bigId(56), "keysetBoundary");
+        Instant equalTime = Instant.parse("2026-02-01T01:00:00Z");
+        BigId seed = addSimpleObsWithoutResultTime(
+                stream, BigId.NONE, equalTime, 1, 0).keySet().iterator().next();
+        forceReadBackFromStorage();
+        String resultJson = hotResultJson(seed.getIdAsLong());
+
+        int rowCount = 20_005;
+        long equalIdBase = 900_000_000L;
+        long equalFoiBase = 100_000L;
+        bulkInsertKeysetRows(stream.getIdAsLong(), equalIdBase, equalFoiBase,
+                equalTime, resultJson, rowCount);
+
+        for (boolean descending : List.of(false, true)) {
+            Set<Long> equalMatches = Set.of(equalFoiBase + 1, equalFoiBase + rowCount);
+            ObsFilter equalFilter = new ObsFilter.Builder()
+                    .withDataStreams(stream)
+                    .withPhenomenonTime(new TemporalFilter.Builder()
+                            .withSingleValue(equalTime)
+                            .descendingOrder(descending)
+                            .build())
+                    .withValuePredicate(observation -> observation.getFoiID() != null &&
+                            equalMatches.contains(observation.getFoiID().getIdAsLong()))
+                    .withLimit(2)
+                    .build();
+            assertSparseKeysetIds(equalFilter,
+                    List.of(equalIdBase + 1, equalIdBase + rowCount));
+        }
+    }
+
+    @Test
+    public void bulkRemoveDecodesOnlyWhenJavaPredicateNeedsTheObservation() throws Exception {
+        OscarTieredObsStore tiered = (OscarTieredObsStore) postgisObsStore;
+        var stream = addSimpleDataStream(bigId(52), "predicateRemove");
+        Instant start = Instant.parse("2026-02-01T01:00:00Z");
+        addSimpleObsWithoutResultTime(stream, BigId.NONE, start, 6, 1_000L);
+        forceReadBackFromStorage();
+
+        ObsFilter predicate = new ObsFilter.Builder()
+                .withDataStreams(stream)
+                .withValuePredicate(observation ->
+                        observation.getResult().getDoubleValue(0) >= 3.0)
+                .withLimit(2)
+                .build();
+        assertEquals(2, tiered.removeEntries(predicate));
+        assertEquals(4, tiered.countMatchingEntries(new ObsFilter.Builder()
+                .withDataStreams(stream)
+                .build()));
     }
 
     @Test
@@ -196,6 +385,10 @@ public class TestDisposableTieredPostgresIntegration extends TestPostgisObsStore
     @Override
     @org.junit.After
     public void cleanup() throws Exception {
+        if (disposableFoiStore != null) {
+            disposableFoiStore.close();
+            disposableFoiStore = null;
+        }
         if (postgisObsStore != null) {
             postgisObsStore.close();
             dropDisposableTieredTables(TABLE);
@@ -683,6 +876,30 @@ public class TestDisposableTieredPostgresIntegration extends TestPostgisObsStore
                 .build())) {
             assertEquals(1, endpoint.count());
         }
+    }
+
+    @Test
+    public void bulkRemoveRechecksArchiveOwnershipBeforeSetBasedDelete() throws Exception {
+        TestableTieredStore tiered = (TestableTieredStore) postgisObsStore;
+        Instant start = Instant.parse("2026-02-01T00:30:00Z");
+        BigId stream = addSimpleDataStream(bigId(601), "gammaCounts");
+        BigId key = addSimpleObsWithoutResultTime(
+                stream, BigId.NONE, start, 1, 0).keySet().iterator().next();
+        forceReadBackFromStorage();
+
+        AtomicReference<ArchiveGeneration> activated = new AtomicReference<>();
+        tiered.beforeNextRemoveBatch(() -> activated.set(tiered.archiveWindow(
+                start, start.plus(1, ChronoUnit.HOURS), "RAW_GATED").orElseThrow()));
+
+        assertEquals(1, tiered.removeEntries(new ObsFilter.Builder()
+                .withInternalIDs(key)
+                .build()));
+        assertNotNull(activated.get());
+        assertTrue("An archive-owned row must not enter the live batch DELETE",
+                hotRowExists(key.getIdAsLong()));
+        assertTrue(tiered.getArchiveCatalog().isTombstoned(key.getIdAsLong()));
+        assertEquals(activated.get().id(), tombstoneGeneration(key.getIdAsLong()));
+        assertNull(tiered.get(key));
     }
 
     @Test
@@ -2293,7 +2510,34 @@ public class TestDisposableTieredPostgresIntegration extends TestPostgisObsStore
         try (Connection connection = open(); Statement statement = connection.createStatement()) {
             statement.execute("DROP TABLE IF EXISTS " + observationTable);
             statement.execute("DROP TABLE IF EXISTS " + observationTable + "_datastreams");
+            statement.execute("DROP TABLE IF EXISTS " + observationTable + "_fois");
         }
+    }
+
+    private BigId addVersionedDataStream(BigId systemId, String outputName,
+                                         TimeExtent validTime) throws Exception {
+        SWEHelper swe = new SWEHelper();
+        var record = swe.createRecord().name(outputName);
+        for (int i = 0; i < 5; i++)
+            record.addField("comp" + i, swe.createQuantity().build());
+        var info = new DataStreamInfo.Builder()
+                .withName(outputName)
+                .withSystem(new FeatureId(systemId, "urn:oscar:test:system:" + systemId))
+                .withRecordDescription(record.build())
+                .withRecordEncoding(new TextEncodingImpl())
+                .withValidTime(validTime)
+                .build();
+        return postgisObsStore.getDataStreams().add(info).getInternalID();
+    }
+
+    private static GenericTemporalFeatureImpl temporalFoi(
+            String uid, String name, OffsetDateTime begin, OffsetDateTime end) {
+        GenericTemporalFeatureImpl feature = new GenericTemporalFeatureImpl(
+                new QName("urn:oscar:test", "VersionedFoi"));
+        feature.setUniqueIdentifier(uid);
+        feature.setName(name);
+        feature.setValidTimePeriod(begin, end);
+        return feature;
     }
 
     private UUID insertManualGeneration(UUID jobId, String storeKey, int scope,
@@ -2325,6 +2569,35 @@ public class TestDisposableTieredPostgresIntegration extends TestPostgisObsStore
     private static long selectAll(OscarTieredObsStore store) {
         try (var rows = store.selectEntries(new ObsFilter.Builder().build())) {
             return rows.count();
+        }
+    }
+
+    private void bulkInsertKeysetRows(long streamId, long idBase, long foiBase,
+                                      Instant phenomenonTime, String resultJson,
+                                      int rowCount) throws Exception {
+        String sql = "INSERT INTO " + TABLE +
+                " (id,datastreamid,foiid,phenomenontime,resulttime,result) " +
+                "SELECT ? + series, ?, ? + series, ?, NULL, ?::jsonb " +
+                "FROM generate_series(1, ?) series";
+        try (Connection connection = open(); PreparedStatement statement = connection.prepareStatement(sql)) {
+            statement.setLong(1, idBase);
+            statement.setLong(2, streamId);
+            statement.setLong(3, foiBase);
+            if (phenomenonTime == null)
+                statement.setTimestamp(4, null);
+            else
+                UtcJdbcTime.setInstant(statement, 4, phenomenonTime);
+            statement.setString(5, resultJson);
+            statement.setInt(6, rowCount);
+            assertEquals(rowCount, statement.executeUpdate());
+        }
+    }
+
+    private void assertSparseKeysetIds(ObsFilter filter, List<Long> expectedIds) {
+        try (var rows = postgisObsStore.selectEntries(filter)) {
+            assertEquals(expectedIds, rows
+                    .map(entry -> entry.getKey().getIdAsLong())
+                    .toList());
         }
     }
 

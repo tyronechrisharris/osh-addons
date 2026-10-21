@@ -29,6 +29,7 @@ import org.sensorhub.impl.datastore.postgis.builder.generator.SelectFilterQueryG
 import org.sensorhub.impl.datastore.postgis.utils.PostgisUtils;
 import org.vast.util.Asserts;
 
+import java.util.List;
 import java.util.stream.Collectors;
 
 import static org.sensorhub.api.datastore.obs.IObsStore.ObsField.DATASTREAM_ID;
@@ -155,7 +156,25 @@ public class SelectObsFilterQuery extends BaseObsFilterQuery<SelectFilterQueryGe
 
     protected void handleFoiFilter(FoiFilter foiFilter, ObsFilter obsFilter) {
         if (foiFilter != null) {
-            if (this.foiTableName != null) {
+            if (hasOnlyInternalIds(foiFilter)) {
+                List<BigId> ids = foiFilter.getInternalIDs().stream()
+                        .filter(id -> !BigId.NONE.equals(id))
+                        .toList();
+                boolean includesNone = foiFilter.getInternalIDs().contains(BigId.NONE);
+                String idCondition = null;
+                if (!ids.isEmpty()) {
+                    String operator = ids.size() == 1 ? "=" : "IN";
+                    idCondition = this.tableName + "." + FOI_ID + " " + operator + " (" +
+                            placeholders(ids.size()) + ")";
+                }
+                if (includesNone && idCondition != null)
+                    addCondition("(" + this.tableName + "." + FOI_ID + " IS NULL OR " + idCondition + ")");
+                else if (includesNone)
+                    addCondition(this.tableName + "." + FOI_ID + " IS NULL");
+                else
+                    addCondition(idCondition);
+                ids.forEach(id -> addParameter(id.getIdAsLong()));
+            } else if (this.foiTableName != null) {
                 // create JOIN
                 Asserts.checkNotNull(foiFilter, "foiFilter should not be null");
 
@@ -189,6 +208,15 @@ public class SelectObsFilterQuery extends BaseObsFilterQuery<SelectFilterQueryGe
                 }
             }
         }
+    }
+
+    private static boolean hasOnlyInternalIds(FoiFilter filter) {
+        return filter.getInternalIDs() != null && !filter.getInternalIDs().isEmpty() &&
+                filter.getUniqueIDs() == null && filter.getValidTime() == null &&
+                filter.getLocationFilter() == null && filter.getFullTextFilter() == null &&
+                filter.getValuePredicate() == null && !filter.includeMembers() &&
+                filter.getParentFilter() == null && filter.getObservationFilter() == null &&
+                filter.getSampledFeatureFilter() == null;
     }
 
 }

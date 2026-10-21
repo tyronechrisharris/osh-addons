@@ -20,6 +20,7 @@ import static org.junit.Assert.*;
 
 import org.sensorhub.api.common.BigId;
 import org.sensorhub.api.data.IObsData;
+import org.sensorhub.api.datastore.obs.IObsStore;
 import org.sensorhub.api.datastore.obs.ObsFilter;
 import org.sensorhub.impl.datastore.AbstractTestObsStore;
 import org.sensorhub.impl.datastore.postgis.store.obs.PostgisDataStreamStoreImpl;
@@ -32,6 +33,7 @@ import org.vast.swe.SWEHelper;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.Map;
+import java.util.Set;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
@@ -54,6 +56,28 @@ public class TestPostgisObsStore extends AbstractTestObsStore<PostgisObsStoreImp
     protected PostgisObsStoreImpl initStore() throws Exception {
         this.postgisObsStore = new PostgisObsStoreImpl(url, DB_NAME, login, password, OBS_DATASTORE_NAME, DATABASE_NUM, IdProviderType.UID_HASH);
         return this.postgisObsStore;
+    }
+
+    @Test
+    public void testFiniteLimitIsAppliedAfterValuePredicateBeforeProjection() throws Exception {
+        var stream = addSimpleDataStream(bigId(10), "predicateProjection");
+        Instant start = Instant.parse("2026-01-01T00:00:00Z");
+        addSimpleObsWithoutResultTime(stream, BigId.NONE, start, 6, 1_000L);
+        forceReadBackFromStorage();
+
+        ObsFilter filter = new ObsFilter.Builder()
+                .withDataStreams(stream)
+                .withValuePredicate(observation ->
+                        observation.getResult().getDoubleValue(0) >= 3.0)
+                .withLimit(2)
+                .build();
+        try (Stream<Map.Entry<BigId, IObsData>> selected = postgisObsStore.selectEntries(
+                filter, Set.of(IObsStore.ObsField.PHENOMENON_TIME))) {
+            var rows = selected.toList();
+            assertEquals(2, rows.size());
+            assertEquals(start.plusMillis(3_000L), rows.get(0).getValue().getPhenomenonTime());
+            assertEquals(start.plusMillis(4_000L), rows.get(1).getValue().getPhenomenonTime());
+        }
     }
 
     @Override

@@ -33,6 +33,12 @@ public class SelectEntriesQuery extends EntriesQuery<SelectFilterQueryGenerator>
             return self();
         }
 
+        public T withoutOrderByIf(boolean condition) {
+            if (condition)
+                filterQueryGenerator.clearPresentationOrderBy();
+            return self();
+        }
+
         public SelectEntriesQuery build() {
             return new SelectEntriesQuery(this);
         }

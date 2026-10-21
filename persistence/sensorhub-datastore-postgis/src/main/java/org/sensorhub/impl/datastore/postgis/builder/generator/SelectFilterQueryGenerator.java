@@ -163,6 +163,18 @@ public class SelectFilterQueryGenerator extends FilterQueryGenerator {
         this.orderBy.add(orderBy);
     }
 
+    /**
+     * Removes presentation-only ordering for callers that apply their own
+     * stable outer order (for example a keyset page or an aggregate metadata
+     * scan). A composed filter can also use {@code DISTINCT ON} to select the
+     * current/latest version of a related resource; PostgreSQL requires that
+     * selection's ordering to remain inside the subquery, so it is retained.
+     */
+    public void clearPresentationOrderBy() {
+        if (distinct == null || distinct.isEmpty())
+            this.orderBy = null;
+    }
+
     public void addInnerJoin(String innerJoin) {
         this.checkInnerJoin();
         this.innerJoin.add(innerJoin);

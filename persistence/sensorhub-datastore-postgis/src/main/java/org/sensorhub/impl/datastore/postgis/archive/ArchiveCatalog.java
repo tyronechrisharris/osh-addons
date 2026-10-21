@@ -1421,6 +1421,21 @@ public final class ArchiveCatalog {
         }
     }
 
+    /** Returns whether this store has any generation visible to cold queries. */
+    public boolean hasQueryVisibleGenerations() {
+        try (Connection connection = connections.open(); PreparedStatement statement = connection.prepareStatement(
+                "SELECT EXISTS (SELECT 1 FROM oscar_archive_generation " +
+                        "WHERE store_key=? AND id_scope=? AND state IN ('ACTIVE','SEALED'))")) {
+            statement.setString(1, storeKey);
+            statement.setInt(2, idScope);
+            try (ResultSet result = statement.executeQuery()) {
+                return result.next() && result.getBoolean(1);
+            }
+        } catch (SQLException e) {
+            throw new IllegalStateException("Cannot inspect query-visible archive generations", e);
+        }
+    }
+
     /**
      * Resolves mutation membership for one bounded page of observation IDs.
      * This avoids retaining every historical tombstone and overlay in heap for

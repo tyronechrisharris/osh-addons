@@ -49,6 +49,7 @@ import java.nio.file.attribute.PosixFilePermissions;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
+import java.sql.SQLException;
 import java.sql.Types;
 import java.time.Duration;
 import java.time.Instant;
@@ -540,8 +541,11 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
     @Override
     public Stream<Entry<BigId, IObsData>> selectEntries(ObsFilter filter, Set<ObsField> fields) {
         if (!archiveConfig.enabled) {
-            ObsFilter unbounded = filter.getLimit() == Long.MAX_VALUE ? filter :
-                    ObsFilter.Builder.from(filter).withLimit(Long.MAX_VALUE).build();
+            ResolvedRelatedFilter related = resolveRelatedFilter(filter);
+            if (!related.matches())
+                return Stream.empty();
+            ObsFilter unbounded = filter.getLimit() == Long.MAX_VALUE ? related.filter() :
+                    ObsFilter.Builder.from(related.filter()).withLimit(Long.MAX_VALUE).build();
             Stream<Entry<BigId, IObsData>> hot = super.selectEntries(unbounded, fields);
             return limitAndClose(excludeTombstoned(
                     hot, entry -> entry.getKey().getIdAsLong()), filter.getLimit());
@@ -553,11 +557,15 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
     private Stream<Entry<BigId, IObsData>> selectTieredEntries(
             ObsFilter filter, Set<ObsField> fields,
             boolean hasMutations) {
-        Set<Long> dataStreams = resolveDataStreams(filter.getDataStreamFilter());
-        Set<Long> fois = resolveFois(filter.getFoiFilter());
+        ResolvedRelatedFilter related = resolveRelatedFilter(filter);
+        if (!related.matches())
+            return Stream.empty();
+        Set<Long> dataStreams = related.dataStreams();
+        Set<Long> fois = related.fois();
+        ObsFilter resolvedFilter = related.filter();
         boolean latest = hasLatestSelection(filter);
         boolean pushDownLatest = latest && !hasMutations &&
-                queryBuilder.supportsLatestResultPerDataStreamQuery(filter);
+                queryBuilder.supportsLatestResultPerDataStreamQuery(resolvedFilter);
 
         // The top N of a union can only contain rows from the top N of either
         // ordered tier. Push the bound into both engines in the common,
@@ -579,8 +587,8 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
         // final top row. Leaving this small, stream-bounded candidate set
         // unbounded preserves the public ordering/limit contract.
         long tierLimit = boundedMerge ? filter.getLimit() : Long.MAX_VALUE;
-        ObsFilter tierFilter = latest && !pushDownLatest ? withoutLatestSelection(filter, tierLimit) :
-                ObsFilter.Builder.from(filter).withLimit(tierLimit).build();
+        ObsFilter tierFilter = latest && !pushDownLatest ? withoutLatestSelection(resolvedFilter, tierLimit) :
+                ObsFilter.Builder.from(resolvedFilter).withLimit(tierLimit).build();
         Comparator<Entry<BigId, IObsData>> comparator = entryComparator(filter);
 
         // Read complete internal rows even when the caller requested a narrow
@@ -705,6 +713,15 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
     private Set<Long> resolveFois(FoiFilter filter) {
         if (filter == null)
             return null;
+        // Exact FOI IDs are already fully resolved and do not require a
+        // linked metadata store. Preserve the conventional zero representation
+        // of BigId.NONE used for observations with a SQL NULL FOI.
+        if (hasOnlyInternalFoiIds(filter)) {
+            return filter.getInternalIDs().stream()
+                    .filter(id -> BigId.NONE.equals(id) || id.getScope() == idScope)
+                    .map(id -> BigId.NONE.equals(id) ? 0L : id.getIdAsLong())
+                    .collect(Collectors.toCollection(HashSet::new));
+        }
         if (foiStore == null)
             throw new IllegalStateException("Cannot evaluate FOI filter before an FOI store is linked");
         Set<Long> ids;
@@ -714,6 +731,46 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
         if (filter.getInternalIDs() != null && filter.getInternalIDs().contains(BigId.NONE))
             ids.add(0L); // reader interprets zero as SQL NULL as well
         return ids;
+    }
+
+    private static boolean hasOnlyInternalFoiIds(FoiFilter filter) {
+        return filter.getInternalIDs() != null && !filter.getInternalIDs().isEmpty() &&
+                filter.getUniqueIDs() == null && filter.getValidTime() == null &&
+                filter.getLocationFilter() == null && filter.getFullTextFilter() == null &&
+                filter.getValuePredicate() == null && !filter.includeMembers() &&
+                filter.getParentFilter() == null && filter.getObservationFilter() == null &&
+                filter.getSampledFeatureFilter() == null;
+    }
+
+    /**
+     * Resolves relational selectors once and replaces them with exact scoped
+     * IDs before querying observations. Besides avoiding repeated metadata
+     * joins, this preserves the semantics of current/latest version selectors
+     * and prevents multiple temporal versions of a related row from
+     * multiplying an observation count.
+     */
+    private ResolvedRelatedFilter resolveRelatedFilter(ObsFilter filter) {
+        Set<Long> dataStreams = resolveDataStreams(filter.getDataStreamFilter());
+        Set<Long> fois = resolveFois(filter.getFoiFilter());
+        if ((dataStreams != null && dataStreams.isEmpty()) ||
+                (fois != null && fois.isEmpty())) {
+            return new ResolvedRelatedFilter(filter, dataStreams, fois, false);
+        }
+
+        ObsFilter.Builder builder = ObsFilter.Builder.from(filter);
+        if (dataStreams != null) {
+            builder.withDataStreams(dataStreams.stream()
+                    .sorted()
+                    .map(id -> BigId.fromLong(idScope, id))
+                    .toList());
+        }
+        if (fois != null) {
+            builder.withFois(fois.stream()
+                    .sorted()
+                    .map(id -> id == 0L ? BigId.NONE : BigId.fromLong(idScope, id))
+                    .toList());
+        }
+        return new ResolvedRelatedFilter(builder.build(), dataStreams, fois, true);
     }
 
     private ArchiveBounds archiveBounds(ObsFilter filter) {
@@ -755,8 +812,25 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
         if (!matchesTemporal(filter.getPhenomenonTime(), locked.phenomenonTime()) ||
                 !matchesTemporal(filter.getResultTime(), locked.resultTime()))
             return false;
-        return matchesObservation(filter, dataStreams, fois, id,
-                locked.resultJson(), locked.observation());
+        if (filter.getInternalIDs() != null &&
+                !filter.getInternalIDs().contains(BigId.fromLong(idScope, id)))
+            return false;
+        if (dataStreams != null && !dataStreams.contains(locked.dataStreamId()))
+            return false;
+        long foi = locked.foiId() == null ? 0L : locked.foiId();
+        if (fois != null && !fois.contains(foi))
+            return false;
+        if (!JsonCqlEvaluator.matches(filter.getCQLFilter(), locked.resultJson()))
+            return false;
+        if (filter.getPhenomenonLocation() != null || filter.getValuePredicate() != null) {
+            if (locked.observation() == null)
+                throw new IllegalStateException(
+                        "A decoded observation is required for Java-side predicate revalidation");
+            if (!filter.testPhenomenonLocation(locked.observation()) ||
+                    !filter.testValuePredicate(locked.observation()))
+                return false;
+        }
+        return true;
     }
 
     private static boolean matchesTemporal(TemporalFilter filter, Instant value) {
@@ -1159,13 +1233,15 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
     }
 
     private MetadataScanPlan prepareMetadataScan(ObsFilter filter) {
-        Set<Long> dataStreams = resolveDataStreams(filter.getDataStreamFilter());
-        Set<Long> fois = resolveFois(filter.getFoiFilter());
-        ArchiveBounds bounds = archiveBounds(filter);
-        Long oneId = filter.getInternalIDs() != null && filter.getInternalIDs().size() == 1
-                ? filter.getInternalIDs().first().getIdAsLong() : null;
+        ResolvedRelatedFilter related = resolveRelatedFilter(filter);
+        if (!related.matches())
+            return new MetadataScanPlan(filter, related.dataStreams(), related.fois(), List.of(), false);
+        ObsFilter resolvedFilter = related.filter();
+        ArchiveBounds bounds = archiveBounds(resolvedFilter);
+        Long oneId = resolvedFilter.getInternalIDs() != null && resolvedFilter.getInternalIDs().size() == 1
+                ? resolvedFilter.getInternalIDs().first().getIdAsLong() : null;
         List<ArchiveGeneration> candidates = archiveCatalog.candidates(bounds.start(), bounds.end(), oneId);
-        return new MetadataScanPlan(filter, dataStreams, fois, candidates);
+        return new MetadataScanPlan(resolvedFilter, related.dataStreams(), related.fois(), candidates, true);
     }
 
     /**
@@ -1176,6 +1252,8 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
      * was superseded, so reported min/max ranges remain exact.
      */
     private void scanMetadata(MetadataScanPlan plan, MetadataVisitor visitor) {
+        if (!plan.matches())
+            return;
         scanHotMetadata(plan.filter(), hot -> {
             visitor.visit(hot.metadata(), 1, true);
             if (hot.coldOverlap())
@@ -1193,7 +1271,10 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
         ObsFilter unbounded = ObsFilter.Builder.from(filter).withLimit(Long.MAX_VALUE).build();
         Set<ObsField> fields = Set.of(ObsField.DATASTREAM_ID, ObsField.FOI_ID,
                 ObsField.PHENOMENON_TIME, ObsField.RESULT_TIME);
-        ParameterizedQuery selected = queryBuilder.createParameterizedSelectEntriesQuery(unbounded, fields);
+        // Metadata aggregation is order-independent. Avoid forcing PostgreSQL
+        // to sort the complete hot relation before the streaming aggregate.
+        ParameterizedQuery selected = queryBuilder.createParameterizedUnorderedSelectEntriesQuery(
+                unbounded, fields);
         String table = getDatastoreName();
         String sql = "SELECT matched.id, matched.datastreamid, matched.foiid, matched.phenomenontime, " +
                 "matched.resulttime, EXISTS (SELECT 1 FROM oscar_archive_generation generation " +
@@ -1453,7 +1534,9 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
                                        Instant resultTime) {}
     private record StatsKey(long dataStreamId, Long foiId) {}
     private record MetadataScanPlan(ObsFilter filter, Set<Long> dataStreams, Set<Long> fois,
-                                    List<ArchiveGeneration> candidates) {}
+                                    List<ArchiveGeneration> candidates, boolean matches) {}
+    private record ResolvedRelatedFilter(ObsFilter filter, Set<Long> dataStreams,
+                                         Set<Long> fois, boolean matches) {}
 
     @Override
     public IObsData get(Object key) {
@@ -2011,16 +2094,18 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
                 // store and per-ID locks above, not by a cross-store snapshot.
                 Set<Long> dataStreams = resolveDataStreams(filter.getDataStreamFilter());
                 Set<Long> fois = resolveFois(filter.getFoiFilter());
+                Map<Long, LockedLogicalObservation> hotById = lockHotLogicalObservations(
+                        connection, ordered, archiveConfig.enabled,
+                        filter.getValuePredicate() != null || filter.getPhenomenonLocation() != null);
                 long removed = 0;
+                List<Long> liveDeletes = new ArrayList<>();
                 Set<Long> heldObservationIds = new java.util.HashSet<>();
                 for (BigId key : ordered) {
-                    if (removed >= maximumRemovals)
+                    if (removed + liveDeletes.size() >= maximumRemovals)
                         break;
                     long id = key.getIdAsLong();
-                    java.util.Optional<LockedLogicalObservation> hot =
-                            lockHotLogicalObservation(connection, id, archiveConfig.enabled);
-                    if (hot.isPresent()) {
-                        LockedLogicalObservation current = hot.get();
+                    LockedLogicalObservation current = hotById.get(id);
+                    if (current != null) {
                         if (!matchesLockedObservation(filter, dataStreams, fois, id, current)) {
                             continue;
                         }
@@ -2045,13 +2130,7 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
                                 removed = Math.addExact(removed, 1L);
                             }
                         } else {
-                            try (PreparedStatement delete = connection.prepareStatement(
-                                    "DELETE FROM " + getDatastoreName() +
-                                            " WHERE id=? AND archivegenerationid IS NULL")) {
-                                delete.setLong(1, id);
-                                if (delete.executeUpdate() == 1)
-                                    removed = Math.addExact(removed, 1L);
-                            }
+                            liveDeletes.add(id);
                         }
                         continue;
                     }
@@ -2069,16 +2148,16 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
                     java.util.Optional<LockedLogicalObservation> overlay =
                             lockColdOverlay(connection, id);
                     if (overlay.isPresent()) {
-                        LockedLogicalObservation current = overlay.get();
-                        if (!matchesLockedObservation(filter, dataStreams, fois, id, current)) {
+                        LockedLogicalObservation overlayCurrent = overlay.get();
+                        if (!matchesLockedObservation(filter, dataStreams, fois, id, overlayCurrent)) {
                             continue;
                         }
-                        if (holds.blocks(id, current.generationId())) {
+                        if (holds.blocks(id, overlayCurrent.generationId())) {
                             heldObservationIds.add(id);
                             continue;
                         }
                         if (archiveCatalog.tombstoneIfAbsent(connection, id,
-                                current.generationId(), "Removed through IObsStore filter",
+                                overlayCurrent.generationId(), "Removed through IObsStore filter",
                                 "USER_OR_SYSTEM_DELETE", holds)) {
                             removed = Math.addExact(removed, 1L);
                         }
@@ -2094,6 +2173,14 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
                         removed = Math.addExact(removed, 1L);
                     }
                 }
+                if (!liveDeletes.isEmpty()) {
+                    long deleted = deleteLockedLiveRows(connection, liveDeletes);
+                    if (deleted != liveDeletes.size()) {
+                        throw new IllegalStateException(
+                                "Live observation ownership changed while its rows were locked");
+                    }
+                    removed = Math.addExact(removed, deleted);
+                }
                 connection.commit();
                 return new RemovalBatchResult(removed, Set.copyOf(heldObservationIds));
             } catch (Exception error) {
@@ -2105,6 +2192,89 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
         } catch (Exception error) {
             throw new IllegalStateException("Cannot atomically remove tiered observations", error);
         }
+    }
+
+    /**
+     * Locks and decodes a complete candidate page in one PostgreSQL round
+     * trip. Generation-owned overlays remain sparse, so only those exceptional
+     * rows need an additional overlay lookup.
+     */
+    private Map<Long, LockedLogicalObservation> lockHotLogicalObservations(
+            Connection connection, List<BigId> candidates, boolean resolveOverlay,
+            boolean decodeObservation) throws Exception {
+        List<Long> ids = candidates.stream()
+                .map(BigId::getIdAsLong)
+                .distinct()
+                .sorted()
+                .toList();
+        if (ids.isEmpty())
+            return Map.of();
+
+        List<LockedHotRow> rows = new ArrayList<>(ids.size());
+        java.sql.Array sqlIds = connection.createArrayOf("bigint", ids.toArray(Long[]::new));
+        try (PreparedStatement statement = connection.prepareStatement(
+                "SELECT id, datastreamid, foiid, phenomenontime, resulttime, result::text, " +
+                        "archivegenerationid FROM " + getDatastoreName() +
+                        " WHERE id=ANY (?::bigint[]) ORDER BY id FOR UPDATE")) {
+            statement.setArray(1, sqlIds);
+            try (ResultSet result = statement.executeQuery()) {
+                while (result.next()) {
+                    rows.add(new LockedHotRow(
+                            result.getLong(1), result.getLong(2), result.getObject(3, Long.class),
+                            UtcJdbcTime.getInstant(result, 4), UtcJdbcTime.getInstant(result, 5),
+                            result.getString(6), result.getObject(7, UUID.class)));
+                }
+            }
+        } finally {
+            sqlIds.free();
+        }
+
+        Map<Long, LockedLogicalObservation> locked = new HashMap<>(rows.size());
+        for (LockedHotRow row : rows) {
+            if (resolveOverlay && row.generationId() != null) {
+                java.util.Optional<LockedLogicalObservation> overlay =
+                        lockOverlay(connection, row.observationId(), row.generationId());
+                if (overlay.isPresent()) {
+                    locked.put(row.observationId(), overlay.get());
+                    continue;
+                }
+            }
+
+            ArchivedObservation archived = new ArchivedObservation(
+                    idScope, row.observationId(), idScope, row.dataStreamId(),
+                    row.foiId() == null ? null : idScope, row.foiId(),
+                    row.phenomenonTime(), row.resultTime(), row.resultJson(), "HOT");
+            IObsData observation = null;
+            if (decodeObservation) {
+                observation = row.generationId() == null
+                        ? decodeLiveObservation(archived)
+                        : toObservation(connection, row.generationId(), null, archived);
+            }
+            locked.put(row.observationId(), new LockedLogicalObservation(
+                    row.generationId(), row.resultJson(), row.phenomenonTime(),
+                    row.resultTime(), row.dataStreamId(), row.foiId(), observation));
+        }
+        return locked;
+    }
+
+    /** Deletes already locked live rows with one guarded, auditable statement. */
+    private long deleteLockedLiveRows(Connection connection, List<Long> observationIds)
+            throws SQLException {
+        java.sql.Array ids = connection.createArrayOf(
+                "bigint", observationIds.toArray(Long[]::new));
+        long deleted = 0;
+        try (PreparedStatement statement = connection.prepareStatement(
+                "DELETE FROM " + getDatastoreName() +
+                        " WHERE id=ANY (?::bigint[]) AND archivegenerationid IS NULL RETURNING id")) {
+            statement.setArray(1, ids);
+            try (ResultSet result = statement.executeQuery()) {
+                while (result.next())
+                    deleted++;
+            }
+        } finally {
+            ids.free();
+        }
+        return deleted;
     }
 
     private java.util.Optional<LockedLogicalObservation> lockHotLogicalObservation(
@@ -2143,7 +2313,8 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
                         ? decodeLiveObservation(archived)
                         : toObservation(connection, generationId, null, archived);
                 return java.util.Optional.of(new LockedLogicalObservation(
-                        generationId, resultJson, phenomenonTime, resultTime, observation));
+                        generationId, resultJson, phenomenonTime, resultTime,
+                        dataStreamId, foiId, observation));
             }
         }
     }
@@ -2186,6 +2357,7 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
                         phenomenonTime, resultTime, resultJson, "OVERLAY");
                 return java.util.Optional.of(new LockedLogicalObservation(
                         generationId, resultJson, phenomenonTime, resultTime,
+                        dataStreamId, foiId,
                         toObservation(connection, generationId, schemaJson, archived)));
             }
         }
@@ -2222,6 +2394,7 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
         return java.util.Optional.of(new LockedLogicalObservation(
                 row.generation().id(), archived.resultJson(),
                 archived.phenomenonTime(), archived.resultTime(),
+                archived.dataStreamId(), archived.foiId(),
                 toObservation(connection, row.generation().id(), null, archived)));
     }
 
@@ -2247,7 +2420,11 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
 
     private record LockedLogicalObservation(UUID generationId, String resultJson,
                                             Instant phenomenonTime, Instant resultTime,
+                                            long dataStreamId, Long foiId,
                                             IObsData observation) {}
+    private record LockedHotRow(long observationId, long dataStreamId, Long foiId,
+                                Instant phenomenonTime, Instant resultTime,
+                                String resultJson, UUID generationId) {}
     private record RemovalBatchResult(long removed, Set<Long> heldObservationIds) {}
     private record OverlayPayload(ArchivedObservation observation, String schemaJson) {}
 
@@ -2260,9 +2437,24 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
         }
         if (isUnfiltered(filter))
             return getNumRecords();
-
         ObsFilter unbounded = ObsFilter.Builder.from(filter).withLimit(Long.MAX_VALUE).build();
-        if (supportsMetadataScan(unbounded) && !archiveCatalog.hasObservationMutations()) {
+        // A freshly installed store, or one whose generations have all been
+        // purged, is exactly the ordinary PostgreSQL store. Use its COUNT(*)
+        // plan directly instead of scanning every hot row into a metadata
+        // accumulator. This is deliberately restricted to filters whose
+        // cardinality PostgreSQL can count directly: latest/current, spatial,
+        // value, and CQL filters require the logical selection path.
+        boolean hasVisibleCold = archiveCatalog.hasQueryVisibleGenerations();
+        boolean hasMutations = archiveCatalog.hasObservationMutations();
+        if (!hasVisibleCold && !hasMutations && supportsMetadataScan(unbounded)) {
+            ResolvedRelatedFilter related = resolveRelatedFilter(unbounded);
+            if (!related.matches())
+                return 0;
+            long count = super.countMatchingEntries(related.filter());
+            return filter.getLimit() == Long.MAX_VALUE ? count : Math.min(count, filter.getLimit());
+        }
+
+        if (supportsMetadataScan(unbounded) && !hasMutations) {
             long[] count = {0L};
             scanMetadata(prepareMetadataScan(unbounded), (metadata, delta, includeRange) ->
                     count[0] = Math.addExact(count[0], delta));

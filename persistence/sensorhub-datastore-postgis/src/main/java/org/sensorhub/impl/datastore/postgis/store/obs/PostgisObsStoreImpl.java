@@ -27,7 +27,6 @@ import org.sensorhub.api.datastore.obs.*;
 import org.sensorhub.api.datastore.system.ISystemDescStore;
 import org.sensorhub.impl.datastore.postgis.IdProviderType;
 import org.sensorhub.impl.datastore.postgis.archive.UtcJdbcTime;
-import org.sensorhub.impl.datastore.postgis.builder.IteratorResultSet;
 import org.sensorhub.impl.datastore.postgis.builder.ParameterizedQuery;
 import org.sensorhub.impl.datastore.postgis.builder.QueryBuilderObsStore;
 import org.sensorhub.impl.datastore.postgis.store.PostgisStore;
@@ -173,36 +172,77 @@ public class PostgisObsStoreImpl extends PostgisStore<QueryBuilderObsStore> impl
 
     @Override
     public Stream<Entry<BigId, IObsData>> selectEntries(ObsFilter filter, Set<ObsField> fields) {
-        Set<ObsField> hashSet;
-
-        if (fields != null) {
-            hashSet = new HashSet<>(fields);
-            hashSet.add(PHENOMENON_TIME);
+        Set<ObsField> requestedFields = fields == null || fields.isEmpty()
+                ? null : Set.copyOf(fields);
+        boolean projectAfterPredicate = filter.getValuePredicate() != null && requestedFields != null;
+        Set<ObsField> queryFields;
+        Set<ObsField> parserFields;
+        if (projectAfterPredicate || requestedFields == null) {
+            // Java predicates must see the complete decoded observation, not
+            // a caller-requested projection with an empty result block.
+            queryFields = null;
+            parserFields = null;
         } else {
-            hashSet = null;
+            queryFields = new HashSet<>(requestedFields);
+            queryFields.add(PHENOMENON_TIME);
+            parserFields = requestedFields;
         }
 
-        // IteratorResultSet performs stable, bounded paging. Keep the final
-        // OSH limit outside SQL so a large SQL LIMIT is not repeated with
-        // overlapping OFFSET pages, and so Java value predicates run before
-        // the caller-visible limit.
+        // Keep the caller-visible limit outside the base query. The keyset
+        // iterator pushes an exact finite limit into each SQL page when there
+        // is no Java-only value predicate, and otherwise continues bounded
+        // pages until enough predicate matches have been accepted.
         ObsFilter queryFilter = filter.getLimit() == Long.MAX_VALUE ? filter :
                 ObsFilter.Builder.from(filter).withLimit(Long.MAX_VALUE).build();
-        ParameterizedQuery query = queryBuilder.supportsLatestResultPerDataStreamQuery(queryFilter)
-                ? queryBuilder.createParameterizedLatestResultPerDataStreamQuery(queryFilter, hashSet)
-                : queryBuilder.createParameterizedSelectEntriesQuery(queryFilter, hashSet);
+        boolean latestSelection = (queryFilter.getPhenomenonTime() != null &&
+                queryFilter.getPhenomenonTime().isLatestTime()) ||
+                (queryFilter.getResultTime() != null && queryFilter.getResultTime().isLatestTime());
+        ParameterizedQuery query;
+        if (queryBuilder.supportsLatestResultPerDataStreamQuery(queryFilter)) {
+            query = queryBuilder.createParameterizedLatestResultPerDataStreamQuery(queryFilter, queryFields);
+        } else if (latestSelection) {
+            // DISTINCT ON relies on its inner ORDER BY. The outer keyset still
+            // supplies the final stable page order.
+            query = queryBuilder.createParameterizedSelectEntriesQuery(queryFilter, queryFields);
+        } else {
+            query = queryBuilder.createParameterizedUnorderedSelectEntriesQuery(queryFilter, queryFields);
+        }
         logger.debug(query.sql());
 
-        IteratorResultSet<Entry<BigId, IObsData>> iteratorResultSet =
-                new IteratorResultSet<>(
+        boolean descending = filter.getPhenomenonTime() != null &&
+                filter.getPhenomenonTime().descendingOrder();
+        ObservationKeysetIterator<Entry<BigId, IObsData>> iterator =
+                new ObservationKeysetIterator<>(
                         query,
                         connectionManager,
                         STREAM_FETCH_SIZE,
-                        (resultSet) -> resultSetToEntry(resultSet, fields),
-                        (entry) -> (filter.getValuePredicate() == null || filter.getValuePredicate().test(entry.getValue())));
+                        filter.getLimit(),
+                        descending,
+                        (resultSet) -> resultSetToEntry(resultSet, parserFields),
+                        (entry) -> filter.getValuePredicate() == null ||
+                                filter.getValuePredicate().test(entry.getValue()),
+                        filter.getValuePredicate() != null);
         Stream<Entry<BigId, IObsData>> entries = StreamSupport.stream(
-                Spliterators.spliteratorUnknownSize(iteratorResultSet, Spliterator.ORDERED), false);
-        return filter.getLimit() == Long.MAX_VALUE ? entries : entries.limit(filter.getLimit());
+                        Spliterators.spliteratorUnknownSize(iterator, Spliterator.ORDERED), false)
+                .onClose(iterator::close);
+        return projectAfterPredicate
+                ? entries.map(entry -> Map.entry(entry.getKey(), project(entry.getValue(), requestedFields)))
+                : entries;
+    }
+
+    private static IObsData project(IObsData observation, Set<ObsField> fields) {
+        ObsData.Builder builder = new ObsData.Builder();
+        if (fields.contains(DATASTREAM_ID))
+            builder.withDataStream(observation.getDataStreamID());
+        if (fields.contains(FOI_ID) && observation.hasFoi())
+            builder.withFoi(observation.getFoiID());
+        if (observation.getPhenomenonTime() != null)
+            builder.withPhenomenonTime(observation.getPhenomenonTime());
+        if (fields.contains(RESULT_TIME) && observation.getResultTime() != null)
+            builder.withResultTime(observation.getResultTime());
+        builder.withResult(fields.contains(RESULT)
+                ? observation.getResult() : new DataBlockByte());
+        return builder.build();
     }
 
     private Entry<BigId, IObsData> resultSetToEntry(ResultSet resultSet, Set<ObsField> fields) {
