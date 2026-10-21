@@ -213,11 +213,27 @@ public class QueryBuilderObsStore extends QueryBuilder {
     }
 
     public String findByUniqueFieldsQuery() {
-        return "SELECT id FROM " + this.getStoreTableName() + " WHERE " +
+        return naturalKeyLookupQuery("id");
+    }
+
+    /**
+     * Resolve the stored value used to verify an upsert. The predicate must
+     * retain the same COALESCE expressions as the natural-key unique index;
+     * {@code IS NOT DISTINCT FROM} is NULL-safe but does not let a PostgreSQL
+     * generic prepared plan use the full expression key.
+     */
+    public String findResultByUniqueFieldsQuery() {
+        return naturalKeyLookupQuery("id, " + RESULT + "::text");
+    }
+
+    private String naturalKeyLookupQuery(String projection) {
+        return "SELECT " + projection + " FROM " + this.getStoreTableName() + " WHERE " +
                 DATASTREAM_ID + " = ? AND " +
-                FOI_ID + " IS NOT DISTINCT FROM ? AND " +
-                PHENOMENON_TIME + " IS NOT DISTINCT FROM ?::timestamp AND " +
-                RESULT_TIME + " IS NOT DISTINCT FROM ?::timestamp";
+                "COALESCE(" + FOI_ID + ", -1::bigint) = COALESCE(?::bigint, -1::bigint) AND " +
+                "COALESCE(" + PHENOMENON_TIME + ", '-infinity'::timestamp) = " +
+                "COALESCE(?::timestamp, '-infinity'::timestamp) AND " +
+                "COALESCE(" + RESULT_TIME + ", '-infinity'::timestamp) = " +
+                "COALESCE(?::timestamp, '-infinity'::timestamp) LIMIT 1";
     }
 
     public String getPhenomenonTimeRangeByDataStreamIdQuery(long dataStreamID) {

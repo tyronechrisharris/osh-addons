@@ -23,6 +23,7 @@ import org.sensorhub.impl.datastore.postgis.archive.ArchivedObservation;
 import org.sensorhub.impl.datastore.postgis.archive.ParquetArchiveReader;
 import org.sensorhub.impl.datastore.postgis.archive.TieredArchiveConfig;
 import org.sensorhub.impl.datastore.postgis.archive.UtcJdbcTime;
+import org.sensorhub.impl.datastore.postgis.builder.QueryBuilderObsStore;
 import org.sensorhub.impl.datastore.postgis.database.OscarTieredObsSystemDatabase;
 import org.sensorhub.impl.datastore.postgis.connection.ConnectionManager;
 import org.sensorhub.impl.datastore.postgis.store.feature.PostgisFoiStoreImpl;
@@ -2052,6 +2053,52 @@ public class TestDisposableTieredPostgresIntegration extends TestPostgisObsStore
             assertTrue(result.getBoolean(1));
         } finally {
             reopened.close();
+        }
+    }
+
+    @Test
+    public void naturalKeyLookupGenericPlanUsesNullSafeUniqueIndex() throws Exception {
+        QueryBuilderObsStore builder = new QueryBuilderObsStore(TABLE);
+        String preparedQuery = builder.findByUniqueFieldsQuery();
+        for (int parameter = 1; parameter <= 4; parameter++) {
+            int marker = preparedQuery.indexOf('?');
+            assertTrue("Expected all natural-key parameters in the generated lookup", marker >= 0);
+            preparedQuery = preparedQuery.substring(0, marker) + "$" + parameter +
+                    preparedQuery.substring(marker + 1);
+        }
+        assertFalse(preparedQuery.contains("?"));
+
+        String preparedName = "oscar_natural_key_lookup";
+        try (Connection connection = open(); Statement statement = connection.createStatement()) {
+            statement.execute("SET plan_cache_mode=force_generic_plan");
+            statement.execute("SET enable_seqscan=off");
+            statement.execute("PREPARE " + preparedName +
+                    "(bigint,bigint,timestamp,timestamp) AS " + preparedQuery);
+
+            for (String arguments : List.of(
+                    "9223372036854775806, NULL, NULL, NULL",
+                    "9223372036854775806, 7, TIMESTAMP '2031-01-01 00:00:00.000003', " +
+                            "TIMESTAMP '2031-01-01 00:00:00.000003'")) {
+                StringBuilder plan = new StringBuilder();
+                try (ResultSet rows = statement.executeQuery(
+                        "EXPLAIN (COSTS OFF) EXECUTE " + preparedName + "(" + arguments + ")")) {
+                    while (rows.next())
+                        plan.append(rows.getString(1)).append('\n');
+                }
+                String rendered = plan.toString();
+                assertTrue("Generic natural-key plan must use the matching expression index:\n" + plan,
+                        rendered.contains(TABLE + "_unique_constraint_v2"));
+                int conditionStart = rendered.indexOf("Index Cond:");
+                int conditionEnd = conditionStart < 0 ? -1 : rendered.indexOf('\n', conditionStart);
+                assertTrue("Natural-key equality must be an index condition, not a residual filter:\n" + plan,
+                        conditionStart >= 0 && conditionEnd > conditionStart);
+                String indexCondition = rendered.substring(conditionStart, conditionEnd);
+                assertTrue(indexCondition.contains("COALESCE(foiid"));
+                assertTrue(indexCondition.contains("COALESCE(phenomenontime"));
+                assertTrue(indexCondition.contains("COALESCE(resulttime"));
+                assertFalse("Natural-key columns must not be evaluated after the index scan:\n" + plan,
+                        rendered.contains("Filter:"));
+            }
         }
     }
 

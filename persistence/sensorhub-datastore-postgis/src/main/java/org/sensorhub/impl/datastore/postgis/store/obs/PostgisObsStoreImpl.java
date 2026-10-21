@@ -452,9 +452,7 @@ public class PostgisObsStoreImpl extends PostgisStore<QueryBuilderObsStore> impl
 
     protected long validateInsertOutcome(Connection connection, PreparedObservation expected) throws SQLException {
         try (PreparedStatement natural = connection.prepareStatement(
-                "SELECT id, result::text FROM " + getDatastoreName() + " WHERE datastreamid=? " +
-                        "AND foiid IS NOT DISTINCT FROM ? AND phenomenontime IS NOT DISTINCT FROM ?::timestamp " +
-                        "AND resulttime IS NOT DISTINCT FROM ?::timestamp LIMIT 1")) {
+                queryBuilder.findResultByUniqueFieldsQuery())) {
             natural.setLong(1, expected.dataStreamId);
             if (expected.foiId == null) natural.setNull(2, Types.BIGINT); else natural.setLong(2, expected.foiId);
             if (expected.phenomenonTime == null) natural.setNull(3, Types.TIMESTAMP); else UtcJdbcTime.setInstant(natural, 3, expected.phenomenonTime);
@@ -476,9 +474,7 @@ public class PostgisObsStoreImpl extends PostgisStore<QueryBuilderObsStore> impl
     protected Long findStoredObservationId(PreparedObservation observation) {
         try (Connection connection = connectionManager.getConnection();
              PreparedStatement natural = connection.prepareStatement(
-                     "SELECT id FROM " + getDatastoreName() + " WHERE datastreamid=? " +
-                             "AND foiid IS NOT DISTINCT FROM ? AND phenomenontime IS NOT DISTINCT FROM ?::timestamp " +
-                             "AND resulttime IS NOT DISTINCT FROM ?::timestamp LIMIT 1")) {
+                     queryBuilder.findByUniqueFieldsQuery())) {
             natural.setLong(1, observation.dataStreamId);
             if (observation.foiId == null) natural.setNull(2, Types.BIGINT); else natural.setLong(2, observation.foiId);
             if (observation.phenomenonTime == null) natural.setNull(3, Types.TIMESTAMP); else UtcJdbcTime.setInstant(natural, 3, observation.phenomenonTime);

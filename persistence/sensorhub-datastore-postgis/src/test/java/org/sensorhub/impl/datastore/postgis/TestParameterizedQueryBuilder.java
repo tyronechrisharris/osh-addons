@@ -276,9 +276,21 @@ public class TestParameterizedQueryBuilder {
 
         String naturalKeyLookup = builder.findByUniqueFieldsQuery();
         assertTrue(naturalKeyLookup.contains("dataStreamID = ?"));
-        assertTrue(naturalKeyLookup.contains("foiID IS NOT DISTINCT FROM ?"));
-        assertTrue(naturalKeyLookup.contains("phenomenonTime IS NOT DISTINCT FROM ?::timestamp"));
-        assertTrue(naturalKeyLookup.contains("resultTime IS NOT DISTINCT FROM ?::timestamp"));
+        assertTrue(naturalKeyLookup.contains(
+                "COALESCE(foiID, -1::bigint) = COALESCE(?::bigint, -1::bigint)"));
+        assertTrue(naturalKeyLookup.contains(
+                "COALESCE(phenomenonTime, '-infinity'::timestamp) = " +
+                        "COALESCE(?::timestamp, '-infinity'::timestamp)"));
+        assertTrue(naturalKeyLookup.contains(
+                "COALESCE(resultTime, '-infinity'::timestamp) = " +
+                        "COALESCE(?::timestamp, '-infinity'::timestamp)"));
+        assertTrue(naturalKeyLookup.endsWith("LIMIT 1"));
+        assertFalse(naturalKeyLookup.contains("IS NOT DISTINCT FROM"));
+
+        String resultLookup = builder.findResultByUniqueFieldsQuery();
+        assertTrue(resultLookup.startsWith("SELECT id, result::text FROM obs WHERE "));
+        assertEquals(naturalKeyLookup.substring(naturalKeyLookup.indexOf(" WHERE ")),
+                resultLookup.substring(resultLookup.indexOf(" WHERE ")));
     }
 
     @Test
