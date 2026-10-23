@@ -29,6 +29,8 @@ public class TestTieredArchiveConfiguration {
         assertTrue(config.maximumGenerationsPerCycle > 1);
         assertTrue(config.maximumCycleMinutes > 0);
         assertTrue(config.maximumUncompressedBytesPerGeneration > 0);
+        assertTrue(config.effectiveMaximumUncompressedBytesPerGeneration() <=
+                config.maximumUncompressedBytesPerGeneration);
         assertTrue(config.duckDbMemoryLimitMegabytes >= 16);
         assertTrue(config.duckDbThreads > 0);
         assertTrue(config.duckDbMaximumTemporaryMegabytes >= 16);
@@ -51,6 +53,19 @@ public class TestTieredArchiveConfiguration {
         TieredArchiveConfig config = new TieredArchiveConfig();
         config.maximumUncompressedBytesPerGeneration = 0;
         assertThrows(IllegalArgumentException.class, config::validate);
+    }
+
+    @Test
+    public void archivePayloadBudgetIsBoundedByDuckDbMemory() {
+        TieredArchiveConfig config = new TieredArchiveConfig();
+        config.duckDbMemoryLimitMegabytes = 256;
+        config.maximumUncompressedBytesPerGeneration = Long.MAX_VALUE;
+        assertEquals(32L * 1024 * 1024,
+                config.effectiveMaximumUncompressedBytesPerGeneration());
+
+        config.maximumUncompressedBytesPerGeneration = 8L * 1024 * 1024;
+        assertEquals(8L * 1024 * 1024,
+                config.effectiveMaximumUncompressedBytesPerGeneration());
     }
 
     @Test

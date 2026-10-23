@@ -65,26 +65,36 @@ public class OscarTieredObsSystemDatabase extends PostgisObsSystemDatabase {
         Instant deadline = Instant.now().plus(archive.maximumCycleMinutes, ChronoUnit.MINUTES);
         int activated = 0;
         while (activated < archive.maximumGenerationsPerCycle && Instant.now().isBefore(deadline)) {
-            // Work in immutable UTC hour windows. This bounds snapshots and
-            // makes restart/idempotency behavior independent of local DST.
-            Instant oldest = store.nextArchiveWindowStart(cutoff, "RAW_GATED").orElse(null);
-            if (oldest == null)
-                return;
-            Instant start = utcHourWindowStart(oldest);
-            Instant end = start.plus(1, ChronoUnit.HOURS);
-            if (end.isAfter(cutoff))
-                end = cutoff;
-            end = store.selectArchiveWindowEnd(start, end);
+            // Recover the exact shape of a failed/stale legacy job first.
+            // Older builds could create sub-hour bisection windows; replacing
+            // them immediately with a full-hour job would strand their FAILED
+            // catalog row even when all of its observations later archived.
+            var retryable = store.nextRetryableArchiveWindow(cutoff, "RAW_GATED").orElse(null);
+            Instant start;
+            Instant end;
+            if (retryable != null) {
+                start = retryable.start();
+                end = retryable.end();
+            } else {
+                // Work in immutable UTC hour windows. This bounds snapshots and
+                // makes restart/idempotency behavior independent of local DST.
+                Instant oldest = store.nextArchiveWindowStart(cutoff, "RAW_GATED").orElse(null);
+                if (oldest == null)
+                    return;
+                start = utcHourWindowStart(oldest);
+                end = start.plus(1, ChronoUnit.HOURS);
+                if (end.isAfter(cutoff))
+                    end = cutoff;
+            }
             if (!start.isBefore(end))
                 return;
-            Instant selectedEnd = end;
             Optional<org.sensorhub.impl.datastore.postgis.archive.ArchiveGeneration> generation =
                     store.archiveWindow(start, end, "RAW_GATED");
             if (generation.isEmpty())
                 return; // another owner has the window; avoid a tight retry loop
             activated++;
             getLogger().info("Activated archive generation {} with {} rows for [{}, {})",
-                    generation.get().id(), generation.get().rowCount(), start, selectedEnd);
+                    generation.get().id(), generation.get().rowCount(), start, end);
         }
         if (activated > 0)
             getLogger().info("OSCAR archive cycle completed {} generation(s); remaining backlog will continue next cycle",

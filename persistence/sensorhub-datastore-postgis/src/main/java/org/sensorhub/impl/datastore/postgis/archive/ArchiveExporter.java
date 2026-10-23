@@ -34,6 +34,7 @@ import java.util.zip.GZIPOutputStream;
 public final class ArchiveExporter {
     private static final Gson GSON = new GsonBuilder().disableHtmlEscaping().setPrettyPrinting().create();
     private static final int FETCH_SIZE = 5_000;
+    private static final int DUCKDB_INSERT_BATCH_SIZE = 500;
     public static final long ESTIMATED_FIXED_BYTES_PER_ROW = 128L;
 
     private final SqlConnectionProvider postgres;
@@ -101,7 +102,8 @@ public final class ArchiveExporter {
             ExportStats stats = writeParquet(partialParquet, start, end, profile);
             if (stats.rowCount == 0) {
                 Files.deleteIfExists(partialParquet);
-                catalog.failJob(jobId, new IllegalStateException("No matching rows in archive window"));
+                catalog.supersedeEmptyJob(jobId,
+                        "No eligible unowned rows remain in the reclaimed archive window");
                 return Optional.empty();
             }
             verifyParquet(partialParquet, stats);
@@ -181,6 +183,7 @@ public final class ArchiveExporter {
         Files.deleteIfExists(target);
         long count = 0;
         long uncompressedBytes = 0;
+        long byteBudget = config.effectiveMaximumUncompressedBytesPerGeneration();
         long minId = Long.MAX_VALUE;
         long maxId = Long.MIN_VALUE;
         Map<Long, Boolean> schemaIds = new TreeMap<>();
@@ -202,7 +205,7 @@ public final class ArchiveExporter {
                     "FROM " + observationTable + " o JOIN " + dataStreamTable + " d ON d.id=o.datastreamid " +
                     "WHERE o.archivegenerationid IS NULL AND o.phenomenontime >= ? AND o.phenomenontime < ? " +
                     "AND d.data->>'outputName' = ANY (?) " +
-                    "ORDER BY o.id LIMIT ?";
+                    "ORDER BY o.phenomenontime, o.id LIMIT ?";
             try (PreparedStatement read = source.prepareStatement(query);
                  PreparedStatement insert = duck.prepareStatement(
                          "INSERT INTO archive_rows VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")) {
@@ -211,24 +214,26 @@ public final class ArchiveExporter {
                 UtcJdbcTime.setInstant(read, 2, end);
                 Array names = source.createArrayOf("text", config.outputNames.toArray());
                 read.setArray(3, names);
-                // Read one sentinel row so a configured cap can never create
-                // a manifest that silently represents only part of a window.
-                read.setInt(4, Math.addExact(config.maximumRowsPerGeneration, 1));
+                // One UTC hour can contain more data than a bounded DuckDB
+                // session can safely stage.  Export a deterministic prefix;
+                // the next cycle creates a normal same-window revision for
+                // the remaining unowned rows.
+                read.setInt(4, config.maximumRowsPerGeneration);
                 try (ResultSet rows = read.executeQuery()) {
                     while (rows.next()) {
-                        count++;
-                        if (count > config.maximumRowsPerGeneration)
-                            throw new IOException("Archive window exceeds maximumRowsPerGeneration; " +
-                                    "reduce the window or raise the cap");
                         long id = rows.getLong(1);
                         long dataStreamId = rows.getLong(2);
                         Long foiId = rows.getObject(3, Long.class);
                         String resultJson = rows.getString(6);
                         long rowBytes = estimateUncompressedRowBytes(resultJson);
-                        uncompressedBytes = Math.addExact(uncompressedBytes, rowBytes);
-                        if (uncompressedBytes > config.maximumUncompressedBytesPerGeneration)
-                            throw new IOException("Archive window exceeds maximumUncompressedBytesPerGeneration; " +
-                                    "reduce the window or raise the cap");
+                        if (rowBytes > byteBudget - uncompressedBytes) {
+                            if (count == 0)
+                                throw new IOException("One archive row exceeds the effective generation byte limit of " +
+                                        byteBudget + " bytes");
+                            break;
+                        }
+                        uncompressedBytes += rowBytes;
+                        count++;
                         insert.setInt(1, idScope);
                         insert.setLong(2, id);
                         insert.setInt(3, idScope);
@@ -257,11 +262,20 @@ public final class ArchiveExporter {
                         minId = Math.min(minId, id);
                         maxId = Math.max(maxId, id);
                         schemaIds.put(dataStreamId, Boolean.TRUE);
-                        if (count % FETCH_SIZE == 0)
-                            insert.executeBatch();
+                        if (count % DUCKDB_INSERT_BATCH_SIZE == 0) {
+                            executeInsertBatch(insert, count);
+                            // JDBC does not require executeBatch() to discard
+                            // the submitted commands.  DuckDB retains them,
+                            // so an explicit clear prevents quadratic replay
+                            // and native-memory growth across flushes.
+                            insert.clearBatch();
+                        }
                     }
                 }
-                insert.executeBatch();
+                if (count % DUCKDB_INSERT_BATCH_SIZE != 0) {
+                    executeInsertBatch(insert, count);
+                    insert.clearBatch();
+                }
                 schemas = loadSchemas(source, new ArrayList<>(schemaIds.keySet()));
             } finally {
                 source.rollback();
@@ -277,6 +291,17 @@ public final class ArchiveExporter {
             }
         }
         return new ExportStats(count, minId, maxId, schemas);
+    }
+
+    private static void executeInsertBatch(PreparedStatement insert, long rowCount)
+            throws java.sql.SQLException {
+        try {
+            insert.executeBatch();
+        } catch (java.sql.SQLException error) {
+            throw new java.sql.SQLException(
+                    "DuckDB archive staging failed after " + rowCount + " source rows: " +
+                            error.getMessage(), error.getSQLState(), error.getErrorCode(), error);
+        }
     }
 
     /**

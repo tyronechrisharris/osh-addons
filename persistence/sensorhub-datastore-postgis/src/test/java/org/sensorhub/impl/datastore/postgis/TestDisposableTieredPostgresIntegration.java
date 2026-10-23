@@ -2205,6 +2205,305 @@ public class TestDisposableTieredPostgresIntegration extends TestPostgisObsStore
     }
 
     @Test
+    public void denseHourUsesBoundedSameWindowRevisionsAndRecoversFailedJob() throws Exception {
+        TestableTieredStore tiered = (TestableTieredStore) postgisObsStore;
+        Instant start = Instant.parse("2026-06-03T15:00:00Z");
+        Instant end = start.plus(1, ChronoUnit.HOURS);
+        BigId stream = addSimpleDataStream(bigId(52), "gammaCounts");
+        List<Long> expectedIds = addSimpleObsWithoutResultTime(
+                stream, BigId.NONE, start, 6, 10 * 60_000).keySet().stream()
+                .map(BigId::getIdAsLong)
+                .sorted()
+                .toList();
+        forceReadBackFromStorage();
+
+        archiveConfig.maximumRowsPerGeneration = 100;
+        archiveConfig.maximumUncompressedBytesPerGeneration = 1;
+        assertThrows(IllegalStateException.class, () ->
+                tiered.archiveWindow(start, end, "RAW_GATED"));
+
+        UUID failedJob;
+        try (Connection connection = open(); PreparedStatement statement = connection.prepareStatement(
+                "SELECT id FROM oscar_archive_job WHERE store_key=? AND id_scope=? " +
+                        "AND profile='RAW_GATED' AND window_start=? AND window_end=? AND state='FAILED'")) {
+            statement.setString(1, TABLE);
+            statement.setInt(2, DATABASE_NUM);
+            UtcJdbcTime.setInstant(statement, 3, start);
+            UtcJdbcTime.setInstant(statement, 4, end);
+            try (ResultSet result = statement.executeQuery()) {
+                assertTrue(result.next());
+                failedJob = result.getObject(1, UUID.class);
+                assertFalse(result.next());
+            }
+        }
+
+        List<Long> rowBytes = new ArrayList<>();
+        try (Connection connection = open(); Statement statement = connection.createStatement();
+             ResultSet result = statement.executeQuery(
+                     "SELECT result::text FROM " + TABLE + " ORDER BY phenomenontime, id")) {
+            while (result.next())
+                rowBytes.add(ArchiveExporter.estimateUncompressedRowBytes(result.getString(1)));
+        }
+        assertEquals(6, rowBytes.size());
+        long twoRowBudget = Math.addExact(rowBytes.get(0), rowBytes.get(1));
+        assertTrue(Math.addExact(twoRowBudget, rowBytes.get(2)) > twoRowBudget);
+        archiveConfig.maximumUncompressedBytesPerGeneration = twoRowBudget;
+
+        ArchiveGeneration first = tiered.archiveWindow(start, end, "RAW_GATED").orElseThrow();
+        assertEquals(2, first.rowCount());
+        assertEquals(UUID.nameUUIDFromBytes(
+                        ("oscar-archive-generation-v1:" + failedJob)
+                                .getBytes(StandardCharsets.UTF_8)),
+                first.id());
+        ArchiveGeneration second = tiered.archiveWindow(start, end, "RAW_GATED").orElseThrow();
+        ArchiveGeneration third = tiered.archiveWindow(start, end, "RAW_GATED").orElseThrow();
+        assertEquals(2, second.rowCount());
+        assertEquals(2, third.rowCount());
+        assertTrue(tiered.nextArchiveWindowStart(end, "RAW_GATED").isEmpty());
+
+        try (Connection connection = open(); Statement statement = connection.createStatement();
+             ResultSet result = statement.executeQuery(
+                     "SELECT count(*) FILTER (WHERE state='FAILED'), " +
+                             "count(*) FILTER (WHERE state='ACTIVE'), max(revision) " +
+                             "FROM oscar_archive_job WHERE store_key='" + TABLE +
+                             "' AND id_scope=" + DATABASE_NUM + " AND profile='RAW_GATED' " +
+                             "AND window_start='" + start + "' AND window_end='" + end + "'")) {
+            assertTrue(result.next());
+            assertEquals(0, result.getLong(1));
+            assertEquals(3, result.getLong(2));
+            assertEquals(3, result.getInt(3));
+        }
+        try (Connection connection = open(); Statement statement = connection.createStatement();
+             ResultSet result = statement.executeQuery(
+                     "SELECT count(*), count(DISTINCT archivegenerationid), " +
+                             "count(*) FILTER (WHERE archivegenerationid IS NULL) FROM " + TABLE)) {
+            assertTrue(result.next());
+            assertEquals(6, result.getLong(1));
+            assertEquals(3, result.getLong(2));
+            assertEquals(0, result.getLong(3));
+        }
+        ArchiveCatalog catalog = tiered.getArchiveCatalog();
+        assertEquals(3, catalog.candidates(start, end, null).size());
+
+        // All three revisions are query-visible during rollback grace, while
+        // their linked hot copies remain present. The tiered union must return
+        // each logical observation exactly once.
+        List<Long> mixedTierIds;
+        try (var rows = tiered.selectEntries(new ObsFilter.Builder().build())) {
+            mixedTierIds = rows.map(entry -> entry.getKey().getIdAsLong())
+                    .sorted()
+                    .toList();
+        }
+        assertEquals(expectedIds, mixedTierIds);
+
+        for (int attempt = 0; attempt < 6 && catalog.candidates(start, end, null).stream()
+                .anyMatch(generation -> !generation.parityVerified()); attempt++) {
+            tiered.maintainArchiveLifecycle();
+        }
+        List<ArchiveGeneration> verified = catalog.candidates(start, end, null);
+        assertEquals(3, verified.size());
+        assertTrue(verified.stream().allMatch(ArchiveGeneration::parityVerified));
+
+        ageGeneration(first.id());
+        ageGeneration(second.id());
+        ageGeneration(third.id());
+        archiveConfig.deleteHotAfterArchive = true;
+        for (int attempt = 0; attempt < 12 && hotRows() > 0; attempt++)
+            tiered.maintainArchiveLifecycle();
+        assertEquals(0, hotRows());
+
+        try (Connection connection = open(); PreparedStatement statement = connection.prepareStatement(
+                "SELECT count(*) FILTER (WHERE state='SEALED'), " +
+                        "count(*) FILTER (WHERE state<>'SEALED') " +
+                        "FROM oscar_archive_generation WHERE store_key=? AND id_scope=? " +
+                        "AND profile='RAW_GATED' AND window_start=? AND window_end=?")) {
+            statement.setString(1, TABLE);
+            statement.setInt(2, DATABASE_NUM);
+            UtcJdbcTime.setInstant(statement, 3, start);
+            UtcJdbcTime.setInstant(statement, 4, end);
+            try (ResultSet result = statement.executeQuery()) {
+                assertTrue(result.next());
+                assertEquals(3, result.getLong(1));
+                assertEquals(0, result.getLong(2));
+            }
+        }
+        assertEquals(6, tiered.getNumRecords());
+        try (var rows = tiered.selectEntries(new ObsFilter.Builder().build())) {
+            assertEquals(expectedIds, rows.map(entry -> entry.getKey().getIdAsLong())
+                    .sorted()
+                    .toList());
+        }
+
+        // A fresh process must reconstruct the same cold-only view from the
+        // durable catalog and Parquet objects.
+        tiered.close();
+        TestableTieredStore restarted = new TestableTieredStore(url, DB_NAME, login, password, TABLE,
+                DATABASE_NUM, IdProviderType.SEQUENTIAL, archiveConfig);
+        postgisObsStore = restarted;
+        assertEquals(6, restarted.getNumRecords());
+        try (var rows = restarted.selectEntries(new ObsFilter.Builder().build())) {
+            assertEquals(expectedIds, rows.map(entry -> entry.getKey().getIdAsLong())
+                    .sorted()
+                    .toList());
+        }
+    }
+
+    @Test
+    public void legacyFailedSubHourJobIsRetriedBeforeFullHourWork() throws Exception {
+        TestableTieredStore tiered = (TestableTieredStore) postgisObsStore;
+        Instant start = Instant.parse("2026-06-03T16:00:00Z");
+        Instant legacyEnd = start.plus(30, ChronoUnit.MINUTES);
+        Instant cutoff = start.plus(1, ChronoUnit.HOURS);
+        BigId stream = addSimpleDataStream(bigId(54), "gammaCounts");
+        addSimpleObsWithoutResultTime(stream, BigId.NONE, start, 6, 10 * 60_000);
+        forceReadBackFromStorage();
+
+        archiveConfig.maximumUncompressedBytesPerGeneration = 1;
+        assertThrows(IllegalStateException.class, () ->
+                tiered.archiveWindow(start, legacyEnd, "RAW_GATED"));
+
+        ArchiveCatalog.RetryableJobWindow retry = tiered
+                .nextRetryableArchiveWindow(cutoff, "RAW_GATED")
+                .orElseThrow();
+        assertEquals(start, retry.start());
+        assertEquals(legacyEnd, retry.end());
+
+        archiveConfig.maximumUncompressedBytesPerGeneration = Long.MAX_VALUE;
+        ArchiveGeneration recovered = tiered
+                .archiveWindow(retry.start(), retry.end(), "RAW_GATED")
+                .orElseThrow();
+        assertEquals(3, recovered.rowCount());
+        assertTrue(tiered.nextRetryableArchiveWindow(cutoff, "RAW_GATED").isEmpty());
+        assertEquals(legacyEnd, tiered.nextArchiveWindowStart(cutoff, "RAW_GATED").orElseThrow());
+
+        ArchiveGeneration remainder = tiered
+                .archiveWindow(start, cutoff, "RAW_GATED")
+                .orElseThrow();
+        assertEquals(3, remainder.rowCount());
+        try (Connection connection = open(); Statement statement = connection.createStatement();
+             ResultSet result = statement.executeQuery(
+                     "SELECT count(*) FILTER (WHERE state='FAILED'), " +
+                             "count(*) FILTER (WHERE state='ACTIVE') " +
+                             "FROM oscar_archive_job WHERE store_key='" + TABLE +
+                             "' AND id_scope=" + DATABASE_NUM + " AND profile='RAW_GATED'")) {
+            assertTrue(result.next());
+            assertEquals(0, result.getLong(1));
+            assertEquals(2, result.getLong(2));
+        }
+        assertEquals(6, selectAll(tiered));
+    }
+
+    @Test
+    public void emptyLegacyRetryIsSupersededWithoutStarvingLaterWork() throws Exception {
+        TestableTieredStore tiered = (TestableTieredStore) postgisObsStore;
+        Instant start = Instant.parse("2026-06-03T16:00:00Z");
+        Instant legacyEnd = start.plus(30, ChronoUnit.MINUTES);
+        Instant cutoff = start.plus(1, ChronoUnit.HOURS);
+        BigId stream = addSimpleDataStream(bigId(54), "gammaCounts");
+        addSimpleObsWithoutResultTime(stream, BigId.NONE, start, 6, 10 * 60_000);
+        forceReadBackFromStorage();
+
+        archiveConfig.maximumUncompressedBytesPerGeneration = 1;
+        assertThrows(IllegalStateException.class, () ->
+                tiered.archiveWindow(start, legacyEnd, "RAW_GATED"));
+        try (Connection connection = open(); PreparedStatement statement = connection.prepareStatement(
+                "DELETE FROM " + TABLE + " WHERE phenomenontime>=? AND phenomenontime<?")) {
+            UtcJdbcTime.setInstant(statement, 1, start);
+            UtcJdbcTime.setInstant(statement, 2, legacyEnd);
+            assertEquals(3, statement.executeUpdate());
+        }
+
+        ArchiveCatalog.RetryableJobWindow emptyRetry = tiered
+                .nextRetryableArchiveWindow(cutoff, "RAW_GATED")
+                .orElseThrow();
+        archiveConfig.maximumUncompressedBytesPerGeneration = Long.MAX_VALUE;
+        assertTrue(tiered.archiveWindow(emptyRetry.start(), emptyRetry.end(), "RAW_GATED").isEmpty());
+        assertTrue(tiered.nextRetryableArchiveWindow(cutoff, "RAW_GATED").isEmpty());
+
+        assertEquals(legacyEnd, tiered.nextArchiveWindowStart(cutoff, "RAW_GATED").orElseThrow());
+        ArchiveGeneration later = tiered.archiveWindow(start, cutoff, "RAW_GATED").orElseThrow();
+        assertEquals(3, later.rowCount());
+        try (Connection connection = open(); Statement statement = connection.createStatement();
+             ResultSet result = statement.executeQuery(
+                     "SELECT count(*) FILTER (WHERE state='FAILED'), " +
+                             "count(*) FILTER (WHERE state='SUPERSEDED'), " +
+                             "count(*) FILTER (WHERE state='ACTIVE') " +
+                             "FROM oscar_archive_job WHERE store_key='" + TABLE +
+                             "' AND id_scope=" + DATABASE_NUM + " AND profile='RAW_GATED'")) {
+            assertTrue(result.next());
+            assertEquals(0, result.getLong(1));
+            assertEquals(1, result.getLong(2));
+            assertEquals(1, result.getLong(3));
+        }
+        assertEquals(3, selectAll(tiered));
+    }
+
+    @Test
+    public void productionMemoryBudgetArchivesObservedDenseHourAcrossRestart() throws Exception {
+        TestableTieredStore tiered = (TestableTieredStore) postgisObsStore;
+        Instant start = Instant.parse("2026-06-03T17:00:00Z");
+        Instant end = start.plus(1, ChronoUnit.HOURS);
+        BigId stream = addSimpleDataStream(bigId(53), "gammaCounts");
+        addSimpleObsWithoutResultTime(stream, BigId.NONE, start, 1, 0);
+        forceReadBackFromStorage();
+
+        String resultJson;
+        try (Connection connection = open(); PreparedStatement statement = connection.prepareStatement(
+                "SELECT result::text FROM " + TABLE + " WHERE datastreamid=? LIMIT 1")) {
+            statement.setLong(1, stream.getIdAsLong());
+            try (ResultSet result = statement.executeQuery()) {
+                assertTrue(result.next());
+                resultJson = result.getString(1);
+            }
+        }
+        int bulkRows = 184_194;
+        bulkInsertKeysetRows(stream.getIdAsLong(), 5_000_000L, 6_000_000L,
+                start.plusSeconds(1), resultJson, bulkRows);
+        long expectedRows = bulkRows + 1L;
+        assertEquals(32L * 1024 * 1024,
+                archiveConfig.effectiveMaximumUncompressedBytesPerGeneration());
+
+        ArchiveGeneration first = tiered.archiveWindow(start, end, "RAW_GATED").orElseThrow();
+        assertTrue(first.rowCount() > 0);
+        assertTrue(first.rowCount() < expectedRows);
+
+        tiered.close();
+        tiered = new TestableTieredStore(url, DB_NAME, login, password, TABLE,
+                DATABASE_NUM, IdProviderType.SEQUENTIAL, archiveConfig);
+        postgisObsStore = tiered;
+
+        int generationCount = 1;
+        while (tiered.nextArchiveWindowStart(end, "RAW_GATED").isPresent()) {
+            assertTrue("Dense hour must finish in bounded revisions", generationCount < 16);
+            ArchiveGeneration next = tiered.archiveWindow(start, end, "RAW_GATED").orElseThrow();
+            assertTrue(next.rowCount() > 0);
+            generationCount++;
+        }
+        assertTrue(generationCount > 1);
+
+        try (Connection connection = open(); Statement statement = connection.createStatement();
+             ResultSet result = statement.executeQuery(
+                     "SELECT count(*), count(DISTINCT archivegenerationid), " +
+                             "count(*) FILTER (WHERE archivegenerationid IS NULL) FROM " + TABLE)) {
+            assertTrue(result.next());
+            assertEquals(expectedRows, result.getLong(1));
+            assertEquals(generationCount, result.getInt(2));
+            assertEquals(0, result.getLong(3));
+        }
+        try (Connection connection = open(); Statement statement = connection.createStatement();
+             ResultSet result = statement.executeQuery(
+                     "SELECT count(*) FILTER (WHERE state='FAILED'), " +
+                             "count(*) FILTER (WHERE state='ACTIVE') " +
+                             "FROM oscar_archive_job WHERE store_key='" + TABLE +
+                             "' AND id_scope=" + DATABASE_NUM + " AND profile='RAW_GATED'")) {
+            assertTrue(result.next());
+            assertEquals(0, result.getLong(1));
+            assertEquals(generationCount, result.getInt(2));
+        }
+        assertEquals(expectedRows, tiered.getNumRecords());
+    }
+
+    @Test
     public void sparseByteHeavyHourDoesNotSelectAnEmptyPrefix() throws Exception {
         OscarTieredObsStore tiered = (OscarTieredObsStore) postgisObsStore;
         Instant start = Instant.parse("2026-06-03T18:00:00Z");

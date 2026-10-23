@@ -426,6 +426,12 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
         }
     }
 
+    /** Reclaims an exact failed/stale window before normal full-hour work. */
+    public java.util.Optional<ArchiveCatalog.RetryableJobWindow> nextRetryableArchiveWindow(
+            Instant cutoff, String profile) {
+        return archiveCatalog.nextRetryableJobWindow(profile, cutoff);
+    }
+
     /**
      * Measures at most {@code rowCap + 1} candidates using the same uncompressed-byte
      * accounting as {@link ArchiveExporter}. If the returned row count is at most the
@@ -476,7 +482,7 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
                     start, end, archiveConfig.maximumRowsPerGeneration);
             boolean rowLimitExceeded = footprint.rowCount() > archiveConfig.maximumRowsPerGeneration;
             boolean byteLimitExceeded = footprint.estimatedUncompressedBytes() >
-                    archiveConfig.maximumUncompressedBytesPerGeneration;
+                    archiveConfig.effectiveMaximumUncompressedBytesPerGeneration();
             if (!rowLimitExceeded && !byteLimitExceeded)
                 return end;
 
@@ -503,7 +509,7 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
                         "exceed configured generation limits: rows=" + footprint.rowCount() + "/" +
                         archiveConfig.maximumRowsPerGeneration + ", estimatedBytes=" +
                         footprint.estimatedUncompressedBytes() + "/" +
-                        archiveConfig.maximumUncompressedBytesPerGeneration);
+                        archiveConfig.effectiveMaximumUncompressedBytesPerGeneration());
             }
             Instant bisected = bisectArchiveWindowEnd(start, end);
             end = bisected.isBefore(minimumCandidateEnd) ? minimumCandidateEnd : bisected;

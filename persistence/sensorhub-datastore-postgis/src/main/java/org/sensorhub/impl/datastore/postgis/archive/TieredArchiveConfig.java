@@ -18,6 +18,15 @@ import java.util.List;
  * query parity plus a rollback grace period.</p>
  */
 public class TieredArchiveConfig {
+    /**
+     * DuckDB needs room for the staged table, sort keys, compression buffers,
+     * and the Parquet writer at the same time.  Limiting source payload to one
+     * eighth of the session cap keeps those structures bounded without raising
+     * the native-memory budget on small installations.
+     */
+    private static final long EXPORT_MEMORY_SAFETY_DIVISOR = 8L;
+    private static final long BYTES_PER_MEBIBYTE = 1024L * 1024L;
+
     @DisplayInfo(label = "Enable cold archive")
     public boolean enabled = true;
 
@@ -48,7 +57,8 @@ public class TieredArchiveConfig {
 
     @Min(1)
     @DisplayInfo(label = "Maximum uncompressed generation bytes",
-            desc = "Bounds JSON and row payload admitted to one archive generation before Parquet compression")
+            desc = "Operator cap for JSON and row payload admitted to one archive generation; " +
+                    "the runtime also applies a conservative cap derived from DuckDB memory")
     public long maximumUncompressedBytesPerGeneration = 2L * 1024 * 1024 * 1024;
 
     @Min(16)
@@ -107,6 +117,23 @@ public class TieredArchiveConfig {
     public List<String> outputNames = new ArrayList<>(Arrays.asList(
             "gammaCounts", "gammaThreshold", "neutronCounts", "setupGamma", "setupNeutron"));
 
+    /**
+     * Returns the actual source-payload budget for one Parquet generation.
+     *
+     * <p>The configured generation cap remains an operator-controlled upper
+     * bound, but it cannot admit a batch grossly larger than the memory budget
+     * of the DuckDB session that must stage, sort, and encode it.  This also
+     * makes upgraded installations with the former 2 GiB generation setting
+     * safe without rewriting their persisted configuration.</p>
+     */
+    public long effectiveMaximumUncompressedBytesPerGeneration() {
+        long duckDbMemoryBytes = Math.multiplyExact(
+                (long) duckDbMemoryLimitMegabytes, BYTES_PER_MEBIBYTE);
+        long memorySafePayloadBytes = Math.max(1L,
+                duckDbMemoryBytes / EXPORT_MEMORY_SAFETY_DIVISOR);
+        return Math.min(maximumUncompressedBytesPerGeneration, memorySafePayloadBytes);
+    }
+
     /** Rejects unsafe compatibility settings that cannot weaken invariants. */
     public void validate() {
         if (!requireParityReceipt)
@@ -118,6 +145,8 @@ public class TieredArchiveConfig {
             throw new IllegalArgumentException("maximumUncompressedBytesPerGeneration must be positive");
         if (duckDbMemoryLimitMegabytes < 16)
             throw new IllegalArgumentException("duckDbMemoryLimitMegabytes must be at least 16 MiB");
+        if (effectiveMaximumUncompressedBytesPerGeneration() < 1)
+            throw new IllegalArgumentException("Effective archive generation byte limit must be positive");
         if (duckDbThreads < 1 || duckDbThreads > 64)
             throw new IllegalArgumentException("duckDbThreads must be between 1 and 64");
         if (duckDbMaximumTemporaryMegabytes < 16)

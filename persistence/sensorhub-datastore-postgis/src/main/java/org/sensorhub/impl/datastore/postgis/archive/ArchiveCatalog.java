@@ -682,6 +682,56 @@ public final class ArchiveCatalog {
     private record BackupGenerationInventory(long count, String sha256, long bytes) {
     }
 
+    /** Exact legacy/current job window that can safely be reclaimed. */
+    public record RetryableJobWindow(Instant start, Instant end) {
+        public RetryableJobWindow {
+            if (start == null || end == null || !start.isBefore(end))
+                throw new IllegalArgumentException("Retryable archive job window must be non-empty");
+        }
+    }
+
+    /**
+     * Returns the oldest latest-revision FAILED job, or EXPORTING job stale for
+     * two hours, that is wholly before the current retention cutoff.
+     *
+     * <p>This exact-window lookup preserves upgrade recovery for sub-hour jobs
+     * created by the former time-bisection scheduler.  Reclaiming those jobs
+     * before normal full-hour work clears their durable failure state instead
+     * of leaving an obsolete FAILED row after the same observations are
+     * archived by a differently shaped window.</p>
+     */
+    public Optional<RetryableJobWindow> nextRetryableJobWindow(String profile, Instant cutoff) {
+        if (profile == null || profile.isBlank())
+            throw new IllegalArgumentException("Archive profile is required");
+        if (cutoff == null)
+            throw new IllegalArgumentException("Archive cutoff is required");
+        String sql = "SELECT job.window_start, job.window_end FROM oscar_archive_job job " +
+                "WHERE job.store_key=? AND job.id_scope=? AND job.profile=? AND job.window_end<=? " +
+                "AND (job.state='FAILED' OR (job.state='EXPORTING' " +
+                "AND job.updated_at < now()-interval '2 hours')) " +
+                "AND NOT EXISTS (SELECT 1 FROM oscar_archive_job newer " +
+                "WHERE newer.store_key=job.store_key AND newer.id_scope=job.id_scope " +
+                "AND newer.profile=job.profile AND newer.window_start=job.window_start " +
+                "AND newer.window_end=job.window_end AND newer.revision>job.revision) " +
+                "ORDER BY job.window_start, job.window_end LIMIT 1";
+        try (Connection connection = connections.open();
+             PreparedStatement statement = connection.prepareStatement(sql)) {
+            statement.setString(1, storeKey);
+            statement.setInt(2, idScope);
+            statement.setString(3, profile);
+            UtcJdbcTime.setInstant(statement, 4, cutoff);
+            try (ResultSet result = statement.executeQuery()) {
+                if (!result.next())
+                    return Optional.empty();
+                return Optional.of(new RetryableJobWindow(
+                        UtcJdbcTime.getInstant(result, 1),
+                        UtcJdbcTime.getInstant(result, 2)));
+            }
+        } catch (SQLException e) {
+            throw new IllegalStateException("Cannot inspect retryable archive jobs", e);
+        }
+    }
+
     public Optional<UUID> claimJob(String profile, Instant start, Instant end) {
         try (Connection connection = connections.open()) {
             boolean oldAutoCommit = connection.getAutoCommit();
@@ -971,6 +1021,31 @@ public final class ArchiveCatalog {
             statement.executeUpdate();
         } catch (SQLException e) {
             throw new IllegalStateException("Cannot record archive failure", e);
+        }
+    }
+
+    /**
+     * Completes a reclaimed job that no longer owns any eligible source rows.
+     * This is an audited no-op, not an export failure: concurrent removal or
+     * an overlapping recovery may legitimately make an old retry window empty.
+     */
+    public void supersedeEmptyJob(UUID jobId, String detail) {
+        String message = detail == null ? "No eligible source rows remain" : detail;
+        if (message.length() > 4000)
+            message = message.substring(0, 4000);
+        String sql = "UPDATE oscar_archive_job job SET state='SUPERSEDED', error=?, updated_at=now() " +
+                "WHERE job.id=? AND job.store_key=? AND job.id_scope=? AND job.state='EXPORTING' " +
+                "AND NOT EXISTS (SELECT 1 FROM oscar_archive_generation generation WHERE generation.job_id=job.id)";
+        try (Connection connection = connections.open(); PreparedStatement statement =
+                connection.prepareStatement(sql)) {
+            statement.setString(1, message);
+            statement.setObject(2, jobId);
+            statement.setString(3, storeKey);
+            statement.setInt(4, idScope);
+            if (statement.executeUpdate() != 1)
+                throw new IllegalStateException("Empty archive job was not eligible for supersession");
+        } catch (SQLException e) {
+            throw new IllegalStateException("Cannot supersede empty archive job", e);
         }
     }
 
