@@ -24,9 +24,11 @@ import java.sql.PreparedStatement;
 import java.sql.Statement;
 import java.time.Instant;
 import java.util.List;
+import java.util.Set;
 import java.util.UUID;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 
@@ -223,6 +225,51 @@ public class TestParquetArchiveReader {
         assertEquals(2, reader.count(List.of(first, second), latest, null, null));
         ObsFilter limited = new ObsFilter.Builder().withLimit(3).build();
         assertEquals(3, reader.count(List.of(first, second), limited, null, null));
+    }
+
+    @Test
+    public void aggregatePlansOmitOnlyPresentationOrdering() throws Exception {
+        Path root = temporary.newFolder("aggregate-plan").toPath();
+        ArchiveGeneration generation = writeGeneration(root, "aggregate.parquet", new TestRow[]{
+                new TestRow(1, 10, "2026-01-01T00:01:00Z")
+        });
+        ParquetArchiveReader reader = new ParquetArchiveReader(root);
+        ObsFilter all = new ObsFilter.Builder().build();
+
+        String aggregateSql = queryPlanSql(reader, List.of(generation), all, true, false);
+        assertFalse("Order-independent metadata/count plans must not sort the complete archive",
+                aggregateSql.contains(" ORDER BY phenomenon_time "));
+
+        String streamSql = queryPlanSql(reader, List.of(generation), all, true, true);
+        assertTrue("Row streams retain their deterministic presentation order",
+                streamSql.contains(" ORDER BY phenomenon_time ASC NULLS FIRST, id_value"));
+
+        ObsFilter latest = new ObsFilter.Builder().withPhenomenonTime()
+                .withLatestTime().done().build();
+        String latestAggregateSql = queryPlanSql(
+                reader, List.of(generation), latest, true, false);
+        assertTrue("Latest-per-stream reduction retains its semantic window ordering",
+                latestAggregateSql.contains("row_number() OVER (PARTITION BY datastream_id " +
+                        "ORDER BY phenomenon_time DESC NULLS LAST, id_value DESC)"));
+        assertFalse("Latest aggregate plans still omit the outer presentation sort",
+                latestAggregateSql.contains(") ranked WHERE archive_rank=1 ORDER BY"));
+    }
+
+    @Test
+    public void finiteMetadataScanRetainsDeterministicSubsetOrder() throws Exception {
+        Path root = temporary.newFolder("finite-metadata-order").toPath();
+        ArchiveGeneration generation = writeGeneration(root, "metadata.parquet", new TestRow[]{
+                new TestRow(3, 10, "2026-01-01T00:03:00Z"),
+                new TestRow(1, 10, "2026-01-01T00:01:00Z"),
+                new TestRow(2, 10, "2026-01-01T00:02:00Z")
+        });
+        List<Long> ids = new java.util.ArrayList<>();
+
+        new ParquetArchiveReader(root).forEachMetadata(
+                List.of(generation), new ObsFilter.Builder().build(), null, null, 1,
+                row -> ids.add(row.id()));
+
+        assertEquals(List.of(1L), ids);
     }
 
     @Test
@@ -430,6 +477,25 @@ public class TestParquetArchiveReader {
                 Instant.parse("2026-01-01T00:00:00Z"), Instant.parse("2026-01-01T01:00:00Z"),
                 root.relativize(object), ArchiveExporter.sha256(object), rows.length,
                 minimum, maximum, "ACTIVE", true);
+    }
+
+    private String queryPlanSql(ParquetArchiveReader reader,
+                                List<ArchiveGeneration> generations,
+                                ObsFilter filter,
+                                boolean applyLatest,
+                                boolean ordered) throws Exception {
+        var authorize = ParquetArchiveReader.class.getDeclaredMethod("authorize", List.class);
+        authorize.setAccessible(true);
+        Object authorized = authorize.invoke(reader, generations);
+        var queryPlan = ParquetArchiveReader.class.getDeclaredMethod(
+                "queryPlan", authorize.getReturnType(), ObsFilter.class,
+                Set.class, Set.class, boolean.class, boolean.class, long.class, boolean.class);
+        queryPlan.setAccessible(true);
+        Object plan = queryPlan.invoke(reader, authorized, filter,
+                null, null, false, applyLatest, Long.MAX_VALUE, ordered);
+        var sql = plan.getClass().getDeclaredMethod("sql");
+        sql.setAccessible(true);
+        return (String) sql.invoke(plan);
     }
 
     private record TestRow(long id, long dataStreamId, String time) {}

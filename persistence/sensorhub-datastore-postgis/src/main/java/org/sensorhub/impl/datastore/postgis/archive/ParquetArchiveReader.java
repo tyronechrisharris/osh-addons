@@ -211,7 +211,9 @@ public final class ParquetArchiveReader {
         AuthorizedObjects objects = authorize(generations);
         if (objects.byFilename().isEmpty())
             return;
-        QueryPlan plan = queryPlan(objects, filter, allowedDataStreams, allowedFois, false, true, limit);
+        QueryPlan plan = queryPlan(
+                objects, filter, allowedDataStreams, allowedFois, false, true, limit,
+                limit != Long.MAX_VALUE);
         try (DuckDbResourcePolicy.Session duckSession = DuckDbResourcePolicy.open(config, "metadata-query");
              PreparedStatement statement = ConnectionManager.trackCancellableStatement(
                      duckSession.connection().prepareStatement(plan.sql()), "DuckDB metadata query")) {
@@ -245,7 +247,8 @@ public final class ParquetArchiveReader {
         if (objects.byFilename().isEmpty())
             return 0;
         ObsFilter unbounded = ObsFilter.Builder.from(filter).withLimit(Long.MAX_VALUE).build();
-        QueryPlan plan = queryPlan(objects, unbounded, allowedDataStreams, allowedFois, false, true, Long.MAX_VALUE);
+        QueryPlan plan = queryPlan(objects, unbounded, allowedDataStreams, allowedFois,
+                false, true, Long.MAX_VALUE, false);
         try (DuckDbResourcePolicy.Session duckSession = DuckDbResourcePolicy.open(config, "cold-count");
              PreparedStatement statement = ConnectionManager.trackCancellableStatement(
                      duckSession.connection().prepareStatement(
@@ -277,6 +280,14 @@ public final class ParquetArchiveReader {
     private QueryPlan queryPlan(AuthorizedObjects objects, ObsFilter filter,
                                 Set<Long> allowedDataStreams, Set<Long> allowedFois,
                                 boolean includeResult, boolean applyLatest, long limit) {
+        return queryPlan(objects, filter, allowedDataStreams, allowedFois,
+                includeResult, applyLatest, limit, true);
+    }
+
+    private QueryPlan queryPlan(AuthorizedObjects objects, ObsFilter filter,
+                                Set<Long> allowedDataStreams, Set<Long> allowedFois,
+                                boolean includeResult, boolean applyLatest, long limit,
+                                boolean ordered) {
         String columns = includeResult ? FULL_COLUMNS : METADATA_COLUMNS;
         String fileList = objects.byFilename().keySet().stream().map(path -> "'" + sqlLiteral(path) + "'")
                 .collect(Collectors.joining(","));
@@ -319,9 +330,12 @@ public final class ParquetArchiveReader {
         } else {
             sql = source;
         }
-        sql.append(" ORDER BY phenomenon_time ")
-                .append(filter.getPhenomenonTime() != null && filter.getPhenomenonTime().descendingOrder() ? "DESC" : "ASC")
-                .append(" NULLS FIRST, id_value");
+        if (ordered) {
+            sql.append(" ORDER BY phenomenon_time ")
+                    .append(filter.getPhenomenonTime() != null && filter.getPhenomenonTime().descendingOrder()
+                            ? "DESC" : "ASC")
+                    .append(" NULLS FIRST, id_value");
+        }
         if (limit != Long.MAX_VALUE) {
             if (limit < 0)
                 throw new IllegalArgumentException("Archive query limit cannot be negative");
