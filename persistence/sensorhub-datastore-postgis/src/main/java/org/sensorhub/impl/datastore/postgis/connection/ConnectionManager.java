@@ -132,6 +132,15 @@ public class ConnectionManager {
         return CancellableConnectionScope.trackStandaloneStatement(statement, description);
     }
 
+    /**
+     * Throws when the operation bound to the current thread has been
+     * cancelled.  Use this around iteration that continues after a tracked
+     * JDBC statement call has returned, such as a materialized result set.
+     */
+    public static void throwIfCancellableOperationCancelled() {
+        CancellableConnectionScope.throwIfCancellationRequested();
+    }
+
     public void addBatch(String sqlQuery) {
         batchList.add(sqlQuery);
     }

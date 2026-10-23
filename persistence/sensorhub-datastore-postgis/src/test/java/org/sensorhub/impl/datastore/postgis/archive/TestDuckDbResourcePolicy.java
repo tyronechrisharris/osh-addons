@@ -6,15 +6,25 @@ import org.junit.rules.TemporaryFolder;
 import org.sensorhub.api.datastore.ICancellableDataStore;
 import org.sensorhub.impl.datastore.postgis.connection.ConnectionManager;
 
+import java.io.IOException;
+import java.nio.channels.FileChannel;
+import java.nio.channels.FileLock;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.nio.file.attribute.PosixFileAttributeView;
 import java.nio.file.attribute.PosixFilePermissions;
 import java.sql.ResultSet;
 import java.sql.SQLTransientException;
 import java.sql.Statement;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
@@ -22,6 +32,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotEquals;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 
@@ -65,6 +76,7 @@ public class TestDuckDbResourcePolicy {
 
         assertFalse(Files.exists(operationDirectory));
         assertTrue(Files.isDirectory(temporaryRoot));
+        assertOnlyRootLock(temporaryRoot);
     }
 
     @Test
@@ -83,6 +95,341 @@ public class TestDuckDbResourcePolicy {
         }
         assertFalse(Files.exists(firstDirectory));
         assertFalse(Files.exists(secondDirectory));
+        assertOnlyRootLock(temporaryRoot);
+    }
+
+    @Test
+    public void firstOpenReclaimsOnlyRecognizedPriorProcessDirectories() throws Exception {
+        Path temporaryRoot = temporary.newFolder("stale-spill").toPath();
+        Path staleEmpty = temporaryRoot.resolve(
+                "cold-query-11111111-1111-4111-8111-111111111111");
+        Path stalePopulated = temporaryRoot.resolve(
+                "metadata-query-22222222-2222-4222-8222-222222222222");
+        Path unrelated = temporaryRoot.resolve("operator-notes");
+        Path unsafePrefix = temporaryRoot.resolve(
+                "Cold-query-33333333-3333-4333-8333-333333333333");
+        Path uppercaseUuid = temporaryRoot.resolve(
+                "cold-query-44444444-4444-4444-8444-44444444444A");
+        Path recognizedRegularFile = temporaryRoot.resolve(
+                "cold-query-55555555-5555-4555-8555-555555555555");
+        Files.createDirectory(staleEmpty);
+        Files.createDirectories(stalePopulated.resolve("nested"));
+        Files.writeString(stalePopulated.resolve("nested/spill.tmp"), "stale spill");
+        Files.createDirectory(unrelated);
+        Files.writeString(unrelated.resolve("keep"), "operator data");
+        Files.createDirectory(unsafePrefix);
+        Files.createDirectory(uppercaseUuid);
+        Files.writeString(recognizedRegularFile, "not an operation directory");
+
+        Path liveDirectory;
+        try (DuckDbResourcePolicy.Session session =
+                     DuckDbResourcePolicy.open(config(temporaryRoot), "cold-query")) {
+            liveDirectory = session.operationDirectory();
+            assertFalse(Files.exists(staleEmpty, LinkOption.NOFOLLOW_LINKS));
+            assertFalse(Files.exists(stalePopulated, LinkOption.NOFOLLOW_LINKS));
+            assertTrue(Files.isDirectory(liveDirectory, LinkOption.NOFOLLOW_LINKS));
+            assertTrue(Files.isDirectory(unrelated, LinkOption.NOFOLLOW_LINKS));
+            assertTrue(Files.isDirectory(unsafePrefix, LinkOption.NOFOLLOW_LINKS));
+            assertTrue(Files.isDirectory(uppercaseUuid, LinkOption.NOFOLLOW_LINKS));
+            assertTrue(Files.isRegularFile(recognizedRegularFile, LinkOption.NOFOLLOW_LINKS));
+        }
+
+        assertFalse(Files.exists(liveDirectory, LinkOption.NOFOLLOW_LINKS));
+        assertTrue(Files.exists(unrelated.resolve("keep"), LinkOption.NOFOLLOW_LINKS));
+        assertTrue(Files.isDirectory(unsafePrefix, LinkOption.NOFOLLOW_LINKS));
+        assertTrue(Files.isDirectory(uppercaseUuid, LinkOption.NOFOLLOW_LINKS));
+        assertTrue(Files.isRegularFile(recognizedRegularFile, LinkOption.NOFOLLOW_LINKS));
+    }
+
+    @Test
+    public void firstOpenPreservesRecognizedNameSymbolicLinkWithoutFollowingIt()
+            throws Exception {
+        Path temporaryRoot = temporary.newFolder("linked-stale-spill").toPath();
+        Path outside = temporary.newFolder("linked-stale-target").toPath();
+        Path proof = Files.writeString(outside.resolve("proof"), "must survive");
+        Path linkedOperation = temporaryRoot.resolve(
+                "cold-query-66666666-6666-4666-8666-666666666666");
+        try {
+            Files.createSymbolicLink(linkedOperation, outside);
+        } catch (UnsupportedOperationException | java.nio.file.FileSystemException unsupported) {
+            return;
+        }
+
+        try (DuckDbResourcePolicy.Session ignored =
+                     DuckDbResourcePolicy.open(config(temporaryRoot), "cold-query")) {
+            assertTrue(Files.isSymbolicLink(linkedOperation));
+            assertTrue(Files.exists(proof, LinkOption.NOFOLLOW_LINKS));
+        }
+
+        assertTrue(Files.isSymbolicLink(linkedOperation));
+        assertTrue(Files.exists(proof, LinkOption.NOFOLLOW_LINKS));
+    }
+
+    @Test
+    public void staleCleanupFailurePreventsSessionAdmissionUntilCleanupCanSucceed()
+            throws Exception {
+        Path temporaryRoot = temporary.newFolder("stale-cleanup-failure-spill").toPath();
+        if (!supportsPosix(temporaryRoot))
+            return;
+        Files.setPosixFilePermissions(temporaryRoot,
+                PosixFilePermissions.fromString("rwx------"));
+        Path stale = temporaryRoot.resolve(
+                "cold-query-77777777-7777-4777-8777-777777777777");
+        Files.createDirectory(stale);
+        Files.writeString(stale.resolve("spill.tmp"), "cannot remove yet");
+        Files.setPosixFilePermissions(stale,
+                PosixFilePermissions.fromString("r-x------"));
+
+        try {
+            assertThrows(java.io.IOException.class,
+                    () -> DuckDbResourcePolicy.open(config(temporaryRoot), "cold-query"));
+            assertTrue(Files.exists(stale, LinkOption.NOFOLLOW_LINKS));
+        } finally {
+            Files.setPosixFilePermissions(stale,
+                    PosixFilePermissions.fromString("rwx------"));
+        }
+
+        try (DuckDbResourcePolicy.Session recovered =
+                     DuckDbResourcePolicy.open(config(temporaryRoot), "cold-query")) {
+            assertFalse(Files.exists(stale, LinkOption.NOFOLLOW_LINKS));
+            assertTrue(Files.isDirectory(recovered.operationDirectory(), LinkOption.NOFOLLOW_LINKS));
+        }
+    }
+
+    @Test
+    public void externallyHeldRootLockPreventsCleanupUntilReleased() throws Exception {
+        Path temporaryRoot = temporary.newFolder("externally-locked-spill").toPath();
+        Path stale = temporaryRoot.resolve(
+                "cold-query-89999999-9999-4999-8999-999999999999");
+        Path externallyLive = temporaryRoot.resolve(
+                "metadata-query-90000000-0000-4000-8000-000000000000");
+        Path staleProof = Files.createDirectories(stale.resolve("nested"))
+                .resolve("spill.tmp");
+        Files.writeString(staleProof, "prior process spill");
+        Path liveProof = Files.writeString(
+                Files.createDirectory(externallyLive).resolve("active.tmp"),
+                "other process live spill");
+        Path lockFile = temporaryRoot.resolve(DuckDbResourcePolicy.ROOT_LOCK_FILE_NAME);
+        if (supportsPosix(lockFile.getParent()))
+            Files.createFile(lockFile,
+                    PosixFilePermissions.asFileAttribute(
+                            PosixFilePermissions.fromString("rw-------")));
+        else
+            Files.createFile(lockFile);
+
+        Path readyFile = temporaryRoot.resolve(".external-lock-ready");
+        Process lockHolder = startExternalLockHolder(lockFile, readyFile);
+        try {
+            long readyDeadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+            while (!Files.exists(readyFile, LinkOption.NOFOLLOW_LINKS) &&
+                    lockHolder.isAlive() && System.nanoTime() < readyDeadline)
+                Thread.sleep(10L);
+            assertTrue("External DuckDB root lock holder did not become ready",
+                    Files.isRegularFile(readyFile, LinkOption.NOFOLLOW_LINKS));
+            Files.delete(readyFile);
+
+            IOException unavailable = assertThrows(IOException.class,
+                    () -> DuckDbResourcePolicy.open(config(temporaryRoot), "cold-query"));
+            assertTrue(unavailable.getMessage().contains("another process"));
+            assertTrue(Files.exists(staleProof, LinkOption.NOFOLLOW_LINKS));
+            assertTrue(Files.exists(liveProof, LinkOption.NOFOLLOW_LINKS));
+            assertTrue(Files.isRegularFile(lockFile, LinkOption.NOFOLLOW_LINKS));
+        } finally {
+            lockHolder.getOutputStream().close();
+            if (!lockHolder.waitFor(5, TimeUnit.SECONDS)) {
+                lockHolder.destroyForcibly();
+                assertTrue("External DuckDB root lock holder did not exit",
+                        lockHolder.waitFor(5, TimeUnit.SECONDS));
+            }
+        }
+        assertEquals("External DuckDB root lock holder failed", 0, lockHolder.exitValue());
+
+        try (DuckDbResourcePolicy.Session recovered =
+                     DuckDbResourcePolicy.open(config(temporaryRoot), "cold-query")) {
+            assertFalse(Files.exists(stale, LinkOption.NOFOLLOW_LINKS));
+            assertFalse(Files.exists(externallyLive, LinkOption.NOFOLLOW_LINKS));
+            assertTrue(Files.isDirectory(
+                    recovered.operationDirectory(), LinkOption.NOFOLLOW_LINKS));
+        }
+        assertOnlyRootLock(temporaryRoot);
+    }
+
+    @Test
+    public void unsafeExistingRootLockFailsClosedBeforeStaleCleanup() throws Exception {
+        Path linkedRoot = temporary.newFolder("linked-root-lock-spill").toPath();
+        Path linkedStale = linkedRoot.resolve(
+                "cold-query-91111111-1111-4111-8111-111111111111");
+        Path linkedProof = Files.writeString(
+                Files.createDirectory(linkedStale).resolve("spill.tmp"), "must survive");
+        Path lockTarget = Files.writeString(
+                temporary.getRoot().toPath().resolve("lock-target"), "unrelated");
+        Path linkedLock = linkedRoot.resolve(DuckDbResourcePolicy.ROOT_LOCK_FILE_NAME);
+        try {
+            Files.createSymbolicLink(linkedLock, lockTarget);
+            assertThrows(IOException.class,
+                    () -> DuckDbResourcePolicy.open(config(linkedRoot), "cold-query"));
+            assertTrue(Files.isSymbolicLink(linkedLock));
+            assertTrue(Files.exists(linkedProof, LinkOption.NOFOLLOW_LINKS));
+            assertTrue(Files.exists(lockTarget, LinkOption.NOFOLLOW_LINKS));
+        } catch (UnsupportedOperationException | java.nio.file.FileSystemException unsupported) {
+            // The POSIX permission case below still exercises fail-closed
+            // validation on filesystems without symbolic links.
+        }
+
+        Path broadRoot = temporary.newFolder("broad-root-lock-spill").toPath();
+        if (!supportsPosix(broadRoot))
+            return;
+        Files.setPosixFilePermissions(broadRoot,
+                PosixFilePermissions.fromString("rwx------"));
+        Path broadStale = broadRoot.resolve(
+                "cold-query-92222222-2222-4222-8222-222222222222");
+        Path broadProof = Files.writeString(
+                Files.createDirectory(broadStale).resolve("spill.tmp"), "must survive");
+        Path broadLock = broadRoot.resolve(DuckDbResourcePolicy.ROOT_LOCK_FILE_NAME);
+        Files.createFile(broadLock,
+                PosixFilePermissions.asFileAttribute(
+                        PosixFilePermissions.fromString("rw-r--r--")));
+
+        IOException broadFailure = assertThrows(IOException.class,
+                () -> DuckDbResourcePolicy.open(config(broadRoot), "cold-query"));
+        assertTrue(broadFailure.getMessage().contains("POSIX mode 0600"));
+        assertTrue(Files.exists(broadProof, LinkOption.NOFOLLOW_LINKS));
+        assertEquals(PosixFilePermissions.fromString("rw-r--r--"),
+                Files.getPosixFilePermissions(broadLock, LinkOption.NOFOLLOW_LINKS));
+    }
+
+    @Test
+    public void fifoRootLockFailsPromptlyBeforeStaleCleanup() throws Exception {
+        Path temporaryRoot = temporary.newFolder("fifo-root-lock-spill").toPath();
+        if (!supportsPosix(temporaryRoot))
+            return;
+        Files.setPosixFilePermissions(temporaryRoot,
+                PosixFilePermissions.fromString("rwx------"));
+        Path stale = temporaryRoot.resolve(
+                "cold-query-93333333-3333-4333-8333-333333333333");
+        Path staleProof = Files.writeString(
+                Files.createDirectory(stale).resolve("spill.tmp"), "must survive");
+        Path lockFile = temporaryRoot.resolve(DuckDbResourcePolicy.ROOT_LOCK_FILE_NAME);
+        Process fifoCreator;
+        try {
+            fifoCreator = new ProcessBuilder("mkfifo", lockFile.toString()).start();
+        } catch (IOException unavailable) {
+            return;
+        }
+        if (!fifoCreator.waitFor(5, TimeUnit.SECONDS)) {
+            fifoCreator.destroyForcibly();
+            fifoCreator.waitFor(5, TimeUnit.SECONDS);
+            return;
+        }
+        if (fifoCreator.exitValue() != 0)
+            return;
+        Files.setPosixFilePermissions(lockFile,
+                PosixFilePermissions.fromString("rw-------"));
+        assertFalse(Files.isRegularFile(lockFile, LinkOption.NOFOLLOW_LINKS));
+
+        TieredArchiveConfig config = config(temporaryRoot);
+        AtomicBoolean sessionCreated = new AtomicBoolean();
+        AtomicReference<Throwable> failure = new AtomicReference<>();
+        CountDownLatch finished = new CountDownLatch(1);
+        Thread opener = new Thread(() -> {
+            try (DuckDbResourcePolicy.Session ignored =
+                         DuckDbResourcePolicy.open(config, "cold-query")) {
+                sessionCreated.set(true);
+            } catch (Throwable error) {
+                failure.set(error);
+            } finally {
+                finished.countDown();
+            }
+        }, "fifo-root-lock-opener");
+        opener.setDaemon(true);
+
+        long started = System.nanoTime();
+        opener.start();
+        boolean completedPromptly = finished.await(2, TimeUnit.SECONDS);
+        long elapsedMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started);
+        if (!completedPromptly) {
+            // Unblock a regressed write-only FIFO open so the daemon does not
+            // retain test resources after the bounded assertion fails.
+            try (FileChannel ignored = FileChannel.open(
+                    lockFile, StandardOpenOption.READ, StandardOpenOption.WRITE,
+                    LinkOption.NOFOLLOW_LINKS)) {
+                // Opening a POSIX FIFO read/write is nonblocking.
+            }
+            finished.await(2, TimeUnit.SECONDS);
+        }
+
+        assertTrue("FIFO root lease blocked DuckDB admission for " + elapsedMillis + " ms",
+                completedPromptly);
+        assertFalse(sessionCreated.get());
+        assertTrue("Expected a fail-closed FIFO lease error, got " + failure.get(),
+                failure.get() instanceof IOException);
+        assertTrue(failure.get().getMessage().contains("real regular file"));
+        assertTrue(Files.exists(staleProof, LinkOption.NOFOLLOW_LINKS));
+        assertTrue(Files.exists(lockFile, LinkOption.NOFOLLOW_LINKS));
+    }
+
+    @Test
+    public void concurrentFirstOpensCannotReapNewLiveOperationDirectories() throws Exception {
+        Path temporaryRoot = temporary.newFolder("concurrent-first-open-spill").toPath();
+        Path stale = temporaryRoot.resolve(
+                "cold-query-88888888-8888-4888-8888-888888888888");
+        Files.createDirectory(stale);
+        Files.writeString(stale.resolve("spill.tmp"), "prior process");
+        TieredArchiveConfig config = config(temporaryRoot);
+        int workerCount = 4;
+        config.duckDbMaximumConcurrentSessions = workerCount;
+        config.duckDbSessionAcquireTimeoutSeconds = 10;
+
+        ExecutorService workers = Executors.newFixedThreadPool(workerCount);
+        CountDownLatch start = new CountDownLatch(1);
+        CountDownLatch opened = new CountDownLatch(workerCount);
+        CountDownLatch release = new CountDownLatch(1);
+        ConcurrentLinkedQueue<Path> liveDirectories = new ConcurrentLinkedQueue<>();
+        AtomicReference<Throwable> workerFailure = new AtomicReference<>();
+        List<Future<?>> futures = new ArrayList<>();
+        for (int worker = 0; worker < workerCount; worker++) {
+            int workerNumber = worker;
+            futures.add(workers.submit(() -> {
+                boolean signalled = false;
+                try {
+                    assertTrue(start.await(5, TimeUnit.SECONDS));
+                    try (DuckDbResourcePolicy.Session session =
+                                 DuckDbResourcePolicy.open(config, "cold-query")) {
+                        liveDirectories.add(session.operationDirectory());
+                        opened.countDown();
+                        signalled = true;
+                        assertTrue(release.await(10, TimeUnit.SECONDS));
+                    }
+                } catch (Throwable error) {
+                    workerFailure.compareAndSet(null, new AssertionError(
+                            "Concurrent DuckDB opener " + workerNumber + " failed", error));
+                } finally {
+                    if (!signalled)
+                        opened.countDown();
+                }
+            }));
+        }
+
+        start.countDown();
+        try {
+            assertTrue("Concurrent DuckDB sessions did not open",
+                    opened.await(15, TimeUnit.SECONDS));
+            assertNull(workerFailure.get());
+            assertFalse(Files.exists(stale, LinkOption.NOFOLLOW_LINKS));
+            assertEquals(workerCount, liveDirectories.size());
+            for (Path liveDirectory : liveDirectories)
+                assertTrue("A concurrent first opener reaped a live session directory",
+                        Files.isDirectory(liveDirectory, LinkOption.NOFOLLOW_LINKS));
+        } finally {
+            release.countDown();
+            workers.shutdown();
+            assertTrue("Concurrent DuckDB opener threads did not exit",
+                    workers.awaitTermination(15, TimeUnit.SECONDS));
+        }
+        for (Future<?> future : futures)
+            future.get();
+        assertNull(workerFailure.get());
+        assertOnlyRootLock(temporaryRoot);
     }
 
     @Test
@@ -154,9 +501,7 @@ public class TestDuckDbResourcePolicy {
                 + elapsedMillis + " ms", elapsedMillis < 4_000L);
         assertFalse("Closing the cancelled session must remove its private scratch directory",
                 Files.exists(operationDirectory.get(), LinkOption.NOFOLLOW_LINKS));
-        try (var children = Files.list(temporaryRoot)) {
-            assertEquals("No cancelled DuckDB scratch directory may remain", 0L, children.count());
-        }
+        assertOnlyRootLock(temporaryRoot);
     }
 
     @Test
@@ -301,6 +646,50 @@ public class TestDuckDbResourcePolicy {
         config.duckDbSessionAcquireTimeoutSeconds = 2;
         config.duckDbTemporaryDirectory = temporaryRoot.toString();
         return config;
+    }
+
+    private static Process startExternalLockHolder(Path lockFile, Path readyFile)
+            throws IOException {
+        String executableName = System.getProperty("os.name").startsWith("Windows") ?
+                "java.exe" : "java";
+        Path java = Path.of(System.getProperty("java.home"), "bin", executableName);
+        return new ProcessBuilder(
+                java.toString(),
+                "-cp", System.getProperty("java.class.path"),
+                ExternalRootLockHolder.class.getName(),
+                lockFile.toString(),
+                readyFile.toString())
+                .redirectErrorStream(true)
+                .start();
+    }
+
+    public static final class ExternalRootLockHolder {
+        private ExternalRootLockHolder() {
+        }
+
+        public static void main(String[] arguments) throws Exception {
+            Path lockFile = Path.of(arguments[0]);
+            Path readyFile = Path.of(arguments[1]);
+            try (FileChannel channel = FileChannel.open(
+                        lockFile, StandardOpenOption.WRITE, LinkOption.NOFOLLOW_LINKS);
+                 FileLock ignored = channel.lock()) {
+                Files.writeString(readyFile, "ready", StandardOpenOption.CREATE_NEW);
+                System.in.read();
+            }
+        }
+    }
+
+    private static void assertOnlyRootLock(Path temporaryRoot) throws Exception {
+        Path expected = temporaryRoot.resolve(DuckDbResourcePolicy.ROOT_LOCK_FILE_NAME);
+        try (var children = Files.list(temporaryRoot)) {
+            assertEquals("DuckDB scratch must contain only its root lease",
+                    List.of(expected), children.toList());
+        }
+        assertTrue(Files.isRegularFile(expected, LinkOption.NOFOLLOW_LINKS));
+        assertFalse(Files.isSymbolicLink(expected));
+        if (supportsPosix(expected))
+            assertEquals(PosixFilePermissions.fromString("rw-------"),
+                    Files.getPosixFilePermissions(expected, LinkOption.NOFOLLOW_LINKS));
     }
 
     private static boolean supportsPosix(Path path) {

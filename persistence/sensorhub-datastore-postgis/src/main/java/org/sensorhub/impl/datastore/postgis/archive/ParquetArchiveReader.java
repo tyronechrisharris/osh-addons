@@ -13,6 +13,7 @@ import java.nio.file.Path;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
+import java.sql.SQLException;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collection;
@@ -219,7 +220,7 @@ public final class ParquetArchiveReader {
                      duckSession.connection().prepareStatement(plan.sql()), "DuckDB metadata query")) {
             bind(statement, plan.parameters());
             try (ResultSet result = statement.executeQuery()) {
-                while (result.next()) {
+                while (nextCancellable(result)) {
                     ArchiveGeneration generation = generationForFilename(objects, result.getString(1));
                     Integer foiScope = result.getObject(6, Integer.class);
                     Long foiId = result.getObject(7, Long.class);
@@ -256,7 +257,7 @@ public final class ParquetArchiveReader {
                      "DuckDB cold count")) {
             bind(statement, plan.parameters());
             try (ResultSet result = statement.executeQuery()) {
-                long count = result.next() ? result.getLong(1) : 0;
+                long count = nextCancellable(result) ? result.getLong(1) : 0;
                 return filter.getLimit() == Long.MAX_VALUE ? count : Math.min(count, filter.getLimit());
             }
         } catch (Exception e) {
@@ -507,6 +508,19 @@ public final class ParquetArchiveReader {
         }
     }
 
+    /**
+     * Checks cancellation on both sides of a raw DuckDB result-set advance.
+     * Statement.cancel() remains responsible for interrupting a next() call
+     * that is actively executing inside the driver; the second checkpoint
+     * covers results that DuckDB materialized before cancellation arrived.
+     */
+    private static boolean nextCancellable(ResultSet result) throws SQLException {
+        ConnectionManager.throwIfCancellableOperationCancelled();
+        boolean available = result.next();
+        ConnectionManager.throwIfCancellableOperationCancelled();
+        return available;
+    }
+
     private static Throwable closeAndCollect(AutoCloseable closeable, Throwable failure) {
         if (closeable == null)
             return failure;
@@ -676,7 +690,7 @@ public final class ParquetArchiveReader {
             if (closed.get())
                 return false;
             try {
-                if (result.next()) {
+                if (nextCancellable(result)) {
                     ArchiveGeneration generation = generationForFilename(objects, result.getString(1));
                     Integer foiScope = result.getObject(6, Integer.class);
                     Long foiId = result.getObject(7, Long.class);

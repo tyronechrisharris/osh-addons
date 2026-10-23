@@ -104,6 +104,18 @@ final class CancellableConnectionScope implements ICancellableDataStore.Cancella
         return scope == null ? statement : scope.trackStandalone(statement, description);
     }
 
+    /**
+     * Provides a cooperative cancellation point for work performed after a
+     * tracked JDBC call has returned.  JDBC statements can hand callers a
+     * materialized {@link java.sql.ResultSet}; cancelling the statement then
+     * need not interrupt iteration over those already-produced rows.
+     */
+    static void throwIfCancellationRequested() {
+        CancellableConnectionScope scope = CURRENT.get();
+        if (scope != null && scope.cancelled.get())
+            throw new CancellationException("Datastore operation was cancelled");
+    }
+
     private Connection trackConnection(Connection connection) {
         TrackedConnection tracked = new TrackedConnection(connection);
         connections.add(tracked);

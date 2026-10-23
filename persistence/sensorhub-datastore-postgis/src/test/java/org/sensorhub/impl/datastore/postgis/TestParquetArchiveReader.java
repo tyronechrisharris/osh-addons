@@ -5,6 +5,7 @@ import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
 import org.sensorhub.api.common.BigId;
+import org.sensorhub.api.datastore.ICancellableDataStore;
 import org.sensorhub.api.datastore.TemporalFilter;
 import org.sensorhub.api.datastore.obs.ObsFilter;
 import org.sensorhub.impl.datastore.postgis.archive.ArchiveExporter;
@@ -12,6 +13,7 @@ import org.sensorhub.impl.datastore.postgis.archive.ArchiveGeneration;
 import org.sensorhub.impl.datastore.postgis.archive.ParquetArchiveReader;
 import org.sensorhub.impl.datastore.postgis.archive.TieredArchiveConfig;
 import org.sensorhub.impl.datastore.postgis.archive.UtcJdbcTime;
+import org.sensorhub.impl.datastore.postgis.connection.ConnectionManager;
 
 import java.nio.file.Path;
 import java.nio.file.Files;
@@ -23,12 +25,18 @@ import java.sql.DriverManager;
 import java.sql.PreparedStatement;
 import java.sql.Statement;
 import java.time.Instant;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.CancellationException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.stream.Stream;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 
@@ -270,6 +278,66 @@ public class TestParquetArchiveReader {
                 row -> ids.add(row.id()));
 
         assertEquals(List.of(1L), ids);
+    }
+
+    @Test
+    public void cancellationAfterMaterializationClosesCursorSessionAndScratchPromptly()
+            throws Exception {
+        Path root = temporary.newFolder("materialized-cancellation").toPath();
+        ArchiveGeneration generation = writeGeneration(root, "materialized.parquet", new TestRow[]{
+                new TestRow(1, 10, "2026-01-01T00:01:00Z"),
+                new TestRow(2, 10, "2026-01-01T00:02:00Z"),
+                new TestRow(3, 10, "2026-01-01T00:03:00Z")
+        });
+        ParquetArchiveReader reader = new ParquetArchiveReader(root);
+        Path scratchRoot = root.resolveSibling(root.getFileName() + ".duckdb-test-tmp");
+        AtomicReference<Throwable> cancellationFailure = new AtomicReference<>();
+
+        try (ICancellableDataStore.CancellableOperation operation =
+                     ConnectionManager.beginCancellableOperation();
+             Stream<ParquetArchiveReader.ArchivedRow> rows = reader.stream(
+                     List.of(generation), new ObsFilter.Builder().build(),
+                     null, null, Long.MAX_VALUE)) {
+            Iterator<ParquetArchiveReader.ArchivedRow> iterator = rows.iterator();
+            assertTrue(iterator.hasNext());
+            assertEquals(1L, iterator.next().observation().id());
+
+            Thread canceller = new Thread(() -> {
+                try {
+                    operation.cancel();
+                } catch (Throwable error) {
+                    cancellationFailure.set(error);
+                }
+            }, "materialized-duckdb-canceller");
+            canceller.setDaemon(true);
+            canceller.start();
+            canceller.join(3_000L);
+            assertFalse("DuckDB cancellation did not finish promptly", canceller.isAlive());
+            assertNull(cancellationFailure.get());
+
+            long started = System.nanoTime();
+            IllegalStateException cancelled = assertThrows(
+                    IllegalStateException.class, iterator::hasNext);
+            long elapsedMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started);
+            assertTrue("Materialized row iteration did not observe cancellation promptly: " +
+                    elapsedMillis + " ms", elapsedMillis < 500L);
+            assertTrue(cancelled.getCause() instanceof CancellationException);
+            assertEquals(0, reader.getOpenCursorCount());
+        }
+
+        assertEquals(0, reader.getOpenCursorCount());
+        assertTrue(Files.isDirectory(scratchRoot));
+        Path rootLock = scratchRoot.resolve(".oscar-duckdb.lock");
+        try (Stream<Path> children = Files.list(scratchRoot)) {
+            assertEquals("Cancelled materialized query left DuckDB operation scratch",
+                    List.of(rootLock), children.toList());
+        }
+        assertTrue(Files.isRegularFile(rootLock, LinkOption.NOFOLLOW_LINKS));
+        assertFalse(Files.isSymbolicLink(rootLock));
+        if (Files.getFileAttributeView(
+                rootLock, PosixFileAttributeView.class, LinkOption.NOFOLLOW_LINKS) != null)
+            assertEquals(PosixFilePermissions.fromString("rw-------"),
+                    Files.getPosixFilePermissions(rootLock, LinkOption.NOFOLLOW_LINKS));
     }
 
     @Test

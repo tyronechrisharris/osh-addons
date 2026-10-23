@@ -1,11 +1,17 @@
 package org.sensorhub.impl.datastore.postgis.archive;
 
 import java.io.IOException;
+import java.nio.channels.FileChannel;
+import java.nio.channels.FileLock;
+import java.nio.channels.OverlappingFileLockException;
 import java.nio.file.FileVisitResult;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
+import java.nio.file.NoSuchFileException;
+import java.nio.file.OpenOption;
 import java.nio.file.Path;
 import java.nio.file.SimpleFileVisitor;
+import java.nio.file.StandardOpenOption;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.nio.file.attribute.PosixFileAttributeView;
 import java.nio.file.attribute.PosixFilePermission;
@@ -16,17 +22,27 @@ import java.sql.SQLTransientException;
 import java.sql.Statement;
 import java.util.ArrayDeque;
 import java.util.Deque;
-import java.util.TreeMap;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.regex.Pattern;
 
 /** Opens a bounded DuckDB connection with an operation-private spill directory. */
 final class DuckDbResourcePolicy {
     private static final Set<PosixFilePermission> PRIVATE_DIRECTORY_PERMISSIONS =
             PosixFilePermissions.fromString("rwx------");
+    private static final Set<PosixFilePermission> PRIVATE_LOCK_FILE_PERMISSIONS =
+            PosixFilePermissions.fromString("rw-------");
+    static final String ROOT_LOCK_FILE_NAME = ".oscar-duckdb.lock";
+    private static final Pattern SAFE_OPERATION = Pattern.compile("[a-z][a-z0-9-]{0,31}");
+    private static final int CANONICAL_UUID_LENGTH = 36;
+    private static final Object TEMPORARY_ROOT_INITIALIZATION_LOCK = new Object();
+    private static final Map<Path, RootLock> LOCKED_TEMPORARY_ROOTS = new HashMap<>();
     private static final AdmissionController ADMISSION = new AdmissionController();
 
     private DuckDbResourcePolicy() {
@@ -34,7 +50,7 @@ final class DuckDbResourcePolicy {
 
     static Session open(TieredArchiveConfig config, String operation) throws Exception {
         config.validate();
-        if (operation == null || !operation.matches("[a-z][a-z0-9-]{0,31}"))
+        if (operation == null || !SAFE_OPERATION.matcher(operation).matches())
             throw new IllegalArgumentException("Unsafe DuckDB operation name");
 
         Path archiveRoot = Path.of(config.rootDirectory).toAbsolutePath().normalize();
@@ -53,6 +69,7 @@ final class DuckDbResourcePolicy {
             Path realArchiveRoot = Files.exists(archiveRoot, LinkOption.NOFOLLOW_LINKS) ?
                     archiveRoot.toRealPath() : archiveRoot;
             requireDisjointRoots(realArchiveRoot, realTemporaryRoot);
+            initializeTemporaryRoot(realTemporaryRoot);
             operationDirectory = realTemporaryRoot.resolve(
                     operation + '-' + UUID.randomUUID()).normalize();
             if (!operationDirectory.getParent().equals(realTemporaryRoot))
@@ -136,36 +153,172 @@ final class DuckDbResourcePolicy {
                     "DuckDB temporary directory and immutable archive root must be disjoint");
     }
 
+    /**
+     * Exclusively claims the canonical temporary root for this classloader,
+     * then reclaims operation directories left by a prior owner.  The OS lock
+     * remains held for the lifetime of this classloader so another process or
+     * classloader cannot mistake a live directory for stale state.
+     */
+    private static void initializeTemporaryRoot(Path realTemporaryRoot) throws IOException {
+        synchronized (TEMPORARY_ROOT_INITIALIZATION_LOCK) {
+            if (LOCKED_TEMPORARY_ROOTS.containsKey(realTemporaryRoot))
+                return;
+
+            RootLock rootLock = acquireRootLock(realTemporaryRoot);
+            try {
+                try (var children = Files.newDirectoryStream(realTemporaryRoot)) {
+                    for (Path child : children) {
+                        BasicFileAttributes attributes = Files.readAttributes(
+                                child, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
+                        if (!attributes.isDirectory() || attributes.isSymbolicLink() ||
+                                !isRecognizedOperationDirectory(child.getFileName().toString()))
+                            continue;
+                        deleteOperationDirectoryStrict(realTemporaryRoot, child);
+                    }
+                }
+                LOCKED_TEMPORARY_ROOTS.put(realTemporaryRoot, rootLock);
+            } catch (IOException | RuntimeException | Error error) {
+                try {
+                    rootLock.close();
+                } catch (Throwable closeError) {
+                    error.addSuppressed(closeError);
+                }
+                throw error;
+            }
+        }
+    }
+
+    private static RootLock acquireRootLock(Path realTemporaryRoot) throws IOException {
+        Path lockFile = realTemporaryRoot.resolve(ROOT_LOCK_FILE_NAME)
+                .toAbsolutePath().normalize();
+        if (!lockFile.getParent().equals(realTemporaryRoot))
+            throw new IOException("Unsafe DuckDB temporary root lock path: " + lockFile);
+
+        FileChannel channel = null;
+        FileLock lock = null;
+        try {
+            preflightRootLockFile(lockFile);
+            Set<OpenOption> options = Set.of(
+                    StandardOpenOption.CREATE,
+                    StandardOpenOption.READ,
+                    StandardOpenOption.WRITE,
+                    LinkOption.NOFOLLOW_LINKS);
+            if (supportsPosix(realTemporaryRoot))
+                channel = FileChannel.open(lockFile, options,
+                        PosixFilePermissions.asFileAttribute(PRIVATE_LOCK_FILE_PERMISSIONS));
+            else
+                channel = FileChannel.open(lockFile, options);
+            requirePrivateRegularLockFile(lockFile);
+            try {
+                lock = channel.tryLock();
+            } catch (OverlappingFileLockException unavailable) {
+                throw new IOException(
+                        "DuckDB temporary root is already owned in this JVM: " +
+                                realTemporaryRoot, unavailable);
+            }
+            if (lock == null)
+                throw new IOException(
+                        "DuckDB temporary root is already owned by another process: " +
+                                realTemporaryRoot);
+            requirePrivateRegularLockFile(lockFile);
+            return new RootLock(channel, lock);
+        } catch (IOException | RuntimeException | Error error) {
+            if (lock != null) {
+                try {
+                    lock.release();
+                } catch (Throwable releaseError) {
+                    error.addSuppressed(releaseError);
+                }
+            }
+            if (channel != null) {
+                try {
+                    channel.close();
+                } catch (Throwable closeError) {
+                    error.addSuppressed(closeError);
+                }
+            }
+            throw error;
+        }
+    }
+
+    private static void preflightRootLockFile(Path lockFile) throws IOException {
+        try {
+            requirePrivateRegularLockFile(lockFile);
+        } catch (NoSuchFileException absent) {
+            // A positively absent lease is created atomically with mode 0600
+            // by the subsequent no-follow channel open.
+        }
+    }
+
+    private static void requirePrivateRegularLockFile(Path lockFile) throws IOException {
+        BasicFileAttributes attributes = Files.readAttributes(
+                lockFile, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
+        if (!attributes.isRegularFile() || attributes.isSymbolicLink())
+            throw new IOException(
+                    "DuckDB temporary root lock must be a real regular file: " + lockFile);
+        if (!supportsPosix(lockFile))
+            return;
+        Set<PosixFilePermission> permissions = Files.getPosixFilePermissions(
+                lockFile, LinkOption.NOFOLLOW_LINKS);
+        if (!permissions.equals(PRIVATE_LOCK_FILE_PERMISSIONS))
+            throw new IOException(
+                    "DuckDB temporary root lock must have POSIX mode 0600: " + lockFile);
+    }
+
+    private static boolean isRecognizedOperationDirectory(String name) {
+        int separator = name.length() - CANONICAL_UUID_LENGTH - 1;
+        if (separator <= 0 || name.charAt(separator) != '-')
+            return false;
+        String operation = name.substring(0, separator);
+        if (!SAFE_OPERATION.matcher(operation).matches())
+            return false;
+        String candidateUuid = name.substring(separator + 1);
+        try {
+            return UUID.fromString(candidateUuid).toString().equals(candidateUuid);
+        } catch (IllegalArgumentException invalidUuid) {
+            return false;
+        }
+    }
+
     private static void deleteOperationDirectory(Path realTemporaryRoot, Path operationDirectory,
                                                  Throwable primary) {
         try {
-            Path normalized = operationDirectory.toAbsolutePath().normalize();
-            if (!normalized.getParent().equals(realTemporaryRoot) || normalized.equals(realTemporaryRoot))
-                throw new IllegalStateException("Refusing unsafe DuckDB temporary cleanup: " + normalized);
-            // Files.exists() also returns false when existence cannot be
-            // determined. Only a positively confirmed absence may make
-            // cleanup a no-op; inaccessible/indeterminate paths must fail
-            // visibly through walkFileTree below.
-            if (Files.notExists(normalized, LinkOption.NOFOLLOW_LINKS))
-                return;
-            Files.walkFileTree(normalized, new SimpleFileVisitor<>() {
-                @Override
-                public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) throws IOException {
-                    Files.delete(file);
-                    return FileVisitResult.CONTINUE;
-                }
-
-                @Override
-                public FileVisitResult postVisitDirectory(Path directory, IOException error) throws IOException {
-                    if (error != null)
-                        throw error;
-                    Files.delete(directory);
-                    return FileVisitResult.CONTINUE;
-                }
-            });
+            deleteOperationDirectoryStrict(realTemporaryRoot, operationDirectory);
         } catch (Throwable cleanupError) {
             primary.addSuppressed(cleanupError);
         }
+    }
+
+    private static void deleteOperationDirectoryStrict(Path realTemporaryRoot, Path operationDirectory)
+            throws IOException {
+        Path normalized = operationDirectory.toAbsolutePath().normalize();
+        if (!normalized.getParent().equals(realTemporaryRoot) || normalized.equals(realTemporaryRoot))
+            throw new IllegalStateException("Refusing unsafe DuckDB temporary cleanup: " + normalized);
+        // Files.exists() also returns false when existence cannot be
+        // determined. Only a positively confirmed absence may make cleanup a
+        // no-op; inaccessible/indeterminate paths must fail visibly below.
+        if (Files.notExists(normalized, LinkOption.NOFOLLOW_LINKS))
+            return;
+        BasicFileAttributes rootAttributes = Files.readAttributes(
+                normalized, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
+        if (!rootAttributes.isDirectory() || rootAttributes.isSymbolicLink())
+            throw new IllegalStateException(
+                    "Refusing redirected DuckDB temporary cleanup: " + normalized);
+        Files.walkFileTree(normalized, new SimpleFileVisitor<>() {
+            @Override
+            public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) throws IOException {
+                Files.delete(file);
+                return FileVisitResult.CONTINUE;
+            }
+
+            @Override
+            public FileVisitResult postVisitDirectory(Path directory, IOException error) throws IOException {
+                if (error != null)
+                    throw error;
+                Files.delete(directory);
+                return FileVisitResult.CONTINUE;
+            }
+        });
     }
 
     private static void closeQuietly(Connection connection, Throwable primary) {
@@ -180,6 +333,36 @@ final class DuckDbResourcePolicy {
 
     private static String sqlLiteral(String value) {
         return value.replace("'", "''");
+    }
+
+    private static final class RootLock implements AutoCloseable {
+        private final FileChannel channel;
+        private final FileLock lock;
+
+        private RootLock(FileChannel channel, FileLock lock) {
+            this.channel = channel;
+            this.lock = lock;
+        }
+
+        @Override
+        public void close() throws IOException {
+            IOException failure = null;
+            try {
+                lock.release();
+            } catch (IOException error) {
+                failure = error;
+            }
+            try {
+                channel.close();
+            } catch (IOException error) {
+                if (failure == null)
+                    failure = error;
+                else
+                    failure.addSuppressed(error);
+            }
+            if (failure != null)
+                throw failure;
+        }
     }
 
     static final class Session implements AutoCloseable {
