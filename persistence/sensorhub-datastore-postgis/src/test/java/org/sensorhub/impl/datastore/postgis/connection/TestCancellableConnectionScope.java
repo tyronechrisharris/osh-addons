@@ -88,6 +88,96 @@ public class TestCancellableConnectionScope {
     }
 
     @Test
+    public void standaloneStatementParticipatesInCancellationAndClosesExactlyOnce()
+            throws Exception {
+        StatementProbe duckDb = new StatementProbe();
+        try (CancellableConnectionScope scope = CancellableConnectionScope.open();
+             Statement statement = CancellableConnectionScope.trackStandaloneStatement(
+                     duckDb.statement(), "DuckDB cold query")) {
+            scope.cancel();
+            scope.cancel();
+
+            assertEquals(1, duckDb.cancelCount.get());
+            assertThrows(CancellationException.class,
+                    () -> statement.executeQuery("SELECT 1"));
+            statement.close();
+            statement.close();
+        }
+
+        assertEquals(1, duckDb.closeCount.get());
+    }
+
+    @Test
+    public void cancelledScopeRejectsAndCleansUpLateStandaloneStatement() {
+        StatementProbe duckDb = new StatementProbe();
+        try (CancellableConnectionScope scope = CancellableConnectionScope.open()) {
+            scope.cancel();
+            assertThrows(CancellationException.class,
+                    () -> CancellableConnectionScope.trackStandaloneStatement(
+                            duckDb.statement(), "DuckDB metadata query"));
+        }
+
+        assertEquals(1, duckDb.cancelCount.get());
+        assertEquals(1, duckDb.closeCount.get());
+    }
+
+    @Test
+    public void scopeCloseClosesLeakedStandaloneStatement() {
+        StatementProbe duckDb = new StatementProbe();
+        try (CancellableConnectionScope ignored = CancellableConnectionScope.open()) {
+            CancellableConnectionScope.trackStandaloneStatement(
+                    duckDb.statement(), "DuckDB cold count");
+        }
+
+        assertEquals(0, duckDb.cancelCount.get());
+        assertEquals(1, duckDb.closeCount.get());
+    }
+
+    @Test
+    public void concurrentCancelTrackAndStandaloneCloseNeverLeaksOrDoubleCancels()
+            throws Exception {
+        for (int iteration = 0; iteration < 100; iteration++) {
+            StatementProbe duckDb = new StatementProbe();
+            CancellableConnectionScope scope = CancellableConnectionScope.open();
+            CountDownLatch start = new CountDownLatch(1);
+            AtomicReference<Throwable> cancellerFailure = new AtomicReference<>();
+            Thread canceller = new Thread(() -> {
+                try {
+                    assertTrue(start.await(2, TimeUnit.SECONDS));
+                    scope.cancel();
+                    scope.cancel();
+                } catch (Throwable error) {
+                    cancellerFailure.set(error);
+                }
+            }, "standalone-scope-canceller-" + iteration);
+            canceller.start();
+
+            Statement statement = null;
+            try {
+                start.countDown();
+                try {
+                    statement = CancellableConnectionScope.trackStandaloneStatement(
+                            duckDb.statement(), "DuckDB cold query");
+                } catch (CancellationException expected) {
+                    // Cancellation won before registration completed.
+                }
+                if (statement != null)
+                    statement.close();
+                canceller.join(2_000L);
+                assertFalse(canceller.isAlive());
+                assertNull(cancellerFailure.get());
+            } finally {
+                scope.close();
+            }
+
+            assertTrue("A scoped standalone statement must be cancelled at most once",
+                    duckDb.cancelCount.get() <= 1);
+            assertEquals("Every scoped standalone statement must be closed exactly once",
+                    1, duckDb.closeCount.get());
+        }
+    }
+
+    @Test
     public void cancelledScopeRejectsAndAbortsNewConnections() {
         ConnectionProbe late = new ConnectionProbe();
         try (CancellableConnectionScope scope = CancellableConnectionScope.open()) {

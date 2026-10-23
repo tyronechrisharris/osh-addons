@@ -122,6 +122,16 @@ public class ConnectionManager {
         return CancellableConnectionScope.open();
     }
 
+    /**
+     * Adds a private non-PostgreSQL JDBC statement to the current cancellable
+     * datastore operation. With no active scope the original statement is
+     * returned unchanged.
+     */
+    public static <S extends Statement> S trackCancellableStatement(
+            S statement, String description) {
+        return CancellableConnectionScope.trackStandaloneStatement(statement, description);
+    }
+
     public void addBatch(String sqlQuery) {
         batchList.add(sqlQuery);
     }

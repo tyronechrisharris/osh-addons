@@ -30,8 +30,10 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * Thread-bound cancellation scope shared by every PostgreSQL connection
- * manager. Sharing the thread-local scope is important because one logical
- * observation query can borrow connections from linked metadata stores.
+ * manager and private JDBC resources participating in the same logical
+ * datastore operation. Sharing the thread-local scope is important because
+ * one observation query can borrow connections from linked metadata stores
+ * and open a DuckDB archive session.
  */
 final class CancellableConnectionScope implements ICancellableDataStore.CancellableOperation {
     private static final long DEFAULT_CANCELLATION_TIMEOUT_MILLIS = 2_500L;
@@ -59,13 +61,14 @@ final class CancellableConnectionScope implements ICancellableDataStore.Cancella
     private final AtomicBoolean cancelled = new AtomicBoolean();
     private final AtomicBoolean closed = new AtomicBoolean();
     private final Set<TrackedConnection> connections = ConcurrentHashMap.newKeySet();
+    private final Set<TrackedStandaloneStatement> standaloneStatements = ConcurrentHashMap.newKeySet();
     private boolean cancellationAttempted;
     private IllegalStateException cancellationFailure;
     private volatile IllegalStateException closeFailure;
 
     private CancellableConnectionScope(long cancellationTimeout, TimeUnit unit) {
         if (cancellationTimeout <= 0)
-            throw new IllegalArgumentException("PostgreSQL cancellation timeout must be positive");
+            throw new IllegalArgumentException("Datastore cancellation timeout must be positive");
         this.cancellationTimeoutNanos = unit.toNanos(cancellationTimeout);
     }
 
@@ -84,6 +87,21 @@ final class CancellableConnectionScope implements ICancellableDataStore.Cancella
     static Connection track(Connection connection) {
         CancellableConnectionScope scope = CURRENT.get();
         return scope == null ? connection : scope.trackConnection(connection);
+    }
+
+    /**
+     * Tracks a JDBC statement whose connection is private to a non-PostgreSQL
+     * operation, such as one bounded DuckDB archive session.  The returned
+     * proxy unregisters itself on close and participates in the same
+     * operation-wide cancellation deadline as PostgreSQL resources.
+     */
+    static <S extends Statement> S trackStandaloneStatement(S statement, String description) {
+        if (statement == null)
+            throw new IllegalArgumentException("Cancellable statement cannot be null");
+        if (description == null || !description.matches("[A-Za-z0-9][A-Za-z0-9 -]{0,63}"))
+            throw new IllegalArgumentException("Unsafe cancellable statement description");
+        CancellableConnectionScope scope = CURRENT.get();
+        return scope == null ? statement : scope.trackStandalone(statement, description);
     }
 
     private Connection trackConnection(Connection connection) {
@@ -136,10 +154,12 @@ final class CancellableConnectionScope implements ICancellableDataStore.Cancella
         synchronized (cancellationLock) {
             if (!cancellationAttempted) {
                 List<CancellationAction> actions = new ArrayList<>();
+                for (TrackedStandaloneStatement statement : new ArrayList<>(standaloneStatements))
+                    statement.addCancellationAction(actions);
                 for (TrackedConnection connection : new ArrayList<>(connections))
                     connection.addCancellationActions(actions);
                 cancellationFailure = runBoundedActions(
-                        actions, "Could not cancel every scoped PostgreSQL resource");
+                        actions, "Could not cancel every scoped datastore resource");
                 cancellationAttempted = true;
             }
             if (cancellationFailure != null)
@@ -170,19 +190,29 @@ final class CancellableConnectionScope implements ICancellableDataStore.Cancella
                 cancel();
             } catch (RuntimeException error) {
                 failure = appendFailure(
-                        "Cancellable PostgreSQL operation ended with resource failures",
+                        "Cancellable datastore operation ended with resource failures",
                         failure, error);
             }
         }
 
         boolean closeFailed = false;
+        for (TrackedStandaloneStatement statement : new ArrayList<>(standaloneStatements)) {
+            try {
+                statement.close();
+            } catch (RuntimeException error) {
+                closeFailed = true;
+                failure = appendFailure(
+                        "Cancellable datastore operation ended with resource failures",
+                        failure, error);
+            }
+        }
         for (TrackedConnection connection : new ArrayList<>(connections)) {
             try {
                 connection.close();
             } catch (RuntimeException error) {
                 closeFailed = true;
                 failure = appendFailure(
-                        "Cancellable PostgreSQL operation ended with resource failures",
+                        "Cancellable datastore operation ended with resource failures",
                         failure, error);
             }
         }
@@ -193,7 +223,7 @@ final class CancellableConnectionScope implements ICancellableDataStore.Cancella
                 cancel();
             } catch (RuntimeException error) {
                 failure = appendFailure(
-                        "Cancellable PostgreSQL operation ended with resource failures",
+                        "Cancellable datastore operation ended with resource failures",
                         failure, error);
             }
             // A JDBC abort normally makes a second Hikari close cheap and
@@ -204,7 +234,16 @@ final class CancellableConnectionScope implements ICancellableDataStore.Cancella
                     connection.close();
                 } catch (RuntimeException error) {
                     failure = appendFailure(
-                            "Cancellable PostgreSQL operation ended with resource failures",
+                            "Cancellable datastore operation ended with resource failures",
+                            failure, error);
+                }
+            }
+            for (TrackedStandaloneStatement statement : new ArrayList<>(standaloneStatements)) {
+                try {
+                    statement.close();
+                } catch (RuntimeException error) {
+                    failure = appendFailure(
+                            "Cancellable datastore operation ended with resource failures",
                             failure, error);
                 }
             }
@@ -222,7 +261,7 @@ final class CancellableConnectionScope implements ICancellableDataStore.Cancella
             return;
         synchronized (cancellationLock) {
             cancellationFailure = appendFailure(
-                    "Could not cancel every scoped PostgreSQL resource",
+                    "Could not cancel every scoped datastore resource",
                     cancellationFailure, failure);
         }
     }
@@ -267,7 +306,7 @@ final class CancellableConnectionScope implements ICancellableDataStore.Cancella
                 interrupted = true;
                 failure = appendFailure(failureMessage, failure,
                         new IllegalStateException(
-                                "Interrupted while waiting for PostgreSQL cancellation", error));
+                                "Interrupted while waiting for datastore cancellation", error));
                 break;
             }
             if (completed == null)
@@ -336,6 +375,119 @@ final class CancellableConnectionScope implements ICancellableDataStore.Cancella
         private CancellationAction(String description, Runnable runnable) {
             this.description = description;
             this.runnable = runnable;
+        }
+    }
+
+    private <S extends Statement> S trackStandalone(S statement, String description) {
+        TrackedStandaloneStatement tracked = new TrackedStandaloneStatement(statement, description);
+        standaloneStatements.add(tracked);
+        if (cancelled.get()) {
+            IllegalStateException failure = runBoundedActions(
+                    List.of(new CancellationAction(
+                            "cancel and close " + description + " acquired after cancellation",
+                            () -> {
+                                IllegalStateException cleanupFailure = null;
+                                try {
+                                    tracked.cancel();
+                                } catch (RuntimeException error) {
+                                    cleanupFailure = appendFailure(
+                                            "Could not clean up a statement acquired after cancellation",
+                                            cleanupFailure, error);
+                                }
+                                try {
+                                    tracked.close();
+                                } catch (RuntimeException error) {
+                                    cleanupFailure = appendFailure(
+                                            "Could not clean up a statement acquired after cancellation",
+                                            cleanupFailure, error);
+                                }
+                                if (cleanupFailure != null)
+                                    throw cleanupFailure;
+                            })),
+                    "Could not clean up a statement acquired after cancellation");
+            recordCancellationFailure(failure);
+            CancellationException cancellation =
+                    new CancellationException("Datastore operation was cancelled");
+            if (failure != null)
+                cancellation.addSuppressed(failure);
+            throw cancellation;
+        }
+        return tracked.proxy();
+    }
+
+    private final class TrackedStandaloneStatement {
+        private final Statement delegate;
+        private final String description;
+        private final Statement proxy;
+        private final AtomicBoolean cancelAttempted = new AtomicBoolean();
+        private volatile boolean statementClosed;
+        private volatile boolean statementCancelled;
+
+        TrackedStandaloneStatement(Statement delegate, String description) {
+            this.delegate = delegate;
+            this.description = description;
+            Class<?> statementType = delegate instanceof CallableStatement
+                    ? CallableStatement.class
+                    : delegate instanceof PreparedStatement
+                    ? PreparedStatement.class : Statement.class;
+            this.proxy = (Statement) Proxy.newProxyInstance(
+                    Statement.class.getClassLoader(), new Class<?>[]{statementType},
+                    (ignored, method, args) -> {
+                        if (method.getDeclaringClass() == Object.class) {
+                            return switch (method.getName()) {
+                                case "equals" -> ignored == args[0];
+                                case "hashCode" -> System.identityHashCode(ignored);
+                                case "toString" -> "Scoped[" + delegate + "]";
+                                default -> throw new UnsupportedOperationException(method.getName());
+                            };
+                        }
+                        if (method.getName().equals("close") && method.getParameterCount() == 0) {
+                            close();
+                            return null;
+                        }
+                        if (cancelled.get())
+                            throw new CancellationException("Datastore operation was cancelled");
+                        try {
+                            return method.invoke(delegate, args);
+                        } catch (InvocationTargetException error) {
+                            throw error.getCause();
+                        }
+                    });
+        }
+
+        @SuppressWarnings("unchecked")
+        <S extends Statement> S proxy() {
+            return (S) proxy;
+        }
+
+        void addCancellationAction(List<CancellationAction> actions) {
+            actions.add(new CancellationAction(
+                    "cancel scoped " + description + " " + identity(delegate), this::cancel));
+        }
+
+        void cancel() {
+            if (statementClosed || statementCancelled)
+                return;
+            if (!cancelAttempted.compareAndSet(false, true))
+                return;
+            try {
+                delegate.cancel();
+                statementCancelled = true;
+            } catch (SQLException error) {
+                throw new IllegalStateException("Could not cancel scoped " + description, error);
+            }
+        }
+
+        synchronized void close() {
+            if (statementClosed)
+                return;
+            try {
+                delegate.close();
+                statementClosed = true;
+                standaloneStatements.remove(this);
+            } catch (SQLException error) {
+                throw new IllegalStateException("Could not close scoped " + description, error);
+            }
         }
     }
 

@@ -5,6 +5,7 @@ import org.sensorhub.api.common.BigId;
 import org.sensorhub.api.datastore.TemporalFilter;
 import org.sensorhub.api.datastore.obs.ObsFilter;
 import org.sensorhub.impl.datastore.postgis.builder.filter.JsonCqlEvaluator;
+import org.sensorhub.impl.datastore.postgis.connection.ConnectionManager;
 
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
@@ -174,7 +175,8 @@ public final class ParquetArchiveReader {
         ResultSet result = null;
         try {
             duckSession = DuckDbResourcePolicy.open(config, "cold-query");
-            statement = duckSession.connection().prepareStatement(plan.sql());
+            statement = ConnectionManager.trackCancellableStatement(
+                    duckSession.connection().prepareStatement(plan.sql()), "DuckDB cold query");
             bind(statement, plan.parameters());
             result = statement.executeQuery();
             RowCursor cursor = new RowCursor(duckSession, statement, result, objects);
@@ -211,7 +213,8 @@ public final class ParquetArchiveReader {
             return;
         QueryPlan plan = queryPlan(objects, filter, allowedDataStreams, allowedFois, false, true, limit);
         try (DuckDbResourcePolicy.Session duckSession = DuckDbResourcePolicy.open(config, "metadata-query");
-             PreparedStatement statement = duckSession.connection().prepareStatement(plan.sql())) {
+             PreparedStatement statement = ConnectionManager.trackCancellableStatement(
+                     duckSession.connection().prepareStatement(plan.sql()), "DuckDB metadata query")) {
             bind(statement, plan.parameters());
             try (ResultSet result = statement.executeQuery()) {
                 while (result.next()) {
@@ -244,8 +247,10 @@ public final class ParquetArchiveReader {
         ObsFilter unbounded = ObsFilter.Builder.from(filter).withLimit(Long.MAX_VALUE).build();
         QueryPlan plan = queryPlan(objects, unbounded, allowedDataStreams, allowedFois, false, true, Long.MAX_VALUE);
         try (DuckDbResourcePolicy.Session duckSession = DuckDbResourcePolicy.open(config, "cold-count");
-             PreparedStatement statement = duckSession.connection().prepareStatement(
-                     "SELECT count(*) FROM (" + plan.sql() + ") archive_matches")) {
+             PreparedStatement statement = ConnectionManager.trackCancellableStatement(
+                     duckSession.connection().prepareStatement(
+                             "SELECT count(*) FROM (" + plan.sql() + ") archive_matches"),
+                     "DuckDB cold count")) {
             bind(statement, plan.parameters());
             try (ResultSet result = statement.executeQuery()) {
                 long count = result.next() ? result.getLong(1) : 0;

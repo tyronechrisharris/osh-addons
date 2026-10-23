@@ -3,6 +3,8 @@ package org.sensorhub.impl.datastore.postgis.archive;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
+import org.sensorhub.api.datastore.ICancellableDataStore;
+import org.sensorhub.impl.datastore.postgis.connection.ConnectionManager;
 
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
@@ -12,6 +14,10 @@ import java.nio.file.attribute.PosixFilePermissions;
 import java.sql.ResultSet;
 import java.sql.SQLTransientException;
 import java.sql.Statement;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
@@ -77,6 +83,80 @@ public class TestDuckDbResourcePolicy {
         }
         assertFalse(Files.exists(firstDirectory));
         assertFalse(Files.exists(secondDirectory));
+    }
+
+    @Test
+    public void scopedCancellationInterruptsLongQueryAndRemovesScratchDirectory()
+            throws Exception {
+        Path temporaryRoot = temporary.newFolder("cancelled-query-spill").toPath();
+        TieredArchiveConfig config = config(temporaryRoot);
+        AtomicReference<ICancellableDataStore.CancellableOperation> operation =
+                new AtomicReference<>();
+        AtomicReference<Path> operationDirectory = new AtomicReference<>();
+        AtomicReference<Throwable> workerFailure = new AtomicReference<>();
+        AtomicBoolean completedNormally = new AtomicBoolean();
+        CountDownLatch queryReady = new CountDownLatch(1);
+        CountDownLatch workerExited = new CountDownLatch(1);
+
+        Thread worker = new Thread(() -> {
+            try (ICancellableDataStore.CancellableOperation scope =
+                         ConnectionManager.beginCancellableOperation();
+                 DuckDbResourcePolicy.Session session =
+                         DuckDbResourcePolicy.open(config, "metadata-query");
+                 Statement statement = ConnectionManager.trackCancellableStatement(
+                         session.connection().createStatement(), "DuckDB metadata query")) {
+                operation.set(scope);
+                operationDirectory.set(session.operationDirectory());
+                queryReady.countDown();
+                try (ResultSet rows = statement.executeQuery(
+                        "SELECT sum(hash(i)) FROM range(0, 1000000000000) values(i)")) {
+                    rows.next();
+                }
+                completedNormally.set(true);
+            } catch (Throwable error) {
+                workerFailure.set(error);
+            } finally {
+                workerExited.countDown();
+            }
+        }, "long-cold-statistics-query");
+        worker.setDaemon(true);
+        worker.start();
+
+        long elapsedMillis;
+        try {
+            assertTrue("The DuckDB statement must be ready before cancellation",
+                    queryReady.await(5, TimeUnit.SECONDS));
+            Thread.sleep(200L);
+            long started = System.nanoTime();
+            operation.get().cancel();
+            assertTrue("DuckDB cancellation must release the statistics worker inside the stop budget",
+                    workerExited.await(5, TimeUnit.SECONDS));
+            elapsedMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started);
+        } finally {
+            ICancellableDataStore.CancellableOperation active = operation.get();
+            if (worker.isAlive() && active != null) {
+                try {
+                    active.cancel();
+                } catch (RuntimeException ignored) {
+                    // Preserve the original assertion while still requesting
+                    // best-effort cleanup of a failed cancellation fixture.
+                }
+            }
+            worker.interrupt();
+            worker.join(5_000L);
+        }
+
+        assertFalse("The cancelled statistics worker must terminate", worker.isAlive());
+        assertFalse("The cancelled cold query must not complete normally", completedNormally.get());
+        assertTrue("The in-flight DuckDB query must observe cancellation",
+                workerFailure.get() != null);
+        assertTrue("DuckDB cancellation must preserve headroom inside the 5 second statistics stop budget: "
+                + elapsedMillis + " ms", elapsedMillis < 4_000L);
+        assertFalse("Closing the cancelled session must remove its private scratch directory",
+                Files.exists(operationDirectory.get(), LinkOption.NOFOLLOW_LINKS));
+        try (var children = Files.list(temporaryRoot)) {
+            assertEquals("No cancelled DuckDB scratch directory may remain", 0L, children.count());
+        }
     }
 
     @Test
