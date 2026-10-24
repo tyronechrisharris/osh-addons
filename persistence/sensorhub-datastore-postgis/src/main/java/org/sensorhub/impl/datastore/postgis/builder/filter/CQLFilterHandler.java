@@ -14,10 +14,18 @@ import org.geotools.api.filter.Not;
 import org.geotools.api.filter.expression.PropertyName;
 import org.geotools.api.filter.expression.Literal;
 
+import java.math.BigDecimal;
+import java.time.Instant;
+import java.time.ZoneOffset;
+import java.time.format.DateTimeParseException;
 import java.util.ArrayList;
 import java.util.List;
 
 public class CQLFilterHandler {
+    private static final String RFC3339_INSTANT_PATTERN =
+            "^[0-9]{4}-(0[1-9]|1[0-2])-([0-2][0-9]|3[01])T" +
+            "([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](\\.[0-9]{1,9})?" +
+            "(Z|[+-]((0[0-9]|1[0-7]):[0-5][0-9]|18:00))$";
 
     private StringBuilder whereClause;
     private List<Object> parameters;
@@ -143,25 +151,42 @@ public class CQLFilterHandler {
     private void handleGreaterThan(PropertyIsGreaterThan filter) {
         String propertyName = getPropertyName(filter.getExpression1());
         Object value = getLiteralValue(filter.getExpression2());
-        appendNumericComparison(propertyName, ">", value);
+        appendOrderedComparison(propertyName, ">", value);
     }
 
     private void handleGreaterThanOrEqual(PropertyIsGreaterThanOrEqualTo filter) {
         String propertyName = getPropertyName(filter.getExpression1());
         Object value = getLiteralValue(filter.getExpression2());
-        appendNumericComparison(propertyName, ">=", value);
+        appendOrderedComparison(propertyName, ">=", value);
     }
 
     private void handleLessThan(PropertyIsLessThan filter) {
         String propertyName = getPropertyName(filter.getExpression1());
         Object value = getLiteralValue(filter.getExpression2());
-        appendNumericComparison(propertyName, "<", value);
+        appendOrderedComparison(propertyName, "<", value);
     }
 
     private void handleLessThanOrEqual(PropertyIsLessThanOrEqualTo filter) {
         String propertyName = getPropertyName(filter.getExpression1());
         Object value = getLiteralValue(filter.getExpression2());
-        appendNumericComparison(propertyName, "<=", value);
+        appendOrderedComparison(propertyName, "<=", value);
+    }
+
+    private void appendOrderedComparison(String propertyName, String operator, Object value) {
+        if (value instanceof Number || value instanceof String text && isDecimal(text)) {
+            appendNumericComparison(propertyName, operator, value);
+        } else if (value instanceof String text) {
+            Instant instant = parseRfc3339Instant(text);
+            if (instant != null)
+                appendInstantComparison(propertyName, operator, instant);
+            else
+                whereClause.append("FALSE");
+        } else {
+            // Ordered string comparison is intentionally limited to valid instants. In
+            // particular, do not turn malformed dates or arbitrary strings into a broad
+            // lexical comparison over JSON values.
+            whereClause.append("FALSE");
+        }
     }
 
     /**
@@ -179,6 +204,50 @@ public class CQLFilterHandler {
                 .append(buildJsonPathExtract(propertyName)).append(")::numeric ")
                 .append(operator).append(" ?::numeric)");
         parameters.add(value);
+    }
+
+    /** Compares ISO-8601 strings as instants without casting invalid row values. */
+    private void appendInstantComparison(String propertyName, String operator, Instant value) {
+        String[] parts = propertyName.split("\\.");
+        StringBuilder jsonbPath = new StringBuilder("result");
+        for (String part : parts) {
+            jsonbPath.append("->'").append(escapeJsonKey(part)).append("'");
+        }
+        String extracted = buildJsonPathExtract(propertyName);
+        whereClause.append("CASE WHEN jsonb_typeof(").append(jsonbPath)
+                .append(") = 'string' AND ").append(extracted).append(" ~ '")
+                .append(RFC3339_INSTANT_PATTERN).append("' AND pg_input_is_valid(")
+                .append(extracted).append(", 'timestamp with time zone') AND ")
+                .append("pg_input_is_valid(CAST(? AS text), 'timestamp with time zone') ")
+                .append("THEN CASE WHEN (").append(extracted)
+                .append(")::timestamptz >= '0001-01-01T00:00:00Z'::timestamptz AND (")
+                .append(extracted).append(")::timestamptz < '10000-01-01T00:00:00Z'::timestamptz ")
+                .append("THEN (").append(extracted).append(")::timestamptz ")
+                .append(operator).append(" CAST(? AS timestamptz) ELSE FALSE END ELSE FALSE END");
+        String canonical = value.toString();
+        parameters.add(canonical);
+        parameters.add(canonical);
+    }
+
+    private Instant parseRfc3339Instant(String value) {
+        if (!value.matches(RFC3339_INSTANT_PATTERN))
+            return null;
+        try {
+            Instant instant = Instant.parse(value);
+            int utcYear = instant.atOffset(ZoneOffset.UTC).getYear();
+            return utcYear >= 1 && utcYear <= 9999 ? instant : null;
+        } catch (DateTimeParseException error) {
+            return null;
+        }
+    }
+
+    private boolean isDecimal(String value) {
+        try {
+            new BigDecimal(value);
+            return true;
+        } catch (NumberFormatException error) {
+            return false;
+        }
     }
 
     private void handleLike(PropertyIsLike filter) {

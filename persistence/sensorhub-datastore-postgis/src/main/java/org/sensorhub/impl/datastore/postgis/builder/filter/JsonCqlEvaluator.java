@@ -20,10 +20,18 @@ import org.geotools.api.filter.expression.Literal;
 import org.geotools.api.filter.expression.PropertyName;
 
 import java.math.BigDecimal;
+import java.time.Instant;
+import java.time.ZoneOffset;
+import java.time.format.DateTimeParseException;
 import java.util.regex.Pattern;
 
 /** Evaluates the supported OSCAR CQL subset directly against archived JSON. */
 public final class JsonCqlEvaluator {
+    private static final Pattern RFC3339_INSTANT = Pattern.compile(
+            "^[0-9]{4}-(0[1-9]|1[0-2])-([0-2][0-9]|3[01])T" +
+            "([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](\\.[0-9]{1,9})?" +
+            "(Z|[+-]((0[0-9]|1[0-7]):[0-5][0-9]|18:00))$");
+
     private JsonCqlEvaluator() {
     }
 
@@ -69,16 +77,12 @@ public final class JsonCqlEvaluator {
         if (filter instanceof PropertyIsNotEqualTo)
             return expected == null ? !absent : !absent && sameScalarType(actual, expected) &&
                     !equalsScalar(actual, expected, filter.isMatchingCase());
-        if (absent || !actual.isJsonPrimitive() || !actual.getAsJsonPrimitive().isNumber())
+        if (absent || !actual.isJsonPrimitive())
             return false;
-        BigDecimal left = actual.getAsBigDecimal();
-        BigDecimal right;
-        try {
-            right = expected instanceof Number ? new BigDecimal(expected.toString()) : new BigDecimal(String.valueOf(expected));
-        } catch (NumberFormatException error) {
+
+        Integer order = orderedScalarComparison(actual, expected);
+        if (order == null)
             return false;
-        }
-        int order = left.compareTo(right);
         if (filter instanceof PropertyIsGreaterThan)
             return order > 0;
         if (filter instanceof PropertyIsGreaterThanOrEqualTo)
@@ -88,6 +92,35 @@ public final class JsonCqlEvaluator {
         if (filter instanceof PropertyIsLessThanOrEqualTo)
             return order <= 0;
         throw new IllegalArgumentException("Unsupported archived CQL comparison: " + filter.getClass().getName());
+    }
+
+    private static Integer orderedScalarComparison(JsonElement actual, Object expected) {
+        if (actual.getAsJsonPrimitive().isNumber() &&
+                (expected instanceof Number || expected instanceof String)) {
+            try {
+                return actual.getAsBigDecimal().compareTo(new BigDecimal(expected.toString()));
+            } catch (NumberFormatException error) {
+                return null;
+            }
+        }
+        if (expected instanceof String expectedText && actual.getAsJsonPrimitive().isString()) {
+            Instant left = parseRfc3339Instant(actual.getAsString());
+            Instant right = parseRfc3339Instant(expectedText);
+            return left != null && right != null ? left.compareTo(right) : null;
+        }
+        return null;
+    }
+
+    private static Instant parseRfc3339Instant(String value) {
+        if (!RFC3339_INSTANT.matcher(value).matches())
+            return null;
+        try {
+            Instant instant = Instant.parse(value);
+            int utcYear = instant.atOffset(ZoneOffset.UTC).getYear();
+            return utcYear >= 1 && utcYear <= 9999 ? instant : null;
+        } catch (DateTimeParseException error) {
+            return null;
+        }
     }
 
     private static boolean like(PropertyIsLike filter, JsonObject json) {

@@ -422,6 +422,48 @@ public class TestParquetArchiveReader {
     }
 
     @Test
+    public void cqlOrdersIsoInstantsAcrossOffsetsAndRejectsMalformedStrings() throws Exception {
+        Path root = temporary.newFolder("cql-instant-ordering").toPath();
+        ArchiveGeneration generation = writeGeneration(root, "instant-ordering.parquet", new TestRow[]{
+                new TestRow(1, 10, "2026-01-01T00:01:00Z",
+                        "{\"occurredAt\":\"2026-01-01T11:59:59.581Z\",\"value\":9}"),
+                new TestRow(2, 10, "2026-01-01T00:02:00Z",
+                        "{\"occurredAt\":\"2026-01-01T12:00:00.581Z\",\"value\":10}"),
+                new TestRow(3, 10, "2026-01-01T00:03:00Z",
+                        "{\"occurredAt\":\"2026-01-01T08:00:01.581-04:00\",\"value\":11}"),
+                new TestRow(4, 10, "2026-01-01T00:04:00Z",
+                        "{\"occurredAt\":\"not-a-time\",\"value\":12}"),
+                new TestRow(5, 10, "2026-01-01T00:05:00Z",
+                        "{\"occurredAt\":\"zebra\",\"value\":13}"),
+                new TestRow(6, 10, "2026-01-01T00:06:00Z",
+                        "{\"occurredAt\":20260101,\"value\":14}"),
+                new TestRow(7, 10, "2026-01-01T00:07:00Z",
+                        "{\"occurredAt\":\"today\",\"value\":15}"),
+                new TestRow(8, 10, "2026-01-01T00:08:00Z",
+                        "{\"occurredAt\":\"infinity\",\"value\":16}"),
+                new TestRow(9, 10, "2026-01-01T00:09:00Z",
+                        "{\"occurredAt\":\"2026-01-01\",\"value\":17}")
+        });
+        ParquetArchiveReader reader = new ParquetArchiveReader(root);
+
+        assertEquals(List.of(1L), matchingIds(reader, generation,
+                "occurredAt < '2026-01-01T12:00:00.581Z'"));
+        assertEquals(List.of(1L, 2L), matchingIds(reader, generation,
+                "occurredAt <= '2026-01-01T12:00:00.581Z'"));
+        assertEquals(List.of(3L), matchingIds(reader, generation,
+                "occurredAt > '2026-01-02T06:00:00.581+18:00'"));
+        assertEquals(List.of(2L, 3L), matchingIds(reader, generation,
+                "occurredAt >= '2026-01-01T07:00:00.581-05:00'"));
+
+        assertTrue(matchingIds(reader, generation, "occurredAt > 'not-a-time'").isEmpty());
+        assertTrue(matchingIds(reader, generation, "occurredAt > 'aardvark'").isEmpty());
+        assertEquals(List.of(2L, 3L, 4L, 5L, 6L, 7L, 8L, 9L),
+                matchingIds(reader, generation, "value >= 10"));
+        assertEquals(List.of(2L, 3L, 4L, 5L, 6L, 7L, 8L, 9L),
+                matchingIds(reader, generation, "value >= '10'"));
+    }
+
+    @Test
     public void cursorCloseReportsSpillCleanupFailure() throws Exception {
         Path root = temporary.newFolder("cleanup-failure-archive").toPath();
         Path spillRoot = temporary.newFolder("cleanup-failure-spill").toPath();
@@ -531,7 +573,7 @@ public class TestParquetArchiveReader {
                     insert.setLong(2, row.dataStreamId());
                     UtcJdbcTime.setDuckDbInstant(insert, 3, time);
                     UtcJdbcTime.setDuckDbInstant(insert, 4, time);
-                    insert.setString(5, "{\"value\":" + row.id() + "}");
+                    insert.setString(5, row.resultJson());
                     insert.addBatch();
                 }
                 insert.executeBatch();
@@ -545,6 +587,15 @@ public class TestParquetArchiveReader {
                 Instant.parse("2026-01-01T00:00:00Z"), Instant.parse("2026-01-01T01:00:00Z"),
                 root.relativize(object), ArchiveExporter.sha256(object), rows.length,
                 minimum, maximum, "ACTIVE", true);
+    }
+
+    private List<Long> matchingIds(ParquetArchiveReader reader,
+                                   ArchiveGeneration generation,
+                                   String cql) {
+        ObsFilter filter = new ObsFilter.Builder().withCQLFilter(cql).build();
+        return reader.read(generation, filter, null, null).stream()
+                .map(row -> row.observation().id())
+                .toList();
     }
 
     private String queryPlanSql(ParquetArchiveReader reader,
@@ -566,5 +617,9 @@ public class TestParquetArchiveReader {
         return (String) sql.invoke(plan);
     }
 
-    private record TestRow(long id, long dataStreamId, String time) {}
+    private record TestRow(long id, long dataStreamId, String time, String resultJson) {
+        private TestRow(long id, long dataStreamId, String time) {
+            this(id, dataStreamId, time, "{\"value\":" + id + "}");
+        }
+    }
 }

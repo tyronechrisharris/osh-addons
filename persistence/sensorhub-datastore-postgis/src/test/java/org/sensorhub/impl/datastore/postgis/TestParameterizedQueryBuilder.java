@@ -122,6 +122,60 @@ public class TestParameterizedQueryBuilder {
     }
 
     @Test
+    public void testObsCqlOrderedComparisonsUseTypedInstantOrNumericPaths() {
+        QueryBuilderObsStore builder = new QueryBuilderObsStore("obs");
+        String offsetCutoff = "2026-01-02T06:00:00.581+18:00";
+        String canonicalCutoff = "2026-01-01T12:00:00.581Z";
+
+        for (String operator : List.of("<", "<=", ">", ">=")) {
+            ParameterizedQuery temporal = builder.createParameterizedSelectEntriesQuery(
+                    new ObsFilter.Builder()
+                            .withCQLFilter("occurredAt " + operator + " '" + offsetCutoff + "'")
+                            .build(),
+                    null);
+
+            assertTrue(temporal.sql().contains("jsonb_typeof(result->'occurredAt') = 'string'"));
+            assertTrue(temporal.sql().contains("result->>'occurredAt' ~ '^[0-9]{4}-"));
+            assertTrue(temporal.sql().contains("(\\.[0-9]{1,9})?"));
+            assertTrue(temporal.sql().contains(
+                    "pg_input_is_valid(result->>'occurredAt', 'timestamp with time zone')"));
+            assertTrue(temporal.sql().contains(
+                    "pg_input_is_valid(CAST(? AS text), 'timestamp with time zone')"));
+            assertTrue(temporal.sql().contains(
+                    "(result->>'occurredAt')::timestamptz " + operator + " CAST(? AS timestamptz)"));
+            assertTrue(temporal.sql().contains("ELSE FALSE END"));
+            assertEquals(List.of(canonicalCutoff, canonicalCutoff), temporal.parameters());
+        }
+
+        ParameterizedQuery numeric = builder.createParameterizedSelectEntriesQuery(
+                new ObsFilter.Builder().withCQLFilter("value >= 10").build(), null);
+        assertTrue(numeric.sql().contains("jsonb_typeof(result->'value') = 'number'"));
+        assertTrue(numeric.sql().contains("(result->>'value')::numeric >= ?::numeric"));
+        assertEquals("10", numeric.parameters().get(0).toString());
+
+        ParameterizedQuery quotedNumeric = builder.createParameterizedSelectEntriesQuery(
+                new ObsFilter.Builder().withCQLFilter("value >= '10'").build(), null);
+        assertTrue(quotedNumeric.sql().contains("(result->>'value')::numeric >= ?::numeric"));
+        assertEquals(List.of("10"), quotedNumeric.parameters());
+
+        ParameterizedQuery malformed = builder.createParameterizedSelectEntriesQuery(
+                new ObsFilter.Builder().withCQLFilter("occurredAt > 'not-a-time'").build(), null);
+        assertTrue(malformed.sql().contains("WHERE FALSE"));
+        assertTrue(malformed.parameters().isEmpty());
+        assertFalse(malformed.sql().contains("occurredAt') >"));
+
+        for (String unsupported : List.of("today", "infinity", "2026-01-01",
+                "0000-01-01T00:00:00Z")) {
+            ParameterizedQuery rejected = builder.createParameterizedSelectEntriesQuery(
+                    new ObsFilter.Builder()
+                            .withCQLFilter("occurredAt > '" + unsupported + "'")
+                            .build(), null);
+            assertTrue(rejected.sql().contains("WHERE FALSE"));
+            assertTrue(rejected.parameters().isEmpty());
+        }
+    }
+
+    @Test
     public void testObservationTimeBoundsArePreservedForSelectAndRemove() {
         Instant start = Instant.parse("2026-01-01T00:00:00Z");
         Instant end = Instant.parse("2026-01-02T00:00:00Z");
