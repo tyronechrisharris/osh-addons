@@ -35,12 +35,39 @@ import static org.sensorhub.api.datastore.obs.IObsStore.ObsField.*;
 public class QueryBuilderObsStore extends QueryBuilder {
 
     public final static String OBS_STORE_TABLE_NAME = "obs";
+    private final boolean genericPayloadIndexEnabled;
+
     public QueryBuilderObsStore() {
-        this(OBS_STORE_TABLE_NAME);
+        this(OBS_STORE_TABLE_NAME, true);
     }
 
     public QueryBuilderObsStore(String tableName) {
+        this(tableName, true);
+    }
+
+    /**
+     * @param genericPayloadIndexEnabled false only for a fresh OSCAR
+     *        PARQUET_PRIMARY table. Purpose-built event indexes remain because
+     *        mutable occupancy/alarm workflow rows stay in PostgreSQL.
+     */
+    public QueryBuilderObsStore(String tableName, boolean genericPayloadIndexEnabled) {
         super(tableName);
+        this.genericPayloadIndexEnabled = genericPayloadIndexEnabled;
+    }
+
+    public String[] createInitializationQueries() {
+        List<String> queries = new ArrayList<>();
+        queries.add(createTableQuery());
+        if (genericPayloadIndexEnabled)
+            queries.add(createDataIndexQuery());
+        queries.add(createDataStreamIndexQuery());
+        queries.add(createPhenomenonTimeIndexQuery());
+        queries.add(createPhenomenonTimeDataStreamIdIndexQuery());
+        queries.add(createResultTimeIndexQuery());
+        queries.add(createResultTimeDataStreamIdIndexQuery());
+        queries.add(createFoiIndexQuery());
+        queries.add(createUniqueConstraint());
+        return queries.toArray(String[]::new);
     }
 
     public String createTableQuery() {

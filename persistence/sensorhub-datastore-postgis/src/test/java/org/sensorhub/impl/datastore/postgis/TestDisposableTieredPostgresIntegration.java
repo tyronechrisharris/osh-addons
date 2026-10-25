@@ -418,6 +418,121 @@ public class TestDisposableTieredPostgresIntegration extends TestPostgisObsStore
     }
 
     @Test
+    public void parquetPrimaryFreshTableUsesLeanIndexesAndSurvivesColdRestart() throws Exception {
+        String archiveRoot = archiveConfig.rootDirectory;
+        String temporaryRoot = archiveConfig.duckDbTemporaryDirectory;
+
+        // Recreate the disposable table so this test proves the schema chosen
+        // at first startup rather than observing indexes left by an upgrade.
+        postgisObsStore.close();
+        dropDisposableTieredTables(TABLE);
+        allDataStreams.clear();
+        allObs.clear();
+
+        TieredArchiveConfig primaryConfig = new TieredArchiveConfig();
+        primaryConfig.rootDirectory = archiveRoot;
+        primaryConfig.duckDbTemporaryDirectory = temporaryRoot;
+        primaryConfig.storageMode = TieredArchiveConfig.StorageMode.PARQUET_PRIMARY;
+        primaryConfig.outputNames = List.of("gammaCounts");
+        primaryConfig.parquetPrimaryArchiveDelayMinutes = 1;
+        primaryConfig.maximumGenerationsPerCycle = 1;
+        primaryConfig.maximumVerificationsPerCycle = 1;
+        primaryConfig.maximumDeletionsPerCycle = 1;
+        primaryConfig.rollbackGraceDays = 1;
+        primaryConfig.deleteHotAfterArchive = true;
+        archiveConfig = primaryConfig;
+
+        TestableTieredStore tiered = new TestableTieredStore(
+                url, DB_NAME, login, password, TABLE, DATABASE_NUM,
+                IdProviderType.SEQUENTIAL, archiveConfig);
+        postgisObsStore = tiered;
+        obsStore = tiered;
+
+        List<String> indexes = observationIndexNames();
+        assertFalse("A fresh PARQUET_PRIMARY table must omit the broad result GIN",
+                indexes.contains(TABLE + "_data_idx"));
+        for (String required : List.of(
+                TABLE + "_pkey",
+                TABLE + "_unique_constraint_v2",
+                TABLE + "_datastream_idx",
+                TABLE + "_phenomenon_time_idx",
+                TABLE + "_datastream_id_phenomenon_time_idx",
+                TABLE + "_result_time_idx",
+                TABLE + "_datastream_id_result_time_idx",
+                TABLE + "_foi_idx",
+                TABLE + "_unarchived_time_idx",
+                TABLE + "_archive_generation_idx",
+                TABLE + "_result_path_ops_idx",
+                TABLE + "_result_occupancy_count_idx",
+                TABLE + "_result_max_gamma_idx",
+                TABLE + "_result_max_neutron_idx")) {
+            assertTrue("Missing required PARQUET_PRIMARY index " + required,
+                    indexes.contains(required));
+        }
+        assertTrue(indexDefinition(TABLE + "_result_path_ops_idx")
+                .toLowerCase().contains("using gin (result jsonb_path_ops)"));
+        for (String numeric : List.of("occupancy_count", "max_gamma", "max_neutron")) {
+            String definition = indexDefinition(TABLE + "_result_" + numeric + "_idx")
+                    .toLowerCase();
+            assertTrue(definition.contains("datastreamid"));
+            assertTrue(definition.contains("::numeric"));
+        }
+
+        Instant start = Instant.parse("2026-07-01T00:00:00Z");
+        BigId stream = addSimpleDataStream(bigId(70), "gammaCounts");
+        List<BigId> archivedKeys = addSimpleObsWithoutResultTime(
+                stream, BigId.NONE, start, 3, 60_000L).keySet().stream()
+                .sorted(Comparator.comparingLong(BigId::getIdAsLong))
+                .toList();
+        BigId laterHotKey = addSimpleObsWithoutResultTime(
+                stream, BigId.NONE, start.plus(2, ChronoUnit.HOURS), 1, 0)
+                .keySet().iterator().next();
+        forceReadBackFromStorage();
+
+        ArchiveGeneration generation = tiered.archiveWindow(
+                start, start.plus(1, ChronoUnit.HOURS), "RAW_GATED").orElseThrow();
+        assertEquals(3, generation.rowCount());
+        assertEquals(3, archivedHotRows());
+
+        tiered.maintainArchiveLifecycle();
+        assertTrue(oneGeneration(tiered.getArchiveCatalog()).parityVerified());
+        ageGeneration(generation.id());
+        tiered.maintainArchiveLifecycle();
+
+        assertEquals("Only the out-of-window control row may remain hot", 1, hotRows());
+        assertEquals(0, archivedHotRows());
+        assertEquals("SEALED", oneGeneration(tiered.getArchiveCatalog()).state());
+        assertTrue(hotRowExists(laterHotKey.getIdAsLong()));
+        BigId coldKey = archivedKeys.get(1);
+        assertNotNull(tiered.get(coldKey));
+        try (var selected = tiered.selectEntries(new ObsFilter.Builder()
+                .withInternalIDs(coldKey)
+                .build())) {
+            var rows = selected.toList();
+            assertEquals(1, rows.size());
+            assertEquals(coldKey, rows.get(0).getKey());
+        }
+
+        // Reopen from only durable PostgreSQL catalog state and Parquet
+        // objects; a point lookup must still find exactly the cold row.
+        tiered.close();
+        tiered = new TestableTieredStore(url, DB_NAME, login, password, TABLE,
+                DATABASE_NUM, IdProviderType.SEQUENTIAL, archiveConfig);
+        postgisObsStore = tiered;
+        obsStore = tiered;
+        assertNotNull(tiered.get(coldKey));
+        try (var selected = tiered.selectEntries(new ObsFilter.Builder()
+                .withInternalIDs(coldKey)
+                .build())) {
+            var rows = selected.toList();
+            assertEquals(1, rows.size());
+            assertEquals(coldKey, rows.get(0).getKey());
+        }
+        assertEquals(4, tiered.getNumRecords());
+        assertFalse(observationIndexNames().contains(TABLE + "_data_idx"));
+    }
+
+    @Test
     public void completeHotColdLifecycleAgainstRealPostgres() throws Exception {
         String expectedZone = System.getenv("OSCAR_IT_EXPECTED_ZONE");
         if (expectedZone != null)
@@ -3319,6 +3434,33 @@ public class TestDisposableTieredPostgresIntegration extends TestPostgisObsStore
                      "SELECT count(*) FROM " + TABLE + " WHERE archivegenerationid IS NOT NULL")) {
             assertTrue(result.next());
             return result.getLong(1);
+        }
+    }
+
+    private List<String> observationIndexNames() throws Exception {
+        List<String> indexes = new ArrayList<>();
+        try (Connection connection = open(); PreparedStatement statement = connection.prepareStatement(
+                "SELECT indexname FROM pg_indexes WHERE schemaname=current_schema() " +
+                        "AND tablename=? ORDER BY indexname")) {
+            statement.setString(1, TABLE);
+            try (ResultSet result = statement.executeQuery()) {
+                while (result.next())
+                    indexes.add(result.getString(1));
+            }
+        }
+        return indexes;
+    }
+
+    private String indexDefinition(String indexName) throws Exception {
+        try (Connection connection = open(); PreparedStatement statement = connection.prepareStatement(
+                "SELECT indexdef FROM pg_indexes WHERE schemaname=current_schema() " +
+                        "AND tablename=? AND indexname=?")) {
+            statement.setString(1, TABLE);
+            statement.setString(2, indexName);
+            try (ResultSet result = statement.executeQuery()) {
+                assertTrue("Missing index definition for " + indexName, result.next());
+                return result.getString(1);
+            }
         }
     }
 

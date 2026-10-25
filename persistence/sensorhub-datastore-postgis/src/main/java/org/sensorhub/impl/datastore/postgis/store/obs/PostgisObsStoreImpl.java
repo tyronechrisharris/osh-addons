@@ -97,18 +97,7 @@ public class PostgisObsStoreImpl extends PostgisStore<QueryBuilderObsStore> impl
         super(idScope, dsIdProviderType,
                 queryBuilderObsStore,
                 false);
-        this.init(url, dbName, login, password, new String[]{
-                        queryBuilder.createTableQuery(),
-                        queryBuilder.createDataIndexQuery(),
-                        queryBuilder.createDataStreamIndexQuery(),
-                        queryBuilder.createPhenomenonTimeIndexQuery(),
-                        queryBuilder.createPhenomenonTimeDataStreamIdIndexQuery(),
-                        queryBuilder.createResultTimeIndexQuery(),
-                        queryBuilder.createResultTimeDataStreamIdIndexQuery(),
-                        queryBuilder.createFoiIndexQuery(),
-                        queryBuilder.createUniqueConstraint()
-                }
-        );
+        this.init(url, dbName, login, password, queryBuilder.createInitializationQueries());
     }
 
     @Override

@@ -6,6 +6,8 @@ import javax.validation.constraints.Max;
 import javax.validation.constraints.Min;
 import java.nio.file.InvalidPathException;
 import java.nio.file.Path;
+import java.time.Instant;
+import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -19,6 +21,18 @@ import java.util.List;
  */
 public class TieredArchiveConfig {
     /**
+     * Controls when an allowlisted immutable observation becomes eligible for
+     * Parquet.  The default retains the established age-based cold-tier
+     * behaviour.  PARQUET_PRIMARY still commits observations to PostgreSQL
+     * first, but treats that table as a bounded durable staging/rollback tier
+     * and exports completed UTC-hour batches shortly after they close.
+     */
+    public enum StorageMode {
+        HOT_RETENTION,
+        PARQUET_PRIMARY
+    }
+
+    /**
      * DuckDB needs room for the staged table, sort keys, compression buffers,
      * and the Parquet writer at the same time.  Limiting source payload to one
      * eighth of the session cap keeps those structures bounded without raising
@@ -30,12 +44,22 @@ public class TieredArchiveConfig {
     @DisplayInfo(label = "Enable cold archive")
     public boolean enabled = true;
 
+    @DisplayInfo(label = "Observation storage mode",
+            desc = "PARQUET_PRIMARY is an explicit fresh-database mode for allowlisted immutable outputs; " +
+                    "ordinary PostGIS and the default tiered mode are unchanged")
+    public StorageMode storageMode = StorageMode.HOT_RETENTION;
+
     @DisplayInfo(label = "Archive root", desc = "Durable path mounted outside the PostgreSQL volume")
     public String rootDirectory = "/var/lib/oscar/archive";
 
     @Min(1)
     @DisplayInfo(label = "Hot retention (days)")
     public int hotRetentionDays = 30;
+
+    @Min(1)
+    @DisplayInfo(label = "Parquet-primary archive delay (minutes)",
+            desc = "Safety delay after a UTC hour closes before its immutable rows are eligible for export")
+    public int parquetPrimaryArchiveDelayMinutes = 5;
 
     @Min(1)
     @DisplayInfo(label = "Archive interval (minutes)")
@@ -45,6 +69,16 @@ public class TieredArchiveConfig {
     @DisplayInfo(label = "Maximum generations per cycle",
             desc = "Bounds catch-up work while allowing an installation with a backlog to archive more than one window per interval")
     public int maximumGenerationsPerCycle = 24;
+
+    @Min(1)
+    @DisplayInfo(label = "Maximum parity verifications per cycle",
+            desc = "Independent bound on generations reread from Parquet and PostgreSQL before new exports start")
+    public int maximumVerificationsPerCycle = 2;
+
+    @Min(1)
+    @DisplayInfo(label = "Maximum hot-generation deletions per cycle",
+            desc = "Independent bound on verified generations whose PostgreSQL staging rows may be deleted per cycle")
+    public int maximumDeletionsPerCycle = 10;
 
     @Min(1)
     @DisplayInfo(label = "Maximum archive cycle duration (minutes)",
@@ -134,8 +168,53 @@ public class TieredArchiveConfig {
         return Math.min(maximumUncompressedBytesPerGeneration, memorySafePayloadBytes);
     }
 
+    public boolean isParquetPrimary() {
+        return storageMode == StorageMode.PARQUET_PRIMARY;
+    }
+
+    /**
+     * Returns the exclusive archive cutoff while preserving completed UTC-hour
+     * batches.  PostgreSQL remains the durable staging layer until manifest-
+     * last activation and the existing parity/grace lifecycle permit deletion.
+     */
+    public Instant archiveCutoff(Instant now) {
+        if (now == null)
+            throw new IllegalArgumentException("Archive clock value is required");
+        return (isParquetPrimary()
+                ? now.minus(parquetPrimaryArchiveDelayMinutes, ChronoUnit.MINUTES)
+                : now.minus(hotRetentionDays, ChronoUnit.DAYS))
+                .truncatedTo(ChronoUnit.HOURS);
+    }
+
     /** Rejects unsafe compatibility settings that cannot weaken invariants. */
     public void validate() {
+        if (storageMode == null)
+            throw new IllegalArgumentException("storageMode is required");
+        if (isParquetPrimary() && !enabled)
+            throw new IllegalArgumentException("PARQUET_PRIMARY requires the cold archive to be enabled");
+        if (isParquetPrimary() && !deleteHotAfterArchive)
+            throw new IllegalArgumentException(
+                    "PARQUET_PRIMARY requires deleteHotAfterArchive so PostgreSQL remains a bounded staging tier");
+        if (parquetPrimaryArchiveDelayMinutes < 1)
+            throw new IllegalArgumentException("parquetPrimaryArchiveDelayMinutes must be positive");
+        if (maximumGenerationsPerCycle < 1)
+            throw new IllegalArgumentException("maximumGenerationsPerCycle must be positive");
+        if (maximumVerificationsPerCycle < 1)
+            throw new IllegalArgumentException("maximumVerificationsPerCycle must be positive");
+        if (maximumDeletionsPerCycle < 1)
+            throw new IllegalArgumentException("maximumDeletionsPerCycle must be positive");
+        if (isParquetPrimary() && maximumVerificationsPerCycle < maximumGenerationsPerCycle)
+            throw new IllegalArgumentException(
+                    "PARQUET_PRIMARY requires maximumVerificationsPerCycle to be at least " +
+                            "maximumGenerationsPerCycle so parity backlog cannot grow by configuration");
+        if (isParquetPrimary() && maximumDeletionsPerCycle < maximumGenerationsPerCycle)
+            throw new IllegalArgumentException(
+                    "PARQUET_PRIMARY requires maximumDeletionsPerCycle to be at least " +
+                            "maximumGenerationsPerCycle so eligible hot-deletion backlog cannot grow by configuration");
+        if (isParquetPrimary() && (outputNames == null || outputNames.isEmpty()))
+            throw new IllegalArgumentException("At least one immutable archive output name is required");
+        if (isParquetPrimary() && outputNames.stream().anyMatch(name -> name == null || name.isBlank()))
+            throw new IllegalArgumentException("Archive output names must be non-blank");
         if (!requireParityReceipt)
             throw new IllegalArgumentException(
                     "requireParityReceipt is a mandatory safety invariant and cannot be disabled");

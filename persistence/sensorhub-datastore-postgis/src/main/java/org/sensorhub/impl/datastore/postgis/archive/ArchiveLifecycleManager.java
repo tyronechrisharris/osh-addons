@@ -41,13 +41,15 @@ public final class ArchiveLifecycleManager {
     }
 
     public void maintain() {
-        for (ArchiveGeneration generation : catalog.unverifiedGenerations(2))
+        for (ArchiveGeneration generation : catalog.unverifiedGenerations(
+                config.maximumVerificationsPerCycle))
             verifyHotColdParity(generation);
 
         if (!config.deleteHotAfterArchive)
             return;
         Instant graceCutoff = Instant.now().minus(config.rollbackGraceDays, ChronoUnit.DAYS);
-        for (ArchiveGeneration generation : catalog.readyForHotDeletion(graceCutoff))
+        for (ArchiveGeneration generation : catalog.readyForHotDeletion(
+                graceCutoff, config.maximumDeletionsPerCycle))
             deleteVerifiedHotRows(generation);
     }
 

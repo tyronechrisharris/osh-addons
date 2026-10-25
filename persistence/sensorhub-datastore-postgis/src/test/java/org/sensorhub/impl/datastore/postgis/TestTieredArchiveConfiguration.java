@@ -2,6 +2,7 @@ package org.sensorhub.impl.datastore.postgis;
 
 import org.junit.Test;
 import org.sensorhub.impl.datastore.postgis.archive.TieredArchiveConfig;
+import org.sensorhub.impl.datastore.postgis.archive.TieredArchiveConfig.StorageMode;
 import org.sensorhub.impl.datastore.postgis.archive.ArchiveExporter;
 import org.sensorhub.impl.datastore.postgis.archive.UtcJdbcTime;
 import org.sensorhub.impl.datastore.postgis.builder.QueryBuilderDataStreamStore;
@@ -24,6 +25,9 @@ public class TestTieredArchiveConfiguration {
     public void hotDeletionIsFailSafeByDefault() {
         TieredArchiveConfig config = new TieredArchiveConfig();
         assertTrue(config.enabled);
+        assertEquals(StorageMode.HOT_RETENTION, config.storageMode);
+        assertFalse(config.isParquetPrimary());
+        assertEquals(2, config.maximumVerificationsPerCycle);
         assertFalse(config.deleteHotAfterArchive);
         assertTrue(config.requireParityReceipt);
         assertTrue(config.maximumGenerationsPerCycle > 1);
@@ -39,6 +43,91 @@ public class TestTieredArchiveConfiguration {
         assertFalse(config.duckDbTemporaryDirectory.isBlank());
         assertTrue(config.outputNames.contains("gammaCounts"));
         assertFalse(config.outputNames.contains("occupancy"));
+    }
+
+    @Test
+    public void parquetPrimaryIsExplicitAndRequiresBoundedHotDeletion() {
+        TieredArchiveConfig config = new TieredArchiveConfig();
+        config.storageMode = StorageMode.PARQUET_PRIMARY;
+
+        IllegalArgumentException retained = assertThrows(
+                IllegalArgumentException.class, config::validate);
+        assertTrue(retained.getMessage().contains("deleteHotAfterArchive"));
+
+        config.deleteHotAfterArchive = true;
+        IllegalArgumentException verificationBacklog = assertThrows(
+                IllegalArgumentException.class, config::validate);
+        assertTrue(verificationBacklog.getMessage().contains("maximumVerificationsPerCycle"));
+
+        config.maximumGenerationsPerCycle = 2;
+        config.validate();
+        assertTrue(config.isParquetPrimary());
+        assertEquals(config.maximumGenerationsPerCycle, config.maximumVerificationsPerCycle);
+
+        config.enabled = false;
+        IllegalArgumentException disabled = assertThrows(
+                IllegalArgumentException.class, config::validate);
+        assertTrue(disabled.getMessage().contains("requires the cold archive"));
+    }
+
+    @Test
+    public void parquetPrimaryArchivesOnlyCompletedUtcHourBatches() {
+        TieredArchiveConfig config = new TieredArchiveConfig();
+        config.hotRetentionDays = 2;
+        assertEquals(Instant.parse("2026-01-01T13:00:00Z"),
+                config.archiveCutoff(Instant.parse("2026-01-03T13:47:00Z")));
+
+        config.storageMode = StorageMode.PARQUET_PRIMARY;
+        config.deleteHotAfterArchive = true;
+        config.parquetPrimaryArchiveDelayMinutes = 5;
+
+        assertEquals(Instant.parse("2026-01-01T12:00:00Z"),
+                config.archiveCutoff(Instant.parse("2026-01-01T13:04:59Z")));
+        assertEquals(Instant.parse("2026-01-01T13:00:00Z"),
+                config.archiveCutoff(Instant.parse("2026-01-01T13:05:00Z")));
+    }
+
+    @Test
+    public void archiveGenerationAndVerificationBudgetCannotBeDisabled() {
+        TieredArchiveConfig config = new TieredArchiveConfig();
+        config.maximumGenerationsPerCycle = 0;
+        assertThrows(IllegalArgumentException.class, config::validate);
+        config.maximumGenerationsPerCycle = 1;
+        config.maximumVerificationsPerCycle = 0;
+        assertThrows(IllegalArgumentException.class, config::validate);
+        config.maximumVerificationsPerCycle = 1;
+        config.maximumDeletionsPerCycle = 0;
+        assertThrows(IllegalArgumentException.class, config::validate);
+    }
+
+    @Test
+    public void parquetPrimaryLifecycleBudgetsMustKeepPaceWithExports() {
+        TieredArchiveConfig config = new TieredArchiveConfig();
+        config.storageMode = StorageMode.PARQUET_PRIMARY;
+        config.deleteHotAfterArchive = true;
+        config.maximumGenerationsPerCycle = 3;
+        config.maximumVerificationsPerCycle = 3;
+        config.maximumDeletionsPerCycle = 2;
+        IllegalArgumentException deletionBacklog = assertThrows(
+                IllegalArgumentException.class, config::validate);
+        assertTrue(deletionBacklog.getMessage().contains("maximumDeletionsPerCycle"));
+    }
+
+    @Test
+    public void parquetPrimaryOmitsGenericPayloadIndexButRetainsEventIndexes() {
+        QueryBuilderObsStore ordinary = new QueryBuilderObsStore("obs", true);
+        String ordinaryInitialization = String.join("\n", ordinary.createInitializationQueries());
+        assertTrue(ordinaryInitialization.contains("USING GIN(result)"));
+        assertTrue(ordinary.createEventFilterIndexQueries().length > 0);
+
+        QueryBuilderObsStore primary = new QueryBuilderObsStore("obs", false);
+        String primaryInitialization = String.join("\n", primary.createInitializationQueries());
+        assertFalse(primaryInitialization.contains("USING GIN"));
+        String primaryEventIndexes = String.join("\n", primary.createEventFilterIndexQueries());
+        assertTrue(primaryEventIndexes.contains("jsonb_path_ops"));
+        assertTrue(primaryEventIndexes.contains("occupancy_count_idx"));
+        assertTrue(primaryInitialization.contains("obs_unique_constraint_v2"));
+        assertTrue(primaryInitialization.contains("obs_datastream_id_phenomenon_time_idx"));
     }
 
     @Test

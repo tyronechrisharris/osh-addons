@@ -59,8 +59,7 @@ public class OscarTieredObsSystemDatabase extends PostgisObsSystemDatabase {
     private void runArchiveCycle() {
         OscarTieredObsStore store = (OscarTieredObsStore) obsStore;
         TieredArchiveConfig archive = archiveConfig();
-        Instant cutoff = Instant.now().minus(archive.hotRetentionDays, ChronoUnit.DAYS)
-                .truncatedTo(ChronoUnit.HOURS);
+        Instant cutoff = archive.archiveCutoff(Instant.now());
         store.maintainArchiveLifecycle();
         Instant deadline = Instant.now().plus(archive.maximumCycleMinutes, ChronoUnit.MINUTES);
         int activated = 0;

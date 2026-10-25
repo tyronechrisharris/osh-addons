@@ -1221,6 +1221,12 @@ public final class ArchiveCatalog {
     }
 
     public List<ArchiveGeneration> readyForHotDeletion(Instant activatedBefore) {
+        return readyForHotDeletion(activatedBefore, 10);
+    }
+
+    public List<ArchiveGeneration> readyForHotDeletion(Instant activatedBefore, int limit) {
+        if (limit < 1)
+            throw new IllegalArgumentException("Hot-deletion generation limit must be positive");
         List<ArchiveGeneration> generations = new ArrayList<>();
         String sql = "SELECT g.id, g.profile, g.window_start, g.window_end, g.object_path, g.sha256, " +
                 "g.row_count, g.min_id, g.max_id, g.state, g.parity_verified " +
@@ -1229,11 +1235,12 @@ public final class ArchiveCatalog {
                 "AND g.activated_at <= ? AND NOT EXISTS (SELECT 1 FROM oscar_retention_hold h " +
                 "WHERE h.store_key=g.store_key AND h.id_scope=g.id_scope AND h.released_at IS NULL " +
                 "AND h.subject_type='ARCHIVE_GENERATION' AND h.subject_id=g.id::text) " +
-                "ORDER BY g.activated_at LIMIT 10";
+                "ORDER BY g.activated_at LIMIT ?";
         try (Connection connection = connections.open(); PreparedStatement statement = connection.prepareStatement(sql)) {
             statement.setString(1, storeKey);
             statement.setInt(2, idScope);
             UtcJdbcTime.setInstant(statement, 3, activatedBefore);
+            statement.setInt(4, limit);
             try (ResultSet result = statement.executeQuery()) {
                 while (result.next()) {
                     generations.add(new ArchiveGeneration(result.getObject(1, UUID.class), result.getString(2),

@@ -27,6 +27,7 @@ import org.sensorhub.impl.datastore.postgis.archive.TieredArchiveConfig;
 import org.sensorhub.impl.datastore.postgis.archive.UtcJdbcTime;
 import org.sensorhub.impl.datastore.postgis.builder.filter.JsonCqlEvaluator;
 import org.sensorhub.impl.datastore.postgis.builder.ParameterizedQuery;
+import org.sensorhub.impl.datastore.postgis.builder.QueryBuilderObsStore;
 import org.sensorhub.impl.datastore.postgis.utils.SerializerUtils;
 import org.vast.util.TimeExtent;
 import org.vast.data.DataBlockByte;
@@ -103,7 +104,8 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
 
     public OscarTieredObsStore(String url, String dbName, String login, String password, String dataStoreName,
                                int idScope, IdProviderType idProviderType, TieredArchiveConfig archiveConfig) {
-        super(url, dbName, login, password, dataStoreName, idScope, idProviderType);
+        super(url, dbName, login, password, dataStoreName, idScope, idProviderType,
+                tieredQueryBuilder(dataStoreName, archiveConfig));
         this.archiveConfig = archiveConfig;
         try {
             if (idProviderType != IdProviderType.SEQUENTIAL)
@@ -136,6 +138,16 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
             }
             throw failure;
         }
+    }
+
+    private static QueryBuilderObsStore tieredQueryBuilder(
+            String dataStoreName, TieredArchiveConfig archiveConfig) {
+        Objects.requireNonNull(archiveConfig, "archiveConfig");
+        // Validate before the superclass opens PostgreSQL or creates a table.
+        // A mistyped primary-mode configuration must fail without leaving a
+        // partially initialized schema with the wrong index profile.
+        archiveConfig.validate();
+        return new QueryBuilderObsStore(dataStoreName, !archiveConfig.isParquetPrimary());
     }
 
     public ArchiveCatalog getArchiveCatalog() {
