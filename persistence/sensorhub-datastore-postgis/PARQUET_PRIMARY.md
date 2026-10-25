@@ -6,51 +6,75 @@ fresh OSCAR databases. Ordinary PostGIS stores and the default
 
 ## Storage contract
 
-- PostgreSQL is the durable staging and rollback tier. A write becomes durable
+- PostgreSQL provides a short-lived, crash-recoverable landing tier. A write becomes durable
   when the normal OSH store `commit()` completes; `add()` alone is not a
   durability boundary because the batch store intentionally buffers writes.
 - Only output names in `archive.outputNames` are eligible. In primary mode this
   list must contain only streams that are immutable once committed. Mutable or
   open occupancy, alarm, and adjudication workflow state must remain in
-  PostgreSQL.
-- Completed UTC-hour batches become eligible after
-  `parquetPrimaryArchiveDelayMinutes`. Row and byte caps bound each generation;
-  a large hour is exported as deterministic revisions over later cycles.
+  PostgreSQL. The storage class is recorded when a datastream first receives a
+  row; changing that datastream ID between mutable and immutable classes is
+  rejected. Use a new datastream version/ID for such a schema change. Export
+  selects physical stage membership rather than re-reading a mutable output
+  name, so a later label edit cannot strand already accepted raw rows.
+- Allowlisted rows are routed at receipt into LOGGED, UTC-aligned physical
+  staging children keyed by detector phenomenon time. PostgreSQL records a
+  separate server-side `received_at` timestamp, so a late historical sample is
+  immediately eligible instead of waiting for a new retention period. Detector
+  clocks more than `maximumFuturePhenomenonSkewMinutes` ahead of PostgreSQL are
+  rejected before routing; the default maximum skew is five minutes. The
+  default window is 30 minutes
+  (`immutableStageWindowMinutes=30`); the primary worker runs every minute
+  (`parquetPrimaryIntervalMinutes=1`). A completed window becomes eligible
+  after `parquetPrimaryArchiveDelayMinutes`. Row and byte caps bound each
+  generation; a large window is exported as deterministic revisions and its
+  physical child remains until every revision passes parity.
 - Export continues to use a transactionally claimed job, `.partial` files,
   file and directory sync, atomic rename, checksum/count/range validation, an
   exact activation ledger, and manifest-last publication. A restart reclaims
   stale jobs and reuses deterministic generation object names.
-- PostgreSQL rows are deleted only after activation, parity verification,
-  `rollbackGraceDays`, retention-hold checks, and the existing bounded deletion
-  lifecycle. `deleteHotAfterArchive=true` is therefore mandatory in primary
-  mode.
+- After atomic publication, exact activation, checksum validation, and
+  row/ID/payload parity, OSCAR detaches and drops the complete staging child.
+  It does not issue high-volume row DELETEs, retain a three-day raw overlap, or
+  wait for autovacuum to reclaim those raw indexes. Mutable rows in the base
+  table are never part of this drop. `deleteHotAfterArchive=true` remains the
+  explicit operator opt-in required for this authority transition.
+- Activation records exact row ownership in a compact, LOGGED sidecar instead
+  of rewriting every staged JSON tuple. This prevents a second full MVCC copy
+  and generation-index growth while a size-capped child is published across
+  several Parquet generations. The ownership rows are removed transactionally
+  with the physical child.
 - Primary mode verifies up to `maximumVerificationsPerCycle` older generations
   before exporting the next bounded batch. Configuration validation requires
   that cap to be at least `maximumGenerationsPerCycle`, preventing each cycle
   from creating parity work faster than a later cycle can process it. A newly
-  activated generation is intentionally first eligible for verification on
-  the next scheduled cycle. The verification cap is separate because parity
-  rereads both Parquet and PostgreSQL and is not covered by the export deadline.
-- Hot deletion has its own `maximumDeletionsPerCycle` bound. Primary-mode
-  validation likewise requires it to be at least the export-generation cap so
-  eligible staging rows cannot accumulate solely because of a fixed lifecycle
-  rate mismatch. Verification and deletion still run before the export
-  deadline begins, so configure all three caps for the host's measured I/O
-  budget.
+  activated generation is verified again in the same bounded cycle when
+  possible. The verification cap is separate because parity rereads both
+  Parquet and PostgreSQL. Whole-child disposal has its own
+  `maximumStagePartitionsPerCycle` bound; a busy relation backs off after a
+  short lock timeout rather than blocking ingestion.
 - Mixed hot/cold queries, mutation overlays, tombstones, stable observation
   IDs, and late-arrival revisions continue to use the existing tiered reader.
   A single-ID lookup first prunes the catalog through
   `oscar_archive_id_block`, then applies Parquet predicate pushdown; it does not
   scan every generation.
 
-`rollbackGraceDays=3` is a minimum three-day rollback overlap measured from
-generation activation, not a guaranteed 72-hour deletion deadline measured
-from observation arrival. Backlog, a failed parity receipt (which stops that
-lifecycle pass), an active hold, an unavailable archive, or a stopped scheduler
-safely delays deletion. Operations must alert on unverified-generation and
-unarchived-row backlog if a bounded storage envelope is required. PostgreSQL
-normally reuses space freed by deletion; the volume's physical file size need
-not fall immediately and still depends on autovacuum/checkpoint operation.
+`rollbackGraceDays` applies to `HOT_RETENTION`, not to primary-mode raw staging.
+In primary mode, a failed parity receipt, missing/corrupt archive object,
+unfinished capped revision, busy relation, or stopped scheduler safely keeps
+the complete child attached. Restart reconciliation resumes a cataloged
+detached child; an attached catalog entry with a missing relation is treated as
+data loss and fails closed. Retention holds protect the verified Parquet
+record, not its redundant landing copy, so a long-lived hold cannot pin an
+entire high-volume PostgreSQL child.
+
+With the default 30-minute window, five-minute close delay, one-minute worker,
+and five-minute permitted future clock skew, a normally operating row has a
+41-minute nominal eligibility budget. Export, parity validation, and a bounded
+drop add workload-dependent time. The scheduler warns when any staging receipt
+is one hour old. One hour is therefore an operating SLO, not permission to
+discard data: failed export, insufficient disk, corruption, a busy table, or a
+stopped process keeps the durable PostgreSQL child until recovery succeeds.
 
 OSCAR's public event identifier is decoded to the stable OSH observation ID
 before this store is queried. The direct cold lookup then uses
@@ -59,17 +83,19 @@ before this store is queried. The direct cold lookup then uses
 
 ## Index policy
 
-On a fresh primary-mode observation table, OSCAR omits the redundant generic
+On a fresh primary-mode mutable observation table, OSCAR omits the redundant generic
 `GIN(result)` index, which was the largest payload index on the measured test
 system. The purpose-built `jsonb_path_ops` and numeric event-filter indexes
 remain because mutable occupancy, alarm, and adjudication workflow rows are
-still PostgreSQL-authoritative and must remain searchable. Index entries for
-allowlisted raw streams age out with bounded hot deletion and can reuse space;
-entries for retained non-allowlisted workflow data remain and can still grow.
-That residual growth must be monitored rather than described as eliminated.
-Narrow identity, natural-key, stream, time, FOI, unarchived-time, and generation
-indexes also remain for ingestion, idempotency, staging scans, lifecycle work,
-and hot queries.
+still PostgreSQL-authoritative and must remain searchable. Each raw staging
+child has only three local indexes: stable ID, null-safe natural identity, and
+datastream/phenomenon-time/ID. Exact temporary Parquet ownership lives in the
+compact sidecar, so neither the child nor the mutable parent needs a primary-mode
+generation index. A child has no JSON GIN or event-value indexes. Dropping the
+child removes its heap and all three indexes
+as filesystem relations, which bounds raw PostgreSQL index growth instead of
+merely creating reusable dead space. Retained mutable workflow data can still
+grow and must be governed by its own lifecycle.
 
 This mode does not drop indexes from an existing database. That deliberate
 fresh-schema rule prevents a configuration change from causing destructive DDL
@@ -95,7 +121,11 @@ does not provide.
     "enabled": true,
     "storageMode": "PARQUET_PRIMARY",
     "parquetPrimaryArchiveDelayMinutes": 5,
-    "intervalMinutes": 5,
+    "immutableStageWindowMinutes": 30,
+    "maximumFuturePhenomenonSkewMinutes": 5,
+    "parquetPrimaryIntervalMinutes": 1,
+    "maximumStagePartitionsPerCycle": 8,
+    "intervalMinutes": 60,
     "maximumGenerationsPerCycle": 2,
     "maximumVerificationsPerCycle": 2,
     "maximumDeletionsPerCycle": 2,
@@ -112,9 +142,12 @@ does not provide.
 }
 ```
 
-Do not describe this mode as direct-to-Parquet ingestion: PostgreSQL staging is
-intentional. It provides a crash-recoverable commit boundary while Parquet
-generation remains asynchronous and bounded.
+Do not describe this mode as synchronous direct-to-Parquet ingestion. The
+small LOGGED staging child is intentional: it supplies the crash-recoverable
+commit and efficient batch boundary. It is not a multi-day hot copy. Parquet
+and the daily-file product are the long-term raw detector representations;
+PostgreSQL retains only mutable workflows, compact metadata, archive catalog,
+overlays, and tombstones after verified child retirement.
 
 Before enabling this profile in a release, run the disposable real-PostgreSQL
 integration suite against a fresh schema and verify the actual index catalog,

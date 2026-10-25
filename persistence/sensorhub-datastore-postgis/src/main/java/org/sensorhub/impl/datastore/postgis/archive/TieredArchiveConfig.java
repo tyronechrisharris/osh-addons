@@ -10,6 +10,7 @@ import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashSet;
 import java.util.List;
 
 /**
@@ -24,8 +25,8 @@ public class TieredArchiveConfig {
      * Controls when an allowlisted immutable observation becomes eligible for
      * Parquet.  The default retains the established age-based cold-tier
      * behaviour.  PARQUET_PRIMARY still commits observations to PostgreSQL
-     * first, but treats that table as a bounded durable staging/rollback tier
-     * and exports completed UTC-hour batches shortly after they close.
+     * first, but treats short-lived LOGGED children as a bounded durable staging tier
+     * and exports completed UTC windows shortly after they close.
      */
     public enum StorageMode {
         HOT_RETENTION,
@@ -58,8 +59,31 @@ public class TieredArchiveConfig {
 
     @Min(1)
     @DisplayInfo(label = "Parquet-primary archive delay (minutes)",
-            desc = "Safety delay after a UTC hour closes before its immutable rows are eligible for export")
+            desc = "Safety delay after a UTC staging window closes before its immutable rows are eligible for export")
     public int parquetPrimaryArchiveDelayMinutes = 5;
+
+    @Min(1)
+    @Max(60)
+    @DisplayInfo(label = "Immutable staging window (minutes)",
+            desc = "UTC-aligned Parquet-primary window; must divide one day evenly and cannot exceed one hour")
+    public int immutableStageWindowMinutes = 30;
+
+    @Min(0)
+    @Max(15)
+    @DisplayInfo(label = "Maximum future detector-clock skew (minutes)",
+            desc = "Rejects immutable detector observations farther ahead of the PostgreSQL receipt clock; " +
+                    "this prevents a bad detector clock from defeating bounded staging")
+    public int maximumFuturePhenomenonSkewMinutes = 5;
+
+    @Min(1)
+    @DisplayInfo(label = "Parquet-primary worker interval (minutes)",
+            desc = "How often completed immutable staging windows are exported, verified, and retired")
+    public int parquetPrimaryIntervalMinutes = 1;
+
+    @Min(1)
+    @DisplayInfo(label = "Maximum staging partitions retired per cycle",
+            desc = "Bounds whole-partition PostgreSQL reclamation work in one archive cycle")
+    public int maximumStagePartitionsPerCycle = 8;
 
     @Min(1)
     @DisplayInfo(label = "Archive interval (minutes)")
@@ -135,11 +159,12 @@ public class TieredArchiveConfig {
     @DisplayInfo(label = "Rollback grace (days)")
     public int rollbackGraceDays = 7;
 
-    @DisplayInfo(label = "Delete verified hot rows", desc = "Keep false until mixed-tier query parity and restore tests pass")
+    @DisplayInfo(label = "Retire verified PostgreSQL source",
+            desc = "HOT_RETENTION deletes verified rows; PARQUET_PRIMARY drops a verified staging child")
     public boolean deleteHotAfterArchive = false;
 
     @DisplayInfo(label = "Require parity receipt (mandatory)",
-            desc = "Safety invariant: false is rejected; hot deletion always requires a successful parity receipt")
+            desc = "Safety invariant: false is rejected; source retirement always requires successful parity")
     public boolean requireParityReceipt = true;
 
     @Min(1)
@@ -173,17 +198,33 @@ public class TieredArchiveConfig {
     }
 
     /**
-     * Returns the exclusive archive cutoff while preserving completed UTC-hour
-     * batches.  PostgreSQL remains the durable staging layer until manifest-
-     * last activation and the existing parity/grace lifecycle permit deletion.
+     * Returns the exclusive archive cutoff while preserving completed UTC
+     * staging windows. PostgreSQL remains the durable landing layer until
+     * manifest-last activation, exact parity, and verified whole-child retirement.
      */
     public Instant archiveCutoff(Instant now) {
         if (now == null)
             throw new IllegalArgumentException("Archive clock value is required");
-        return (isParquetPrimary()
-                ? now.minus(parquetPrimaryArchiveDelayMinutes, ChronoUnit.MINUTES)
-                : now.minus(hotRetentionDays, ChronoUnit.DAYS))
-                .truncatedTo(ChronoUnit.HOURS);
+        if (isParquetPrimary())
+            return utcWindowStart(
+                    now.minus(parquetPrimaryArchiveDelayMinutes, ChronoUnit.MINUTES),
+                    immutableStageWindowMinutes);
+        // Preserve the established HOT_RETENTION behaviour exactly. Existing
+        // deployments continue to archive whole UTC hours after the day-based
+        // retention period, irrespective of the immutable staging setting.
+        return now.minus(hotRetentionDays, ChronoUnit.DAYS).truncatedTo(ChronoUnit.HOURS);
+    }
+
+    /** Floors an instant to a stable UTC-aligned window boundary. */
+    public static Instant utcWindowStart(Instant instant, int windowMinutes) {
+        if (instant == null)
+            throw new IllegalArgumentException("Archive window instant is required");
+        if (windowMinutes < 1 || windowMinutes > 60 || 1440 % windowMinutes != 0)
+            throw new IllegalArgumentException(
+                    "Archive window minutes must be between 1 and 60 and divide 1440 evenly");
+        long windowSeconds = Math.multiplyExact((long) windowMinutes, 60L);
+        return Instant.ofEpochSecond(Math.multiplyExact(
+                Math.floorDiv(instant.getEpochSecond(), windowSeconds), windowSeconds));
     }
 
     /** Rejects unsafe compatibility settings that cannot weaken invariants. */
@@ -197,6 +238,24 @@ public class TieredArchiveConfig {
                     "PARQUET_PRIMARY requires deleteHotAfterArchive so PostgreSQL remains a bounded staging tier");
         if (parquetPrimaryArchiveDelayMinutes < 1)
             throw new IllegalArgumentException("parquetPrimaryArchiveDelayMinutes must be positive");
+        if (immutableStageWindowMinutes < 1 || immutableStageWindowMinutes > 60 ||
+                1440 % immutableStageWindowMinutes != 0)
+            throw new IllegalArgumentException(
+                    "immutableStageWindowMinutes must be between 1 and 60 and divide 1440 evenly");
+        if (maximumFuturePhenomenonSkewMinutes < 0 ||
+                maximumFuturePhenomenonSkewMinutes > 15)
+            throw new IllegalArgumentException(
+                    "maximumFuturePhenomenonSkewMinutes must be between 0 and 15");
+        if (parquetPrimaryIntervalMinutes < 1)
+            throw new IllegalArgumentException("parquetPrimaryIntervalMinutes must be positive");
+        if (isParquetPrimary() && immutableStageWindowMinutes +
+                parquetPrimaryArchiveDelayMinutes + parquetPrimaryIntervalMinutes +
+                maximumFuturePhenomenonSkewMinutes > 60)
+            throw new IllegalArgumentException(
+                    "PARQUET_PRIMARY staging window, archive delay, worker interval, and " +
+                            "maximum future clock skew must total no more than 60 minutes");
+        if (maximumStagePartitionsPerCycle < 1)
+            throw new IllegalArgumentException("maximumStagePartitionsPerCycle must be positive");
         if (maximumGenerationsPerCycle < 1)
             throw new IllegalArgumentException("maximumGenerationsPerCycle must be positive");
         if (maximumVerificationsPerCycle < 1)
@@ -207,14 +266,12 @@ public class TieredArchiveConfig {
             throw new IllegalArgumentException(
                     "PARQUET_PRIMARY requires maximumVerificationsPerCycle to be at least " +
                             "maximumGenerationsPerCycle so parity backlog cannot grow by configuration");
-        if (isParquetPrimary() && maximumDeletionsPerCycle < maximumGenerationsPerCycle)
-            throw new IllegalArgumentException(
-                    "PARQUET_PRIMARY requires maximumDeletionsPerCycle to be at least " +
-                            "maximumGenerationsPerCycle so eligible hot-deletion backlog cannot grow by configuration");
         if (isParquetPrimary() && (outputNames == null || outputNames.isEmpty()))
             throw new IllegalArgumentException("At least one immutable archive output name is required");
         if (isParquetPrimary() && outputNames.stream().anyMatch(name -> name == null || name.isBlank()))
             throw new IllegalArgumentException("Archive output names must be non-blank");
+        if (isParquetPrimary() && new HashSet<>(outputNames).size() != outputNames.size())
+            throw new IllegalArgumentException("Archive output names must be unique");
         if (!requireParityReceipt)
             throw new IllegalArgumentException(
                     "requireParityReceipt is a mandatory safety invariant and cannot be disabled");

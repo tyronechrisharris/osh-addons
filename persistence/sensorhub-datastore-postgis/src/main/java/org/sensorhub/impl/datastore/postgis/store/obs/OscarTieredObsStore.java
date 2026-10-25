@@ -22,6 +22,7 @@ import org.sensorhub.impl.datastore.postgis.archive.ArchiveExporter;
 import org.sensorhub.impl.datastore.postgis.archive.ArchiveGeneration;
 import org.sensorhub.impl.datastore.postgis.archive.ArchiveLifecycleManager;
 import org.sensorhub.impl.datastore.postgis.archive.ArchivedObservation;
+import org.sensorhub.impl.datastore.postgis.archive.ImmutableObservationStageManager;
 import org.sensorhub.impl.datastore.postgis.archive.ParquetArchiveReader;
 import org.sensorhub.impl.datastore.postgis.archive.TieredArchiveConfig;
 import org.sensorhub.impl.datastore.postgis.archive.UtcJdbcTime;
@@ -98,6 +99,7 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
     private final ArchiveExporter archiveExporter;
     private final ArchiveLifecycleManager archiveLifecycle;
     private final ParquetArchiveReader archiveReader;
+    private final ImmutableObservationStageManager immutableStage;
     private final Map<String, IDataStreamInfo> archivedSchemas = new ConcurrentHashMap<>();
     private final ThreadLocal<Map<Long, IDataStreamInfo>> pinnedDataStreamSchemas =
             new ThreadLocal<>();
@@ -112,11 +114,16 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
                 throw new IllegalArgumentException("OSCAR tiered observations require sequential IDs for race-free archive publication");
             archiveConfig.validate();
             try (java.sql.Connection connection = connectionManager.getConnection()) {
-                org.sensorhub.impl.datastore.postgis.utils.PostgisUtils.executeQueries(connection, new String[]{
+                String[] markerQueries = archiveConfig.isParquetPrimary()
+                        ? new String[]{
+                        queryBuilder.addArchiveGenerationColumnQuery(),
+                        queryBuilder.createUnarchivedTimeIndexQuery()}
+                        : new String[]{
                         queryBuilder.addArchiveGenerationColumnQuery(),
                         queryBuilder.createUnarchivedTimeIndexQuery(),
-                        queryBuilder.createArchiveGenerationIndexQuery()
-                });
+                        queryBuilder.createArchiveGenerationIndexQuery()};
+                org.sensorhub.impl.datastore.postgis.utils.PostgisUtils.executeQueries(
+                        connection, markerQueries);
             } catch (java.sql.SQLException e) {
                 throw new IllegalStateException("Cannot initialize tiered observation markers", e);
             }
@@ -130,6 +137,14 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
             this.archiveLifecycle = new ArchiveLifecycleManager(connectionManager::getConnection, archiveCatalog,
                     archiveConfig, dataStoreName);
             this.archiveReader = new ParquetArchiveReader(Path.of(archiveConfig.rootDirectory), archiveConfig);
+            if (archiveConfig.isParquetPrimary()) {
+                this.immutableStage = new ImmutableObservationStageManager(
+                        connectionManager::getConnection, archiveCatalog, archiveConfig,
+                        dataStoreName, dataStoreName + "_datastreams", idScope);
+                this.immutableStage.initialize();
+            } else {
+                this.immutableStage = null;
+            }
         } catch (RuntimeException | Error failure) {
             try {
                 super.close();
@@ -200,6 +215,20 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
 
     public void maintainArchiveLifecycle() {
         archiveLifecycle.maintain();
+        if (immutableStage != null)
+            immutableStage.retireVerifiedPartitions();
+    }
+
+    /** Physical short-lived stage state exposed for health and regression probes. */
+    public List<ImmutableObservationStageManager.PartitionState> getImmutableStagePartitions() {
+        return immutableStage == null ? List.of() : immutableStage.listPartitions();
+    }
+
+    /** Oldest database receipt still present in the disposable raw stage. */
+    public java.util.Optional<Instant> getOldestImmutableStageReceipt() {
+        return immutableStage == null
+                ? java.util.Optional.empty()
+                : immutableStage.oldestReceivedAt();
     }
 
     public java.util.Optional<ArchiveGeneration> archiveWindow(Instant start, Instant end, String profile) {
@@ -226,6 +255,94 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
             archiveCatalog.lockForMutation(connection, observations.stream()
                     .map(observation -> observation.id)
                     .toList());
+        }
+        if (immutableStage != null) {
+            List<ImmutableObservationStageManager.Route> routes = new ArrayList<>(observations.size());
+            Map<Long, Boolean> immutableByDataStream = new HashMap<>();
+            Map<Long, DataStreamRange> immutableRanges = new HashMap<>();
+            for (PreparedObservation observation : observations) {
+                Boolean immutable = immutableByDataStream.get(observation.dataStreamId);
+                if (immutable == null) {
+                    IDataStreamInfo info = getDataStreamInfo(
+                            BigId.fromLong(idScope, observation.dataStreamId));
+                    if (info == null)
+                        throw new IllegalStateException(
+                                "Cannot classify unknown datastream " + observation.dataStreamId);
+                    immutable = archiveConfig.outputNames.contains(info.getOutputName());
+                    immutableByDataStream.put(observation.dataStreamId, immutable);
+                }
+                routes.add(new ImmutableObservationStageManager.Route(
+                        observation.dataStreamId, observation.phenomenonTime, immutable));
+                if (immutable)
+                    immutableRanges.computeIfAbsent(observation.dataStreamId,
+                                    ignored -> new DataStreamRange())
+                            .include(observation.phenomenonTime, observation.resultTime);
+            }
+            immutableStage.prepare(connection, routes);
+            updateImmutableDataStreamRanges(connection, immutableRanges);
+        }
+    }
+
+    private void updateImmutableDataStreamRanges(Connection connection,
+                                                 Map<Long, DataStreamRange> ranges)
+            throws SQLException {
+        if (ranges.isEmpty())
+            return;
+        String sql = "UPDATE " + getDataStreams().getDatastoreName() + " SET " +
+                "min_phenomenon_time=LEAST(COALESCE(min_phenomenon_time,?),?)," +
+                "max_phenomenon_time=GREATEST(COALESCE(max_phenomenon_time,?),?)," +
+                "min_result_time=CASE WHEN ?::timestamp IS NULL THEN min_result_time ELSE " +
+                "LEAST(COALESCE(min_result_time,?::timestamp),?::timestamp) END," +
+                "max_result_time=CASE WHEN ?::timestamp IS NULL THEN max_result_time ELSE " +
+                "GREATEST(COALESCE(max_result_time,?::timestamp),?::timestamp) END WHERE id=?";
+        try (PreparedStatement statement = connection.prepareStatement(sql)) {
+            for (Map.Entry<Long, DataStreamRange> entry : ranges.entrySet()) {
+                DataStreamRange range = entry.getValue();
+                UtcJdbcTime.setInstant(statement, 1, range.minimumPhenomenon);
+                UtcJdbcTime.setInstant(statement, 2, range.minimumPhenomenon);
+                UtcJdbcTime.setInstant(statement, 3, range.maximumPhenomenon);
+                UtcJdbcTime.setInstant(statement, 4, range.maximumPhenomenon);
+                bindNullableInstant(statement, 5, range.minimumResult);
+                bindNullableInstant(statement, 6, range.minimumResult);
+                bindNullableInstant(statement, 7, range.minimumResult);
+                bindNullableInstant(statement, 8, range.maximumResult);
+                bindNullableInstant(statement, 9, range.maximumResult);
+                bindNullableInstant(statement, 10, range.maximumResult);
+                statement.setLong(11, entry.getKey());
+                statement.addBatch();
+            }
+            statement.executeBatch();
+        }
+    }
+
+    private static void bindNullableInstant(PreparedStatement statement, int index,
+                                            Instant value) throws SQLException {
+        if (value == null)
+            statement.setNull(index, Types.TIMESTAMP);
+        else
+            UtcJdbcTime.setInstant(statement, index, value);
+    }
+
+    private static final class DataStreamRange {
+        private Instant minimumPhenomenon;
+        private Instant maximumPhenomenon;
+        private Instant minimumResult;
+        private Instant maximumResult;
+
+        void include(Instant phenomenon, Instant result) {
+            if (phenomenon == null)
+                throw new IllegalArgumentException(
+                        "Immutable detector observations require a phenomenon time");
+            minimumPhenomenon = minimumPhenomenon == null || phenomenon.isBefore(minimumPhenomenon)
+                    ? phenomenon : minimumPhenomenon;
+            maximumPhenomenon = maximumPhenomenon == null || phenomenon.isAfter(maximumPhenomenon)
+                    ? phenomenon : maximumPhenomenon;
+            if (result != null) {
+                minimumResult = minimumResult == null || result.isBefore(minimumResult)
+                        ? result : minimumResult;
+                maximumResult = maximumResult == null || result.isAfter(maximumResult)
+                        ? result : maximumResult;
+            }
         }
     }
 
@@ -263,7 +380,23 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
 
         List<ProtectedCorrection> corrections = new ArrayList<>();
         Set<Long> protectedHotIds = new HashSet<>();
-        String sql = "SELECT observation.id, generation.id, " +
+        boolean primary = archiveConfig.isParquetPrimary();
+        String sql = primary
+                ? "SELECT observation.id, generation.id, " +
+                "COALESCE(overlay_row.result_json, observation.result)::text " +
+                "FROM " + getDatastoreName() + " observation " +
+                "LEFT JOIN oscar_obs_stage_partition stage ON stage.store_key=? " +
+                "AND stage.id_scope=? AND observation.tableoid=to_regclass(stage.child_table) " +
+                "LEFT JOIN oscar_obs_stage_owner owner ON owner.store_key=? AND owner.id_scope=? " +
+                "AND owner.child_table=stage.child_table AND owner.observation_id=observation.id " +
+                "JOIN oscar_archive_generation generation ON generation.id=owner.generation_id " +
+                "LEFT JOIN oscar_obs_overlay overlay_row " +
+                "ON overlay_row.store_key=? AND overlay_row.id_scope=? " +
+                "AND overlay_row.observation_id=observation.id " +
+                "AND overlay_row.generation_id=generation.id " +
+                "WHERE observation.id=ANY(?) AND generation.store_key=? " +
+                "AND generation.id_scope=? AND generation.state IN ('ACTIVE','SEALED')"
+                : "SELECT observation.id, generation.id, " +
                 "COALESCE(overlay_row.result_json, observation.result)::text " +
                 "FROM " + getDatastoreName() + " observation " +
                 "JOIN oscar_archive_generation generation " +
@@ -275,12 +408,19 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
                 "WHERE observation.id=ANY(?) AND generation.store_key=? " +
                 "AND generation.id_scope=? AND generation.state IN ('ACTIVE','SEALED')";
         try (PreparedStatement statement = connection.prepareStatement(sql)) {
-            statement.setString(1, getDatastoreName());
-            statement.setInt(2, idScope);
-            statement.setArray(3, connection.createArrayOf("bigint",
+            int parameter = 1;
+            if (primary) {
+                statement.setString(parameter++, getDatastoreName());
+                statement.setInt(parameter++, idScope);
+                statement.setString(parameter++, getDatastoreName());
+                statement.setInt(parameter++, idScope);
+            }
+            statement.setString(parameter++, getDatastoreName());
+            statement.setInt(parameter++, idScope);
+            statement.setArray(parameter++, connection.createArrayOf("bigint",
                     expectedById.keySet().toArray(Long[]::new)));
-            statement.setString(4, getDatastoreName());
-            statement.setInt(5, idScope);
+            statement.setString(parameter++, getDatastoreName());
+            statement.setInt(parameter, idScope);
             try (ResultSet result = statement.executeQuery()) {
                 while (result.next()) {
                     PreparedObservation expected = expectedById.get(result.getLong(1));
@@ -311,12 +451,7 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
             if (match.observation().id() != expected.id)
                 throw new IllegalStateException("Archived observation identity resolved after add returned a different ID");
             protectedHotIds.add(expected.id);
-            try (PreparedStatement delete = connection.prepareStatement(
-                    "DELETE FROM " + getDatastoreName() +
-                            " WHERE id=? AND archivegenerationid IS NULL")) {
-                delete.setLong(1, expected.id);
-                delete.executeUpdate();
-            }
+            deleteTemporaryReplayRow(connection, expected.id);
             String logicalResult = archiveCatalog.overlayWithGeneration(
                             connection, expected.id, idScope, "OVERLAY", true)
                     .map(overlay -> overlay.observation().resultJson())
@@ -421,13 +556,29 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
 
     /** Returns the oldest unarchived eligible row, including late arrivals. */
     public java.util.Optional<Instant> nextArchiveWindowStart(Instant cutoff, String profile) {
-        String sql = "SELECT min(o.phenomenontime) FROM " + getDatastoreName() +
+        String sql = archiveConfig.isParquetPrimary()
+                ? "SELECT min(o.phenomenontime) FROM " + getDatastoreName() +
+                " o WHERE o.tableoid IN (SELECT to_regclass(stage.child_table) " +
+                "FROM oscar_obs_stage_partition stage WHERE stage.store_key=? AND stage.id_scope=? " +
+                "AND stage.state='ATTACHED') AND NOT EXISTS (SELECT 1 FROM oscar_obs_stage_owner owner " +
+                "WHERE owner.store_key=? AND owner.id_scope=? AND owner.observation_id=o.id) " +
+                "AND o.phenomenontime < ?"
+                : "SELECT min(o.phenomenontime) FROM " + getDatastoreName() +
                 " o JOIN " + getDataStreams().getDatastoreName() + " d ON d.id=o.datastreamid " +
-                "WHERE o.archivegenerationid IS NULL AND o.phenomenontime < ? AND d.data->>'outputName' = ANY (?)";
+                "WHERE o.archivegenerationid IS NULL AND o.phenomenontime < ? " +
+                "AND d.data->>'outputName' = ANY (?)";
         try (java.sql.Connection connection = connectionManager.getConnection();
              java.sql.PreparedStatement statement = connection.prepareStatement(sql)) {
-            UtcJdbcTime.setInstant(statement, 1, cutoff);
-            statement.setArray(2, connection.createArrayOf("text", archiveConfig.outputNames.toArray()));
+            int parameter = 1;
+            if (archiveConfig.isParquetPrimary()) {
+                statement.setString(parameter++, getDatastoreName());
+                statement.setInt(parameter++, idScope);
+                statement.setString(parameter++, getDatastoreName());
+                statement.setInt(parameter++, idScope);
+            }
+            UtcJdbcTime.setInstant(statement, parameter++, cutoff);
+            if (!archiveConfig.isParquetPrimary())
+                statement.setArray(parameter, connection.createArrayOf("text", archiveConfig.outputNames.toArray()));
             try (java.sql.ResultSet result = statement.executeQuery()) {
                 if (!result.next()) return java.util.Optional.empty();
                 Instant value = UtcJdbcTime.getInstant(result, 1);
@@ -456,21 +607,36 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
             throw new IllegalArgumentException("Archive candidate window must be non-empty");
         if (rowCap < 1)
             throw new IllegalArgumentException("Archive candidate row cap must be positive");
+        String candidateSource = archiveConfig.isParquetPrimary()
+                ? "FROM " + getDatastoreName() + " o WHERE o.tableoid IN (" +
+                "SELECT to_regclass(stage.child_table) FROM oscar_obs_stage_partition stage " +
+                "WHERE stage.store_key=? AND stage.id_scope=? AND stage.state='ATTACHED') " +
+                "AND NOT EXISTS (SELECT 1 FROM oscar_obs_stage_owner owner " +
+                "WHERE owner.store_key=? AND owner.id_scope=? AND owner.observation_id=o.id) " +
+                "AND o.phenomenontime >= ? AND o.phenomenontime < ? "
+                : "FROM " + getDatastoreName() + " o JOIN " + getDataStreams().getDatastoreName() +
+                " d ON d.id=o.datastreamid WHERE o.archivegenerationid IS NULL " +
+                "AND o.phenomenontime >= ? AND o.phenomenontime < ? " +
+                "AND d.data->>'outputName' = ANY (?) ";
         String sql = "SELECT count(*), COALESCE(sum(" +
                 ArchiveExporter.ESTIMATED_FIXED_BYTES_PER_ROW + "::bigint + " +
                 "COALESCE(octet_length(convert_to(candidate.result::text, 'UTF8')), 0)), 0), " +
-                "min(candidate.phenomenontime) " +
-                "FROM (SELECT o.result, o.phenomenontime FROM " + getDatastoreName() +
-                " o JOIN " + getDataStreams().getDatastoreName() + " d ON d.id=o.datastreamid " +
-                "WHERE o.archivegenerationid IS NULL AND o.phenomenontime >= ? AND o.phenomenontime < ? " +
-                "AND d.data->>'outputName' = ANY (?) " +
-                "ORDER BY o.phenomenontime, o.id LIMIT ?) candidate";
+                "min(candidate.phenomenontime) FROM (SELECT o.result,o.phenomenontime " +
+                candidateSource + "ORDER BY o.phenomenontime,o.id LIMIT ?) candidate";
         try (java.sql.Connection connection = connectionManager.getConnection();
              java.sql.PreparedStatement statement = connection.prepareStatement(sql)) {
-            UtcJdbcTime.setInstant(statement, 1, start);
-            UtcJdbcTime.setInstant(statement, 2, end);
-            statement.setArray(3, connection.createArrayOf("text", archiveConfig.outputNames.toArray()));
-            statement.setLong(4, Math.addExact(rowCap, 1));
+            int parameter = 1;
+            if (archiveConfig.isParquetPrimary()) {
+                statement.setString(parameter++, getDatastoreName());
+                statement.setInt(parameter++, idScope);
+                statement.setString(parameter++, getDatastoreName());
+                statement.setInt(parameter++, idScope);
+            }
+            UtcJdbcTime.setInstant(statement, parameter++, start);
+            UtcJdbcTime.setInstant(statement, parameter++, end);
+            if (!archiveConfig.isParquetPrimary())
+                statement.setArray(parameter++, connection.createArrayOf("text", archiveConfig.outputNames.toArray()));
+            statement.setLong(parameter, Math.addExact(rowCap, 1));
             try (java.sql.ResultSet result = statement.executeQuery()) {
                 if (!result.next())
                     return new ArchiveCandidateFootprint(0, 0, null);
@@ -1294,13 +1460,24 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
         ParameterizedQuery selected = queryBuilder.createParameterizedUnorderedSelectEntriesQuery(
                 unbounded, fields);
         String table = getDatastoreName();
+        String ownership = archiveConfig.isParquetPrimary()
+                ? "owner.generation_id"
+                : "marker.archivegenerationid";
+        String stageOwnership = archiveConfig.isParquetPrimary()
+                ? " LEFT JOIN oscar_obs_stage_partition stage ON stage.store_key='" + table + "' " +
+                "AND stage.id_scope=" + idScope + " AND marker.tableoid=to_regclass(stage.child_table) " +
+                "LEFT JOIN oscar_obs_stage_owner owner ON owner.store_key='" + table + "' " +
+                "AND owner.id_scope=" + idScope + " AND owner.child_table=stage.child_table " +
+                "AND owner.observation_id=marker.id"
+                : "";
         String sql = "SELECT matched.id, matched.datastreamid, matched.foiid, matched.phenomenontime, " +
                 "matched.resulttime, EXISTS (SELECT 1 FROM oscar_archive_generation generation " +
-                "WHERE generation.id=marker.archivegenerationid " +
+                "WHERE generation.id=" + ownership + " " +
                 "AND generation.store_key='" + getDatastoreName() + "' " +
                 "AND generation.id_scope=" + idScope + " " +
                 "AND generation.state IN ('ACTIVE','SEALED')) AS cold_overlap " +
-                "FROM (" + selected.sql() + ") matched JOIN " + table + " marker ON marker.id=matched.id";
+                "FROM (" + selected.sql() + ") matched JOIN " + table + " marker ON marker.id=matched.id" +
+                stageOwnership;
         try (Connection connection = connectionManager.getConnection()) {
             connection.setReadOnly(true);
             connection.setAutoCommit(false); // PostgreSQL cursor fetch requires a transaction
@@ -1642,7 +1819,8 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
     private void updateLiveObservation(Connection connection, BigId key, IObsData observation,
                                        String resultJson) throws Exception {
         try (PreparedStatement statement = connection.prepareStatement(
-                queryBuilder.updateByIdQuery() + " AND archivegenerationid IS NULL")) {
+                queryBuilder.updateByIdQuery() + " AND " +
+                        unownedLivePredicate(getDatastoreName()))) {
             statement.setLong(1, observation.getDataStreamID().getIdAsLong());
             if (observation.hasFoi())
                 statement.setLong(2, observation.getFoiID().getIdAsLong());
@@ -1726,7 +1904,8 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
                 } else {
                     try (PreparedStatement delete = connection.prepareStatement(
                             "DELETE FROM " + getDatastoreName() +
-                                    " WHERE id=? AND archivegenerationid IS NULL")) {
+                                    " WHERE id=? AND " +
+                                    unownedLivePredicate(getDatastoreName()))) {
                         delete.setLong(1, observationId);
                         if (delete.executeUpdate() != 1)
                             throw new IllegalStateException(
@@ -2230,10 +2409,23 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
 
         List<LockedHotRow> rows = new ArrayList<>(ids.size());
         java.sql.Array sqlIds = connection.createArrayOf("bigint", ids.toArray(Long[]::new));
-        try (PreparedStatement statement = connection.prepareStatement(
-                "SELECT id, datastreamid, foiid, phenomenontime, resulttime, result::text, " +
-                        "archivegenerationid FROM " + getDatastoreName() +
-                        " WHERE id=ANY (?::bigint[]) ORDER BY id FOR UPDATE")) {
+        String lockSql = archiveConfig.isParquetPrimary()
+                ? "SELECT observation.id,observation.datastreamid,observation.foiid," +
+                "observation.phenomenontime,observation.resulttime,observation.result::text," +
+                "COALESCE(owner.generation_id,observation.archivegenerationid) FROM " +
+                getDatastoreName() + " observation " +
+                "LEFT JOIN oscar_obs_stage_partition stage ON stage.store_key='" +
+                getDatastoreName() + "' AND stage.id_scope=" + idScope +
+                " AND observation.tableoid=to_regclass(stage.child_table) " +
+                "LEFT JOIN oscar_obs_stage_owner owner ON owner.store_key='" +
+                getDatastoreName() + "' AND owner.id_scope=" + idScope +
+                " AND owner.child_table=stage.child_table AND owner.observation_id=observation.id " +
+                "WHERE observation.id=ANY (?::bigint[]) ORDER BY observation.id FOR UPDATE OF observation"
+                : "SELECT observation.id,observation.datastreamid,observation.foiid," +
+                "observation.phenomenontime,observation.resulttime,observation.result::text," +
+                "observation.archivegenerationid FROM " + getDatastoreName() + " observation " +
+                "WHERE observation.id=ANY (?::bigint[]) ORDER BY observation.id FOR UPDATE OF observation";
+        try (PreparedStatement statement = connection.prepareStatement(lockSql)) {
             statement.setArray(1, sqlIds);
             try (ResultSet result = statement.executeQuery()) {
                 while (result.next()) {
@@ -2283,7 +2475,8 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
         long deleted = 0;
         try (PreparedStatement statement = connection.prepareStatement(
                 "DELETE FROM " + getDatastoreName() +
-                        " WHERE id=ANY (?::bigint[]) AND archivegenerationid IS NULL RETURNING id")) {
+                        " WHERE id=ANY (?::bigint[]) AND " +
+                        unownedLivePredicate(getDatastoreName()) + " RETURNING id")) {
             statement.setArray(1, ids);
             try (ResultSet result = statement.executeQuery()) {
                 while (result.next())
@@ -2295,6 +2488,58 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
         return deleted;
     }
 
+    /**
+     * Guards in-place changes to live rows. Primary mode records exact archive
+     * ownership in the compact staging sidecar rather than rewriting each raw
+     * observation tuple with an archive marker.
+     */
+    private String unownedLivePredicate(String observationReference) {
+        String marker = observationReference + ".archivegenerationid IS NULL";
+        if (!archiveConfig.isParquetPrimary())
+            return marker;
+        String store = getDatastoreName().replace("'", "''");
+        return marker + " AND NOT EXISTS (SELECT 1 FROM oscar_obs_stage_owner owner " +
+                "WHERE owner.store_key='" + store + "' AND owner.id_scope=" + idScope +
+                " AND owner.observation_id=" + observationReference + ".id)";
+    }
+
+    /**
+     * Removes only the transient row created by replaying an observation whose
+     * authoritative owner is already in a detached staging child. Global ID
+     * ownership must continue to protect the old child, so this exceptional
+     * cleanup is deliberately scoped to an attached child with no owner for
+     * that same physical child. Every other mutation path uses the global
+     * ownership predicate above.
+     */
+    private void deleteTemporaryReplayRow(Connection connection, long observationId)
+            throws SQLException {
+        String sql = archiveConfig.isParquetPrimary()
+                ? "DELETE FROM " + getDatastoreName() + " observation " +
+                "USING oscar_obs_stage_partition stage " +
+                "WHERE observation.id=? AND stage.store_key=? AND stage.id_scope=? " +
+                "AND stage.state='ATTACHED' " +
+                "AND observation.tableoid=to_regclass(stage.child_table) " +
+                "AND NOT EXISTS (SELECT 1 FROM oscar_obs_stage_owner owner " +
+                "WHERE owner.store_key=stage.store_key AND owner.id_scope=stage.id_scope " +
+                "AND owner.child_table=stage.child_table " +
+                "AND owner.observation_id=observation.id)"
+                : "DELETE FROM " + getDatastoreName() +
+                " observation WHERE observation.id=? " +
+                "AND observation.archivegenerationid IS NULL";
+        try (PreparedStatement delete = connection.prepareStatement(sql)) {
+            delete.setLong(1, observationId);
+            if (archiveConfig.isParquetPrimary()) {
+                delete.setString(2, getDatastoreName());
+                delete.setInt(3, idScope);
+            }
+            int deleted = delete.executeUpdate();
+            if (deleted != 1)
+                throw new IllegalStateException(
+                        "Expected exactly one transient attached replay row for observation " +
+                                observationId + ", deleted " + deleted);
+        }
+    }
+
     private java.util.Optional<LockedLogicalObservation> lockHotLogicalObservation(
             Connection connection, long observationId) throws Exception {
         return lockHotLogicalObservation(connection, observationId, true);
@@ -2302,9 +2547,23 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
 
     private java.util.Optional<LockedLogicalObservation> lockHotLogicalObservation(
             Connection connection, long observationId, boolean resolveOverlay) throws Exception {
-        try (PreparedStatement statement = connection.prepareStatement(
-                "SELECT datastreamid, foiid, phenomenontime, resulttime, result::text, archivegenerationid " +
-                        "FROM " + getDatastoreName() + " WHERE id=? FOR UPDATE")) {
+        String lockSql = archiveConfig.isParquetPrimary()
+                ? "SELECT observation.datastreamid,observation.foiid,observation.phenomenontime," +
+                "observation.resulttime,observation.result::text," +
+                "COALESCE(owner.generation_id,observation.archivegenerationid) FROM " +
+                getDatastoreName() + " observation " +
+                "LEFT JOIN oscar_obs_stage_partition stage ON stage.store_key='" +
+                getDatastoreName() + "' AND stage.id_scope=" + idScope +
+                " AND observation.tableoid=to_regclass(stage.child_table) " +
+                "LEFT JOIN oscar_obs_stage_owner owner ON owner.store_key='" +
+                getDatastoreName() + "' AND owner.id_scope=" + idScope +
+                " AND owner.child_table=stage.child_table AND owner.observation_id=observation.id " +
+                "WHERE observation.id=? FOR UPDATE OF observation"
+                : "SELECT observation.datastreamid,observation.foiid,observation.phenomenontime," +
+                "observation.resulttime,observation.result::text,observation.archivegenerationid " +
+                "FROM " + getDatastoreName() + " observation WHERE observation.id=? " +
+                "FOR UPDATE OF observation";
+        try (PreparedStatement statement = connection.prepareStatement(lockSql)) {
             statement.setLong(1, observationId);
             try (ResultSet result = statement.executeQuery()) {
                 if (!result.next())

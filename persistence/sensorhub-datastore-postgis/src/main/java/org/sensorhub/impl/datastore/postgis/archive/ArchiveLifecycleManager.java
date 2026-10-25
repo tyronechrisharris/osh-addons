@@ -21,7 +21,11 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 
-/** Verifies hot/cold parity and performs bounded exact-ID hot deletion after grace. */
+/**
+ * Verifies PostgreSQL/Parquet parity. HOT_RETENTION also performs bounded
+ * exact-ID deletion after grace; PARQUET_PRIMARY retires verified children in
+ * {@link ImmutableObservationStageManager}.
+ */
 public final class ArchiveLifecycleManager {
     private static final int VERIFY_BATCH = 5_000;
 
@@ -45,7 +49,11 @@ public final class ArchiveLifecycleManager {
                 config.maximumVerificationsPerCycle))
             verifyHotColdParity(generation);
 
-        if (!config.deleteHotAfterArchive)
+        // PARQUET_PRIMARY uses verified whole-partition retirement. Row-wise
+        // DELETE would recreate the table/index bloat this mode is designed to
+        // eliminate and could partially empty a partition before a later
+        // generation in the same window has passed parity.
+        if (!config.deleteHotAfterArchive || config.isParquetPrimary())
             return;
         Instant graceCutoff = Instant.now().minus(config.rollbackGraceDays, ChronoUnit.DAYS);
         for (ArchiveGeneration generation : catalog.readyForHotDeletion(

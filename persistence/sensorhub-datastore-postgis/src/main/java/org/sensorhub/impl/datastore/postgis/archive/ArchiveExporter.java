@@ -201,7 +201,16 @@ public final class ArchiveExporter {
                         "result_time TIMESTAMP, result_json VARCHAR, archive_version INTEGER, profile VARCHAR)");
             }
 
-            String query = "SELECT o.id, o.datastreamid, o.foiid, o.phenomenontime, o.resulttime, o.result::text " +
+            String query = config.isParquetPrimary()
+                    ? "SELECT o.id, o.datastreamid, o.foiid, o.phenomenontime, o.resulttime, o.result::text " +
+                    "FROM " + observationTable + " o WHERE o.tableoid IN (" +
+                    "SELECT to_regclass(stage.child_table) FROM oscar_obs_stage_partition stage " +
+                    "WHERE stage.store_key=? AND stage.id_scope=? AND stage.state='ATTACHED') " +
+                    "AND NOT EXISTS (SELECT 1 FROM oscar_obs_stage_owner owner " +
+                    "WHERE owner.store_key=? AND owner.id_scope=? AND owner.observation_id=o.id) " +
+                    "AND o.phenomenontime >= ? AND o.phenomenontime < ? " +
+                    "ORDER BY o.phenomenontime, o.id LIMIT ?"
+                    : "SELECT o.id, o.datastreamid, o.foiid, o.phenomenontime, o.resulttime, o.result::text " +
                     "FROM " + observationTable + " o JOIN " + dataStreamTable + " d ON d.id=o.datastreamid " +
                     "WHERE o.archivegenerationid IS NULL AND o.phenomenontime >= ? AND o.phenomenontime < ? " +
                     "AND d.data->>'outputName' = ANY (?) " +
@@ -210,15 +219,24 @@ public final class ArchiveExporter {
                  PreparedStatement insert = duck.prepareStatement(
                          "INSERT INTO archive_rows VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")) {
                 read.setFetchSize(FETCH_SIZE);
-                UtcJdbcTime.setInstant(read, 1, start);
-                UtcJdbcTime.setInstant(read, 2, end);
-                Array names = source.createArrayOf("text", config.outputNames.toArray());
-                read.setArray(3, names);
-                // One UTC hour can contain more data than a bounded DuckDB
+                int parameter = 1;
+                if (config.isParquetPrimary()) {
+                    read.setString(parameter++, observationTable);
+                    read.setInt(parameter++, idScope);
+                    read.setString(parameter++, observationTable);
+                    read.setInt(parameter++, idScope);
+                }
+                UtcJdbcTime.setInstant(read, parameter++, start);
+                UtcJdbcTime.setInstant(read, parameter++, end);
+                if (!config.isParquetPrimary()) {
+                    Array names = source.createArrayOf("text", config.outputNames.toArray());
+                    read.setArray(parameter++, names);
+                }
+                // One UTC archive window can contain more data than a bounded DuckDB
                 // session can safely stage.  Export a deterministic prefix;
                 // the next cycle creates a normal same-window revision for
                 // the remaining unowned rows.
-                read.setInt(4, config.maximumRowsPerGeneration);
+                read.setInt(parameter, config.maximumRowsPerGeneration);
                 try (ResultSet rows = read.executeQuery()) {
                     while (rows.next()) {
                         long id = rows.getLong(1);

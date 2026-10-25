@@ -7,6 +7,7 @@ import net.opengis.swe.v20.DataBlock;
 import org.junit.Test;
 import org.sensorhub.api.common.BigId;
 import org.sensorhub.api.data.DataStreamInfo;
+import org.sensorhub.api.data.IObsData;
 import org.sensorhub.api.data.ObsData;
 import org.sensorhub.api.datastore.ICancellableDataStore;
 import org.sensorhub.api.datastore.feature.FoiFilter;
@@ -105,6 +106,13 @@ public class TestDisposableTieredPostgresIntegration extends TestPostgisObsStore
         this.postgisObsStore = new TestableTieredStore(url, DB_NAME, login, password, TABLE,
                 DATABASE_NUM, IdProviderType.SEQUENTIAL, archiveConfig);
         return this.postgisObsStore;
+    }
+
+    @Override
+    @Test
+    public void testGetDatastoreName() throws Exception {
+        assertEquals(TABLE, postgisObsStore.getDatastoreName());
+        forceReadBackFromStorage();
     }
 
     @Test
@@ -461,7 +469,6 @@ public class TestDisposableTieredPostgresIntegration extends TestPostgisObsStore
                 TABLE + "_datastream_id_result_time_idx",
                 TABLE + "_foi_idx",
                 TABLE + "_unarchived_time_idx",
-                TABLE + "_archive_generation_idx",
                 TABLE + "_result_path_ops_idx",
                 TABLE + "_result_occupancy_count_idx",
                 TABLE + "_result_max_gamma_idx",
@@ -469,6 +476,8 @@ public class TestDisposableTieredPostgresIntegration extends TestPostgisObsStore
             assertTrue("Missing required PARQUET_PRIMARY index " + required,
                     indexes.contains(required));
         }
+        assertFalse("Fresh Parquet-primary metadata must not index an always-null marker",
+                indexes.contains(TABLE + "_archive_generation_idx"));
         assertTrue(indexDefinition(TABLE + "_result_path_ops_idx")
                 .toLowerCase().contains("using gin (result jsonb_path_ops)"));
         for (String numeric : List.of("occupancy_count", "max_gamma", "max_neutron")) {
@@ -492,7 +501,8 @@ public class TestDisposableTieredPostgresIntegration extends TestPostgisObsStore
         ArchiveGeneration generation = tiered.archiveWindow(
                 start, start.plus(1, ChronoUnit.HOURS), "RAW_GATED").orElseThrow();
         assertEquals(3, generation.rowCount());
-        assertEquals(3, archivedHotRows());
+        assertEquals(0, archivedHotRows());
+        assertEquals(3, stageOwnerRows());
 
         tiered.maintainArchiveLifecycle();
         assertTrue(oneGeneration(tiered.getArchiveCatalog()).parityVerified());
@@ -501,6 +511,7 @@ public class TestDisposableTieredPostgresIntegration extends TestPostgisObsStore
 
         assertEquals("Only the out-of-window control row may remain hot", 1, hotRows());
         assertEquals(0, archivedHotRows());
+        assertEquals(0, stageOwnerRows());
         assertEquals("SEALED", oneGeneration(tiered.getArchiveCatalog()).state());
         assertTrue(hotRowExists(laterHotKey.getIdAsLong()));
         BigId coldKey = archivedKeys.get(1);
@@ -530,6 +541,523 @@ public class TestDisposableTieredPostgresIntegration extends TestPostgisObsStore
         }
         assertEquals(4, tiered.getNumRecords());
         assertFalse(observationIndexNames().contains(TABLE + "_data_idx"));
+    }
+
+    @Test
+    public void parquetPrimaryRoutesRawRowsToLoggedDroppablePartitions() throws Exception {
+        String archiveRoot = archiveConfig.rootDirectory;
+        String temporaryRoot = archiveConfig.duckDbTemporaryDirectory;
+        postgisObsStore.close();
+        dropDisposableTieredTables(TABLE);
+        allDataStreams.clear();
+        allObs.clear();
+
+        TieredArchiveConfig primaryConfig = new TieredArchiveConfig();
+        primaryConfig.rootDirectory = archiveRoot;
+        primaryConfig.duckDbTemporaryDirectory = temporaryRoot;
+        primaryConfig.storageMode = TieredArchiveConfig.StorageMode.PARQUET_PRIMARY;
+        primaryConfig.outputNames = List.of("gammaCounts");
+        primaryConfig.immutableStageWindowMinutes = 30;
+        primaryConfig.maximumGenerationsPerCycle = 2;
+        primaryConfig.maximumVerificationsPerCycle = 2;
+        primaryConfig.maximumDeletionsPerCycle = 2;
+        primaryConfig.deleteHotAfterArchive = true;
+        archiveConfig = primaryConfig;
+
+        TestableTieredStore tiered = new TestableTieredStore(
+                url, DB_NAME, login, password, TABLE, DATABASE_NUM,
+                IdProviderType.SEQUENTIAL, archiveConfig);
+        postgisObsStore = tiered;
+        obsStore = tiered;
+
+        Instant start = Instant.parse("2026-08-01T00:00:00Z");
+        BigId rawStream = addSimpleDataStream(bigId(80), "gammaCounts");
+        BigId mutableStream = addSimpleDataStream(bigId(81), "occupancy");
+        BigId rawId = addSimpleObsWithoutResultTime(
+                rawStream, BigId.NONE, start.plusSeconds(1), 1, 0)
+                .keySet().iterator().next();
+        BigId mutableId = addSimpleObsWithoutResultTime(
+                mutableStream, BigId.NONE, start.plusSeconds(2), 1, 0)
+                .keySet().iterator().next();
+        forceReadBackFromStorage();
+
+        try (Connection connection = open()) {
+            assertEquals("Only mutable workflow metadata belongs in the base table",
+                    1, queryLong(connection, "SELECT count(*) FROM ONLY " + TABLE));
+        }
+        assertNotNull(tiered.get(rawId));
+        assertNotNull(tiered.get(mutableId));
+        assertEquals(2, tiered.getNumRecords());
+
+        var partitions = tiered.getImmutableStagePartitions();
+        assertEquals(1, partitions.size());
+        String child = partitions.get(0).childTable();
+        try (Connection connection = open()) {
+            try (PreparedStatement persistence = connection.prepareStatement(
+                    "SELECT relpersistence FROM pg_class WHERE oid=to_regclass(?)")) {
+                persistence.setString(1, child);
+                try (ResultSet result = persistence.executeQuery()) {
+                    assertTrue(result.next());
+                    assertEquals("p", result.getString(1)); // LOGGED, crash-recoverable
+                }
+            }
+            try (PreparedStatement indexes = connection.prepareStatement(
+                    "SELECT indexdef FROM pg_indexes WHERE tablename=?")) {
+                indexes.setString(1, child);
+                try (ResultSet result = indexes.executeQuery()) {
+                    int count = 0;
+                    while (result.next()) {
+                        count++;
+                        String definition = result.getString(1).toLowerCase();
+                        assertFalse(definition.contains("using gin"));
+                        assertFalse(definition.contains("jsonb_path_ops"));
+                    }
+                    assertEquals("The raw stage must retain only its three bounded indexes", 3, count);
+                }
+            }
+        }
+
+        // Archive eligibility is fixed when the row is received. A later
+        // metadata rename must not strand staged raw data.
+        try (Connection connection = open(); PreparedStatement rename = connection.prepareStatement(
+                "UPDATE " + TABLE + "_datastreams SET data=jsonb_set(data,'{outputName}'," +
+                        "to_jsonb(?::text),true) WHERE id=?")) {
+            rename.setString(1, "renamedRawOutput");
+            rename.setLong(2, rawStream.getIdAsLong());
+            assertEquals(1, rename.executeUpdate());
+        }
+
+        ArchiveGeneration generation = tiered.archiveWindow(
+                start, start.plus(30, ChronoUnit.MINUTES), "RAW_GATED").orElseThrow();
+        assertEquals(1, generation.rowCount());
+        assertEquals("Activation uses only the compact temporary ownership ledger",
+                0, archivedHotRows());
+        assertEquals(1, stageOwnerRows());
+        try (Connection connection = open(); PreparedStatement ownership = connection.prepareStatement(
+                "SELECT generation_id,child_table FROM oscar_obs_stage_owner " +
+                        "WHERE store_key=? AND id_scope=? AND observation_id=?")) {
+            ownership.setString(1, TABLE);
+            ownership.setInt(2, DATABASE_NUM);
+            ownership.setLong(3, rawId.getIdAsLong());
+            try (ResultSet result = ownership.executeQuery()) {
+                assertTrue(result.next());
+                assertEquals(generation.id(), result.getObject(1, UUID.class));
+                assertEquals(child, result.getString(2));
+            }
+        }
+
+        // Corrupt/extra ownership must fail closed rather than authorizing a
+        // whole-relation drop. Removing the injected inconsistency lets the
+        // next bounded lifecycle pass retire the verified child normally.
+        long orphanOwnerId = Math.addExact(rawId.getIdAsLong(), 1_000_000L);
+        try (Connection connection = open(); PreparedStatement orphan = connection.prepareStatement(
+                "INSERT INTO oscar_obs_stage_owner(" +
+                        "store_key,id_scope,child_table,observation_id,generation_id) " +
+                        "VALUES (?,?,?,?,?)")) {
+            orphan.setString(1, TABLE);
+            orphan.setInt(2, DATABASE_NUM);
+            orphan.setString(3, child);
+            orphan.setLong(4, orphanOwnerId);
+            orphan.setObject(5, generation.id());
+            assertEquals(1, orphan.executeUpdate());
+        }
+        tiered.maintainArchiveLifecycle();
+        assertEquals("Ownership without a physical staged row keeps the child fail-closed",
+                1, tiered.getImmutableStagePartitions().size());
+        try (Connection connection = open(); PreparedStatement orphan = connection.prepareStatement(
+                "DELETE FROM oscar_obs_stage_owner WHERE store_key=? AND id_scope=? " +
+                        "AND observation_id=?")) {
+            orphan.setString(1, TABLE);
+            orphan.setInt(2, DATABASE_NUM);
+            orphan.setLong(3, orphanOwnerId);
+            assertEquals(1, orphan.executeUpdate());
+        }
+        tiered.maintainArchiveLifecycle();
+
+        assertTrue(tiered.getImmutableStagePartitions().isEmpty());
+        try (Connection connection = open(); PreparedStatement relation = connection.prepareStatement(
+                "SELECT to_regclass(?) IS NULL")) {
+            relation.setString(1, child);
+            try (ResultSet result = relation.executeQuery()) {
+                assertTrue(result.next());
+                assertTrue("Verified stage relfile must be dropped as a whole", result.getBoolean(1));
+            }
+        }
+        try (Connection connection = open()) {
+            assertEquals("Mutable workflow row remains in PostgreSQL",
+                    1, queryLong(connection, "SELECT count(*) FROM ONLY " + TABLE));
+        }
+        assertEquals("SEALED", oneGeneration(tiered.getArchiveCatalog()).state());
+        assertEquals(0, stageOwnerRows());
+        assertNotNull("Raw row remains queryable from Parquet", tiered.get(rawId));
+        assertNotNull(tiered.get(mutableId));
+        assertEquals(2, tiered.getNumRecords());
+    }
+
+    @Test
+    public void parquetPrimaryUsesExactShortLivedOwnersAcrossCappedGenerations() throws Exception {
+        String archiveRoot = archiveConfig.rootDirectory;
+        String temporaryRoot = archiveConfig.duckDbTemporaryDirectory;
+        postgisObsStore.close();
+        dropDisposableTieredTables(TABLE);
+        allDataStreams.clear();
+        allObs.clear();
+
+        TieredArchiveConfig primaryConfig = new TieredArchiveConfig();
+        primaryConfig.rootDirectory = archiveRoot;
+        primaryConfig.duckDbTemporaryDirectory = temporaryRoot;
+        primaryConfig.storageMode = TieredArchiveConfig.StorageMode.PARQUET_PRIMARY;
+        primaryConfig.outputNames = List.of("gammaCounts");
+        primaryConfig.immutableStageWindowMinutes = 30;
+        primaryConfig.maximumRowsPerGeneration = 2;
+        primaryConfig.maximumGenerationsPerCycle = 3;
+        primaryConfig.maximumVerificationsPerCycle = 3;
+        primaryConfig.maximumDeletionsPerCycle = 3;
+        primaryConfig.deleteHotAfterArchive = true;
+        archiveConfig = primaryConfig;
+
+        TestableTieredStore tiered = new TestableTieredStore(
+                url, DB_NAME, login, password, TABLE, DATABASE_NUM,
+                IdProviderType.SEQUENTIAL, archiveConfig);
+        postgisObsStore = tiered;
+        obsStore = tiered;
+
+        Instant start = Instant.parse("2026-08-02T00:00:00Z");
+        BigId stream = addSimpleDataStream(bigId(82), "gammaCounts");
+        addSimpleObsWithoutResultTime(stream, BigId.NONE, start.plusSeconds(1), 5, 1_000L);
+        forceReadBackFromStorage();
+        assertEquals(1, tiered.getImmutableStagePartitions().size());
+
+        for (int generationNumber = 1; generationNumber <= 3; generationNumber++) {
+            ArchiveGeneration generation = tiered.archiveWindow(
+                    start, start.plus(30, ChronoUnit.MINUTES), "RAW_GATED").orElseThrow();
+            assertEquals(generationNumber < 3 ? 2 : 1, generation.rowCount());
+            assertEquals(Math.min(5, generationNumber * 2L), stageOwnerRows());
+            assertEquals("Primary staging rows never receive full-row archive markers",
+                    0, archivedHotRows());
+            tiered.maintainArchiveLifecycle();
+            if (generationNumber < 3) {
+                assertEquals("The physical child remains until every row has a verified owner",
+                        1, tiered.getImmutableStagePartitions().size());
+            }
+        }
+
+        assertTrue(tiered.getImmutableStagePartitions().isEmpty());
+        assertEquals(0, stageOwnerRows());
+        assertEquals(0, hotRows());
+        assertEquals(5, tiered.getNumRecords());
+        try (Connection connection = open()) {
+            assertEquals(3, queryLong(connection,
+                    "SELECT count(*) FROM oscar_archive_generation WHERE store_key='" +
+                            TABLE + "' AND id_scope=" + DATABASE_NUM));
+            assertEquals(5, queryLong(connection,
+                    "SELECT sum(row_count) FROM oscar_archive_generation WHERE store_key='" +
+                            TABLE + "' AND id_scope=" + DATABASE_NUM));
+        }
+        try (Stream<Map.Entry<BigId, IObsData>> rows = tiered.selectEntries(
+                new ObsFilter.Builder().build())) {
+            assertEquals(5, rows.count());
+        }
+    }
+
+    @Test
+    public void parquetPrimaryRetirementSerializesWithAWriterAlreadyRoutedToTheChild() throws Exception {
+        String archiveRoot = archiveConfig.rootDirectory;
+        String temporaryRoot = archiveConfig.duckDbTemporaryDirectory;
+        postgisObsStore.close();
+        dropDisposableTieredTables(TABLE);
+        allDataStreams.clear();
+        allObs.clear();
+
+        TieredArchiveConfig primaryConfig = new TieredArchiveConfig();
+        primaryConfig.rootDirectory = archiveRoot;
+        primaryConfig.duckDbTemporaryDirectory = temporaryRoot;
+        primaryConfig.storageMode = TieredArchiveConfig.StorageMode.PARQUET_PRIMARY;
+        primaryConfig.outputNames = List.of("gammaCounts");
+        primaryConfig.immutableStageWindowMinutes = 30;
+        primaryConfig.maximumGenerationsPerCycle = 2;
+        primaryConfig.maximumVerificationsPerCycle = 2;
+        primaryConfig.maximumDeletionsPerCycle = 2;
+        primaryConfig.deleteHotAfterArchive = true;
+        archiveConfig = primaryConfig;
+
+        TestableTieredStore tiered = new TestableTieredStore(
+                url, DB_NAME, login, password, TABLE, DATABASE_NUM,
+                IdProviderType.SEQUENTIAL, archiveConfig);
+        postgisObsStore = tiered;
+        obsStore = tiered;
+
+        Instant start = Instant.parse("2026-08-03T00:00:00Z");
+        BigId stream = addSimpleDataStream(bigId(84), "gammaCounts");
+        BigId base = addSimpleObsWithoutResultTime(
+                stream, BigId.NONE, start.plusSeconds(1), 1, 0)
+                .keySet().iterator().next();
+        forceReadBackFromStorage();
+        String resultJson = hotResultJson(base.getIdAsLong());
+        tiered.archiveWindow(start, start.plus(30, ChronoUnit.MINUTES), "RAW_GATED")
+                .orElseThrow();
+
+        long lateId = Math.addExact(base.getIdAsLong(), 1_000_000L);
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        try (Connection writer = open(); PreparedStatement insert = writer.prepareStatement(
+                "INSERT INTO " + TABLE +
+                        "(id,datastreamid,foiid,phenomenontime,resulttime,result) " +
+                        "VALUES (?,?,NULL,?,NULL,?::jsonb)")) {
+            writer.setAutoCommit(false);
+            insert.setLong(1, lateId);
+            insert.setLong(2, stream.getIdAsLong());
+            UtcJdbcTime.setInstant(insert, 3, start.plusSeconds(2));
+            insert.setString(4, resultJson);
+            assertEquals(0, insert.executeUpdate()); // BEFORE trigger routes to the child
+
+            Future<?> retirement = executor.submit(tiered::maintainArchiveLifecycle);
+            waitForStageCatalogLockWaiter();
+            writer.commit();
+            retirement.get(30, TimeUnit.SECONDS);
+        } finally {
+            executor.shutdownNow();
+            executor.awaitTermination(30, TimeUnit.SECONDS);
+        }
+
+        assertEquals("The just-committed unowned row prevents stale-snapshot retirement",
+                1, tiered.getImmutableStagePartitions().size());
+        assertEquals(1, stageOwnerRows());
+        assertEquals(2, hotRows());
+
+        ArchiveGeneration late = tiered.archiveWindow(
+                start, start.plus(30, ChronoUnit.MINUTES), "RAW_GATED").orElseThrow();
+        assertEquals(1, late.rowCount());
+        tiered.maintainArchiveLifecycle();
+        assertTrue(tiered.getImmutableStagePartitions().isEmpty());
+        assertEquals(0, stageOwnerRows());
+        assertEquals(2, tiered.getNumRecords());
+    }
+
+    @Test
+    public void parquetPrimaryMutationsRespectExactSidecarOwnershipBeforeChildDrop() throws Exception {
+        String archiveRoot = archiveConfig.rootDirectory;
+        String temporaryRoot = archiveConfig.duckDbTemporaryDirectory;
+        postgisObsStore.close();
+        dropDisposableTieredTables(TABLE);
+        allDataStreams.clear();
+        allObs.clear();
+
+        TieredArchiveConfig primaryConfig = new TieredArchiveConfig();
+        primaryConfig.rootDirectory = archiveRoot;
+        primaryConfig.duckDbTemporaryDirectory = temporaryRoot;
+        primaryConfig.storageMode = TieredArchiveConfig.StorageMode.PARQUET_PRIMARY;
+        primaryConfig.outputNames = List.of("gammaCounts");
+        primaryConfig.immutableStageWindowMinutes = 30;
+        primaryConfig.maximumRowsPerGeneration = 2;
+        primaryConfig.maximumGenerationsPerCycle = 2;
+        primaryConfig.maximumVerificationsPerCycle = 2;
+        primaryConfig.maximumDeletionsPerCycle = 2;
+        primaryConfig.deleteHotAfterArchive = true;
+        archiveConfig = primaryConfig;
+
+        TestableTieredStore tiered = new TestableTieredStore(
+                url, DB_NAME, login, password, TABLE, DATABASE_NUM,
+                IdProviderType.SEQUENTIAL, archiveConfig);
+        postgisObsStore = tiered;
+        obsStore = tiered;
+
+        Instant start = Instant.parse("2026-08-04T00:00:00Z");
+        BigId stream = addSimpleDataStream(bigId(85), "gammaCounts");
+        List<BigId> keys = addSimpleObsWithoutResultTime(
+                stream, BigId.NONE, start.plusSeconds(1), 3, 1_000L)
+                .keySet().stream().sorted(Comparator.comparingLong(BigId::getIdAsLong)).toList();
+        forceReadBackFromStorage();
+        ArchiveGeneration generation = tiered.archiveWindow(
+                start, start.plus(30, ChronoUnit.MINUTES), "RAW_GATED").orElseThrow();
+        assertEquals(2, generation.rowCount());
+        assertEquals(2, stageOwnerRows());
+
+        BigId corrected = keys.get(0);
+        String immutableBase = hotResultJson(corrected.getIdAsLong());
+        tiered.put(corrected, new ObsData.Builder()
+                .withDataStream(stream)
+                .withPhenomenonTime(start.plusSeconds(1))
+                .withResult(values(501))
+                .build());
+        assertEquals("An archive-owned staged base is never rewritten",
+                immutableBase, hotResultJson(corrected.getIdAsLong()));
+        assertEquals(501.0, tiered.get(corrected).getResult().getDoubleValue(0), 0.0);
+        assertEquals(generation.id(), tiered.getArchiveCatalog().overlayWithGeneration(
+                corrected.getIdAsLong(), DATABASE_NUM, "OVERLAY").orElseThrow().generationId());
+
+        BigId tombstoned = keys.get(1);
+        assertNotNull(tiered.remove(tombstoned));
+        assertTrue("The owned parity base remains physical until child retirement",
+                hotRowExists(tombstoned.getIdAsLong()));
+        assertTrue(tiered.get(tombstoned) == null);
+        assertEquals(generation.id(), tombstoneGeneration(tombstoned.getIdAsLong()));
+
+        BigId unowned = keys.get(2);
+        assertNotNull(tiered.remove(unowned));
+        assertFalse("An unowned staged row is still an ordinary live delete",
+                hotRowExists(unowned.getIdAsLong()));
+
+        tiered.maintainArchiveLifecycle();
+        assertTrue(tiered.getImmutableStagePartitions().isEmpty());
+        assertEquals(0, stageOwnerRows());
+        assertEquals(1, tiered.getNumRecords());
+        assertEquals(501.0, tiered.get(corrected).getResult().getDoubleValue(0), 0.0);
+        assertTrue(tiered.get(tombstoned) == null);
+        assertTrue(tiered.get(unowned) == null);
+    }
+
+    @Test
+    public void parquetPrimaryReplayDuringDetachedCrashWindowLeavesNoDuplicate() throws Exception {
+        String archiveRoot = archiveConfig.rootDirectory;
+        String temporaryRoot = archiveConfig.duckDbTemporaryDirectory;
+        postgisObsStore.close();
+        dropDisposableTieredTables(TABLE);
+        allDataStreams.clear();
+        allObs.clear();
+
+        TieredArchiveConfig primaryConfig = new TieredArchiveConfig();
+        primaryConfig.rootDirectory = archiveRoot;
+        primaryConfig.duckDbTemporaryDirectory = temporaryRoot;
+        primaryConfig.storageMode = TieredArchiveConfig.StorageMode.PARQUET_PRIMARY;
+        primaryConfig.outputNames = List.of("gammaCounts");
+        primaryConfig.immutableStageWindowMinutes = 30;
+        primaryConfig.maximumStagePartitionsPerCycle = 4;
+        primaryConfig.maximumGenerationsPerCycle = 2;
+        primaryConfig.maximumVerificationsPerCycle = 2;
+        primaryConfig.maximumDeletionsPerCycle = 2;
+        primaryConfig.deleteHotAfterArchive = true;
+        archiveConfig = primaryConfig;
+
+        TestableTieredStore tiered = new TestableTieredStore(
+                url, DB_NAME, login, password, TABLE, DATABASE_NUM,
+                IdProviderType.SEQUENTIAL, archiveConfig);
+        postgisObsStore = tiered;
+        obsStore = tiered;
+
+        Instant start = Instant.parse("2026-08-05T00:00:00Z");
+        BigId stream = addSimpleDataStream(bigId(86), "gammaCounts");
+        BigId stableId = addSimpleObsWithoutResultTime(
+                stream, BigId.NONE, start.plusSeconds(1), 1, 0)
+                .keySet().iterator().next();
+        forceReadBackFromStorage();
+        ArchiveGeneration generation = tiered.archiveWindow(
+                start, start.plus(30, ChronoUnit.MINUTES), "RAW_GATED").orElseThrow();
+        String detachedChild = tiered.getImmutableStagePartitions().get(0).childTable();
+
+        // Simulate a power loss after the verified NO INHERIT transaction has
+        // committed but before the lifecycle's separately committed DROP.
+        try (Connection connection = open(); Statement statement = connection.createStatement()) {
+            connection.setAutoCommit(false);
+            try (PreparedStatement verify = connection.prepareStatement(
+                    "UPDATE oscar_archive_generation SET parity_verified=true " +
+                            "WHERE id=? AND store_key=? AND id_scope=?")) {
+                verify.setObject(1, generation.id());
+                verify.setString(2, TABLE);
+                verify.setInt(3, DATABASE_NUM);
+                assertEquals(1, verify.executeUpdate());
+            }
+            statement.execute("ALTER TABLE " + detachedChild + " NO INHERIT " + TABLE);
+            try (PreparedStatement detach = connection.prepareStatement(
+                    "UPDATE oscar_obs_stage_partition SET state='DETACHED',detached_at=now() " +
+                            "WHERE store_key=? AND id_scope=? AND child_table=? AND state='ATTACHED'")) {
+                detach.setString(1, TABLE);
+                detach.setInt(2, DATABASE_NUM);
+                detach.setString(3, detachedChild);
+                assertEquals(1, detach.executeUpdate());
+            }
+            connection.commit();
+        }
+
+        tiered.close();
+        tiered = new TestableTieredStore(url, DB_NAME, login, password, TABLE,
+                DATABASE_NUM, IdProviderType.SEQUENTIAL, archiveConfig);
+        postgisObsStore = tiered;
+        obsStore = tiered;
+
+        // An exact replay temporarily routes to a replacement attached child,
+        // then reconcile removes only that physical duplicate. The global
+        // owner for the detached child remains authoritative.
+        BigId replay = tiered.add(new ObsData.Builder().withDataStream(stream)
+                .withPhenomenonTime(start.plusSeconds(1)).withResult(values(0)).build());
+        assertEquals(stableId, replay);
+        tiered.commit();
+        assertEquals(0, hotRows());
+        assertEquals(1, stageOwnerRows());
+        assertEquals(1, tiered.getNumRecords());
+        assertTrue(tiered.getArchiveCatalog().overlayWithGeneration(
+                stableId.getIdAsLong(), DATABASE_NUM, "OVERLAY").isEmpty());
+
+        // A correction follows the same cleanup path but persists its logical
+        // replacement as a generation-owned overlay.
+        BigId correction = tiered.add(new ObsData.Builder().withDataStream(stream)
+                .withPhenomenonTime(start.plusSeconds(1)).withResult(values(700)).build());
+        assertEquals(stableId, correction);
+        tiered.commit();
+        assertEquals(0, hotRows());
+        assertEquals(1, tiered.getNumRecords());
+        assertEquals(700.0, tiered.get(stableId).getResult().getDoubleValue(0), 0.0);
+        assertEquals(generation.id(), tiered.getArchiveCatalog().overlayWithGeneration(
+                stableId.getIdAsLong(), DATABASE_NUM, "OVERLAY").orElseThrow().generationId());
+
+        tiered.maintainArchiveLifecycle();
+        assertTrue(tiered.getImmutableStagePartitions().isEmpty());
+        assertEquals(0, stageOwnerRows());
+        try (Connection connection = open(); PreparedStatement relation = connection.prepareStatement(
+                "SELECT to_regclass(?) IS NULL")) {
+            relation.setString(1, detachedChild);
+            try (ResultSet result = relation.executeQuery()) {
+                assertTrue(result.next());
+                assertTrue(result.getBoolean(1));
+            }
+        }
+        assertEquals("SEALED", oneGeneration(tiered.getArchiveCatalog()).state());
+        assertEquals(1, tiered.getNumRecords());
+        assertEquals(700.0, tiered.get(stableId).getResult().getDoubleValue(0), 0.0);
+    }
+
+    @Test
+    public void parquetPrimaryRejectsFutureDetectorClockBeforeCreatingStageState() throws Exception {
+        String archiveRoot = archiveConfig.rootDirectory;
+        String temporaryRoot = archiveConfig.duckDbTemporaryDirectory;
+        postgisObsStore.close();
+        dropDisposableTieredTables(TABLE);
+        allDataStreams.clear();
+        allObs.clear();
+
+        TieredArchiveConfig primaryConfig = new TieredArchiveConfig();
+        primaryConfig.rootDirectory = archiveRoot;
+        primaryConfig.duckDbTemporaryDirectory = temporaryRoot;
+        primaryConfig.storageMode = TieredArchiveConfig.StorageMode.PARQUET_PRIMARY;
+        primaryConfig.outputNames = List.of("gammaCounts");
+        primaryConfig.maximumFuturePhenomenonSkewMinutes = 5;
+        primaryConfig.maximumGenerationsPerCycle = 2;
+        primaryConfig.maximumVerificationsPerCycle = 2;
+        primaryConfig.maximumDeletionsPerCycle = 2;
+        primaryConfig.deleteHotAfterArchive = true;
+        archiveConfig = primaryConfig;
+
+        TestableTieredStore tiered = new TestableTieredStore(
+                url, DB_NAME, login, password, TABLE, DATABASE_NUM,
+                IdProviderType.SEQUENTIAL, archiveConfig);
+        postgisObsStore = tiered;
+        obsStore = tiered;
+        BigId stream = addSimpleDataStream(bigId(83), "gammaCounts");
+        tiered.getDataStreams().commit();
+
+        try (Connection connection = open()) {
+            connection.setAutoCommit(false);
+            SQLException skew = assertThrows(SQLException.class, () ->
+                    tiered.prepareImmutableForTest(connection, 90_001L,
+                            stream.getIdAsLong(), Instant.now().plus(10, ChronoUnit.MINUTES)));
+            assertTrue(skew.getMessage().contains("exceeds the PostgreSQL receipt clock"));
+            connection.rollback();
+        }
+        assertTrue(tiered.getImmutableStagePartitions().isEmpty());
+        try (Connection connection = open()) {
+            assertEquals(0, queryLong(connection,
+                    "SELECT count(*) FROM oscar_obs_storage_route WHERE store_key='" +
+                            TABLE + "' AND id_scope=" + DATABASE_NUM));
+        }
     }
 
     @Test
@@ -2968,10 +3496,52 @@ public class TestDisposableTieredPostgresIntegration extends TestPostgisObsStore
     }
 
     private void dropDisposableTieredTables(String observationTable) throws Exception {
-        try (Connection connection = open(); Statement statement = connection.createStatement()) {
+        try (Connection connection = open()) {
+            List<String> stageChildren = new ArrayList<>();
+            try (PreparedStatement partitions = connection.prepareStatement(
+                    "SELECT child_table FROM oscar_obs_stage_partition WHERE store_key=?")) {
+                partitions.setString(1, observationTable);
+                try (ResultSet result = partitions.executeQuery()) {
+                    while (result.next())
+                        stageChildren.add(result.getString(1));
+                }
+            } catch (SQLException absentOnLegacySchema) {
+                if (!"42P01".equals(absentOnLegacySchema.getSQLState()))
+                    throw absentOnLegacySchema;
+            }
+            try (Statement statement = connection.createStatement()) {
+                for (String stageChild : stageChildren)
+                    statement.execute("DROP TABLE IF EXISTS " + stageChild);
+            }
+            try (PreparedStatement routes = connection.prepareStatement(
+                    "DELETE FROM oscar_obs_storage_route WHERE store_key=?")) {
+                routes.setString(1, observationTable);
+                routes.executeUpdate();
+            } catch (SQLException absentOnLegacySchema) {
+                if (!"42P01".equals(absentOnLegacySchema.getSQLState()))
+                    throw absentOnLegacySchema;
+            }
+            try (PreparedStatement owners = connection.prepareStatement(
+                    "DELETE FROM oscar_obs_stage_owner WHERE store_key=?")) {
+                owners.setString(1, observationTable);
+                owners.executeUpdate();
+            } catch (SQLException absentOnLegacySchema) {
+                if (!"42P01".equals(absentOnLegacySchema.getSQLState()))
+                    throw absentOnLegacySchema;
+            }
+            try (PreparedStatement partitions = connection.prepareStatement(
+                    "DELETE FROM oscar_obs_stage_partition WHERE store_key=?")) {
+                partitions.setString(1, observationTable);
+                partitions.executeUpdate();
+            } catch (SQLException absentOnLegacySchema) {
+                if (!"42P01".equals(absentOnLegacySchema.getSQLState()))
+                    throw absentOnLegacySchema;
+            }
+            try (Statement statement = connection.createStatement()) {
             statement.execute("DROP TABLE IF EXISTS " + observationTable);
             statement.execute("DROP TABLE IF EXISTS " + observationTable + "_datastreams");
             statement.execute("DROP TABLE IF EXISTS " + observationTable + "_fois");
+            }
         }
     }
 
@@ -3286,6 +3856,12 @@ public class TestDisposableTieredPostgresIntegration extends TestPostgisObsStore
             }
             validateInsertOutcomes(connection, List.of(observation));
         }
+
+        void prepareImmutableForTest(Connection connection, long id, long streamId,
+                                     Instant phenomenonTime) throws Exception {
+            beforeObservationWrite(connection, List.of(preparedObservation(
+                    id, streamId, null, phenomenonTime, null, "{}")));
+        }
     }
 
     private void assertCatalogV5AndActivation(ArchiveGeneration generation) throws Exception {
@@ -3437,6 +4013,18 @@ public class TestDisposableTieredPostgresIntegration extends TestPostgisObsStore
         }
     }
 
+    private long stageOwnerRows() throws Exception {
+        try (Connection connection = open(); PreparedStatement statement = connection.prepareStatement(
+                "SELECT count(*) FROM oscar_obs_stage_owner WHERE store_key=? AND id_scope=?")) {
+            statement.setString(1, TABLE);
+            statement.setInt(2, DATABASE_NUM);
+            try (ResultSet result = statement.executeQuery()) {
+                assertTrue(result.next());
+                return result.getLong(1);
+            }
+        }
+    }
+
     private List<String> observationIndexNames() throws Exception {
         List<String> indexes = new ArrayList<>();
         try (Connection connection = open(); PreparedStatement statement = connection.prepareStatement(
@@ -3554,6 +4142,25 @@ public class TestDisposableTieredPostgresIntegration extends TestPostgisObsStore
             Thread.sleep(20);
         }
         throw new AssertionError("Archive activation did not reach the PostgreSQL barrier");
+    }
+
+    private void waitForStageCatalogLockWaiter() throws Exception {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+        while (System.nanoTime() < deadline) {
+            try (Connection observer = open(); Statement statement = observer.createStatement();
+                 ResultSet result = statement.executeQuery(
+                         "SELECT count(*) FROM pg_stat_activity " +
+                                 "WHERE datname=current_database() AND pid<>pg_backend_pid() " +
+                                 "AND wait_event_type='Lock' " +
+                                 "AND query ILIKE '%oscar_obs_stage_partition%' " +
+                                 "AND query ILIKE '%FOR UPDATE%'")) {
+                assertTrue(result.next());
+                if (result.getLong(1) >= 1)
+                    return;
+            }
+            Thread.sleep(20L);
+        }
+        throw new AssertionError("Timed out waiting for staging-catalog retirement lock");
     }
 
     private void waitForAdvisoryWaiters(int minimum) throws Exception {

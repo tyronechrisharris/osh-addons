@@ -32,6 +32,10 @@ public class TestTieredArchiveConfiguration {
         assertTrue(config.requireParityReceipt);
         assertTrue(config.maximumGenerationsPerCycle > 1);
         assertTrue(config.maximumCycleMinutes > 0);
+        assertEquals(30, config.immutableStageWindowMinutes);
+        assertEquals(5, config.maximumFuturePhenomenonSkewMinutes);
+        assertEquals(1, config.parquetPrimaryIntervalMinutes);
+        assertTrue(config.maximumStagePartitionsPerCycle > 0);
         assertTrue(config.maximumUncompressedBytesPerGeneration > 0);
         assertTrue(config.effectiveMaximumUncompressedBytesPerGeneration() <=
                 config.maximumUncompressedBytesPerGeneration);
@@ -46,7 +50,7 @@ public class TestTieredArchiveConfiguration {
     }
 
     @Test
-    public void parquetPrimaryIsExplicitAndRequiresBoundedHotDeletion() {
+    public void parquetPrimaryIsExplicitAndRequiresVerifiedStageRetirement() {
         TieredArchiveConfig config = new TieredArchiveConfig();
         config.storageMode = StorageMode.PARQUET_PRIMARY;
 
@@ -68,23 +72,37 @@ public class TestTieredArchiveConfiguration {
         IllegalArgumentException disabled = assertThrows(
                 IllegalArgumentException.class, config::validate);
         assertTrue(disabled.getMessage().contains("requires the cold archive"));
+
+        config.enabled = true;
+        config.outputNames = java.util.List.of("gammaCounts", "gammaCounts");
+        IllegalArgumentException duplicate = assertThrows(
+                IllegalArgumentException.class, config::validate);
+        assertTrue(duplicate.getMessage().contains("unique"));
     }
 
     @Test
-    public void parquetPrimaryArchivesOnlyCompletedUtcHourBatches() {
+    public void parquetPrimaryArchivesOnlyCompletedUtcStageWindows() {
         TieredArchiveConfig config = new TieredArchiveConfig();
         config.hotRetentionDays = 2;
+        config.immutableStageWindowMinutes = 15;
+        // HOT_RETENTION keeps its historical whole-hour cutoff and does not
+        // inherit the Parquet-primary staging window.
         assertEquals(Instant.parse("2026-01-01T13:00:00Z"),
                 config.archiveCutoff(Instant.parse("2026-01-03T13:47:00Z")));
 
         config.storageMode = StorageMode.PARQUET_PRIMARY;
         config.deleteHotAfterArchive = true;
         config.parquetPrimaryArchiveDelayMinutes = 5;
+        config.immutableStageWindowMinutes = 30;
 
-        assertEquals(Instant.parse("2026-01-01T12:00:00Z"),
-                config.archiveCutoff(Instant.parse("2026-01-01T13:04:59Z")));
         assertEquals(Instant.parse("2026-01-01T13:00:00Z"),
-                config.archiveCutoff(Instant.parse("2026-01-01T13:05:00Z")));
+                config.archiveCutoff(Instant.parse("2026-01-01T13:34:59.999999999Z")));
+        assertEquals(Instant.parse("2026-01-01T13:30:00Z"),
+                config.archiveCutoff(Instant.parse("2026-01-01T13:35:00Z")));
+        assertEquals(Instant.parse("2026-01-01T23:30:00Z"),
+                config.archiveCutoff(Instant.parse("2026-01-02T00:04:59Z")));
+        assertEquals(Instant.parse("2026-01-02T00:00:00Z"),
+                config.archiveCutoff(Instant.parse("2026-01-02T00:05:00Z")));
     }
 
     @Test
@@ -101,16 +119,61 @@ public class TestTieredArchiveConfiguration {
     }
 
     @Test
+    public void immutableStageWindowMustDivideUtcDayAndNotExceedOneHour() {
+        TieredArchiveConfig config = new TieredArchiveConfig();
+        config.immutableStageWindowMinutes = 0;
+        assertThrows(IllegalArgumentException.class, config::validate);
+        config.immutableStageWindowMinutes = 50;
+        assertThrows(IllegalArgumentException.class, config::validate);
+        config.immutableStageWindowMinutes = 61;
+        assertThrows(IllegalArgumentException.class, config::validate);
+        config.immutableStageWindowMinutes = 60;
+        config.validate();
+        config.parquetPrimaryIntervalMinutes = 0;
+        assertThrows(IllegalArgumentException.class, config::validate);
+        config.parquetPrimaryIntervalMinutes = 1;
+        config.maximumStagePartitionsPerCycle = 0;
+        assertThrows(IllegalArgumentException.class, config::validate);
+
+        config.maximumStagePartitionsPerCycle = 1;
+        config.maximumFuturePhenomenonSkewMinutes = -1;
+        assertThrows(IllegalArgumentException.class, config::validate);
+        config.maximumFuturePhenomenonSkewMinutes = 16;
+        assertThrows(IllegalArgumentException.class, config::validate);
+    }
+
+    @Test
+    public void parquetPrimaryNominalStageResidenceMustFitOneHour() {
+        TieredArchiveConfig config = new TieredArchiveConfig();
+        config.storageMode = StorageMode.PARQUET_PRIMARY;
+        config.deleteHotAfterArchive = true;
+        config.immutableStageWindowMinutes = 30;
+        config.parquetPrimaryArchiveDelayMinutes = 5;
+        config.parquetPrimaryIntervalMinutes = 1;
+        config.maximumFuturePhenomenonSkewMinutes = 5;
+        config.maximumGenerationsPerCycle = 2;
+        config.validate();
+
+        config.parquetPrimaryArchiveDelayMinutes = 25;
+        IllegalArgumentException overBudget = assertThrows(
+                IllegalArgumentException.class, config::validate);
+        assertTrue(overBudget.getMessage().contains("total no more than 60 minutes"));
+    }
+
+    @Test
     public void parquetPrimaryLifecycleBudgetsMustKeepPaceWithExports() {
         TieredArchiveConfig config = new TieredArchiveConfig();
         config.storageMode = StorageMode.PARQUET_PRIMARY;
         config.deleteHotAfterArchive = true;
         config.maximumGenerationsPerCycle = 3;
-        config.maximumVerificationsPerCycle = 3;
-        config.maximumDeletionsPerCycle = 2;
-        IllegalArgumentException deletionBacklog = assertThrows(
+        config.maximumVerificationsPerCycle = 2;
+        IllegalArgumentException verificationBacklog = assertThrows(
                 IllegalArgumentException.class, config::validate);
-        assertTrue(deletionBacklog.getMessage().contains("maximumDeletionsPerCycle"));
+        assertTrue(verificationBacklog.getMessage().contains("maximumVerificationsPerCycle"));
+
+        config.maximumVerificationsPerCycle = 3;
+        config.maximumDeletionsPerCycle = 1;
+        config.validate(); // row-deletion budget is HOT_RETENTION-only
     }
 
     @Test
@@ -209,6 +272,15 @@ public class TestTieredArchiveConfiguration {
         assertEquals(Instant.parse("2026-01-01T12:00:00Z"),
                 OscarTieredObsSystemDatabase.utcHourWindowStart(
                         Instant.parse("2026-01-01T12:34:56.789Z")));
+        assertEquals(Instant.parse("2026-01-01T12:30:00Z"),
+                OscarTieredObsSystemDatabase.utcWindowStart(
+                        Instant.parse("2026-01-01T12:34:56.789Z"), 30));
+        assertEquals(Instant.parse("1969-12-31T23:30:00Z"),
+                OscarTieredObsSystemDatabase.utcWindowStart(
+                        Instant.parse("1969-12-31T23:59:59.999Z"), 30));
+        assertThrows(IllegalArgumentException.class, () ->
+                OscarTieredObsSystemDatabase.utcWindowStart(
+                        Instant.parse("2026-01-01T12:34:56.789Z"), 50));
     }
 
     @Test

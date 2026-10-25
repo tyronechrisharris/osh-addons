@@ -829,27 +829,57 @@ public final class ArchiveCatalog {
                 // Parquet decoding.  Exact row predicates below still reject
                 // every mutation that committed before this lock was granted.
                 lockForActivation(connection);
-                try (PreparedStatement mark = connection.prepareStatement(
-                        "UPDATE " + observations + " o SET archivegenerationid=? " +
-                                "FROM oscar_archive_activation_row exported, " + dataStreams + " d " +
-                                "WHERE o.id=exported.observation_id AND d.id=o.datastreamid " +
-                                "AND o.archivegenerationid IS NULL " +
-                                "AND o.datastreamid=exported.datastream_id " +
-                                "AND o.foiid IS NOT DISTINCT FROM exported.foi_id " +
-                                "AND o.phenomenontime IS NOT DISTINCT FROM exported.phenomenon_time " +
-                                "AND o.resulttime IS NOT DISTINCT FROM exported.result_time " +
-                                "AND o.result IS NOT DISTINCT FROM exported.result_json " +
-                                "AND o.phenomenontime>=? AND o.phenomenontime<? " +
-                                "AND d.data->>'outputName'=ANY (?)")) {
-                    mark.setObject(1, generation.id());
-                    UtcJdbcTime.setInstant(mark, 2, generation.start());
-                    UtcJdbcTime.setInstant(mark, 3, generation.end());
-                    mark.setArray(4, connection.createArrayOf("text", outputNames.toArray()));
-                    int marked = mark.executeUpdate();
-                    if (marked != generation.rowCount())
-                        throw new IllegalStateException("Archive snapshot changed before activation: expected " +
-                                generation.rowCount() + " exact rows but marked " + marked);
+                int marked;
+                if (resourceConfig.isParquetPrimary()) {
+                    String ownSql = "INSERT INTO oscar_obs_stage_owner(" +
+                            "store_key,id_scope,child_table,observation_id,generation_id) " +
+                            "SELECT ?,?,stage.child_table,o.id,? FROM " + observations + " o " +
+                            "JOIN oscar_archive_activation_row exported ON o.id=exported.observation_id " +
+                            "JOIN oscar_obs_stage_partition stage ON o.tableoid=to_regclass(stage.child_table) " +
+                            "WHERE stage.store_key=? AND stage.id_scope=? AND stage.state='ATTACHED' " +
+                            "AND NOT EXISTS (SELECT 1 FROM oscar_obs_stage_owner owner " +
+                            "WHERE owner.store_key=stage.store_key AND owner.id_scope=stage.id_scope " +
+                            "AND owner.observation_id=o.id) " +
+                            "AND o.datastreamid=exported.datastream_id " +
+                            "AND o.foiid IS NOT DISTINCT FROM exported.foi_id " +
+                            "AND o.phenomenontime IS NOT DISTINCT FROM exported.phenomenon_time " +
+                            "AND o.resulttime IS NOT DISTINCT FROM exported.result_time " +
+                            "AND o.result IS NOT DISTINCT FROM exported.result_json " +
+                            "AND o.phenomenontime>=? AND o.phenomenontime<? " +
+                            "ON CONFLICT(store_key,id_scope,observation_id) DO NOTHING";
+                    try (PreparedStatement own = connection.prepareStatement(ownSql)) {
+                        own.setString(1, observations);
+                        own.setInt(2, idScope);
+                        own.setObject(3, generation.id());
+                        own.setString(4, observations);
+                        own.setInt(5, idScope);
+                        UtcJdbcTime.setInstant(own, 6, generation.start());
+                        UtcJdbcTime.setInstant(own, 7, generation.end());
+                        marked = own.executeUpdate();
+                    }
+                } else {
+                    String markSql = "UPDATE " + observations + " o SET archivegenerationid=? " +
+                            "FROM oscar_archive_activation_row exported, " + dataStreams + " d " +
+                            "WHERE o.id=exported.observation_id AND d.id=o.datastreamid " +
+                            "AND o.archivegenerationid IS NULL " +
+                            "AND o.datastreamid=exported.datastream_id " +
+                            "AND o.foiid IS NOT DISTINCT FROM exported.foi_id " +
+                            "AND o.phenomenontime IS NOT DISTINCT FROM exported.phenomenon_time " +
+                            "AND o.resulttime IS NOT DISTINCT FROM exported.result_time " +
+                            "AND o.result IS NOT DISTINCT FROM exported.result_json " +
+                            "AND o.phenomenontime>=? AND o.phenomenontime<? " +
+                            "AND d.data->>'outputName'=ANY (?)";
+                    try (PreparedStatement mark = connection.prepareStatement(markSql)) {
+                        mark.setObject(1, generation.id());
+                        UtcJdbcTime.setInstant(mark, 2, generation.start());
+                        UtcJdbcTime.setInstant(mark, 3, generation.end());
+                        mark.setArray(4, connection.createArrayOf("text", outputNames.toArray()));
+                        marked = mark.executeUpdate();
+                    }
                 }
+                if (marked != generation.rowCount())
+                    throw new IllegalStateException("Archive snapshot changed before activation: expected " +
+                            generation.rowCount() + " exact rows but marked " + marked);
                 try (PreparedStatement statement = connection.prepareStatement(
                         "INSERT INTO oscar_archive_generation(id, job_id, store_key, id_scope, profile, window_start, window_end, state, " +
                                 "object_path, manifest_path, sha256, row_count, min_id, max_id) " +
@@ -1837,12 +1867,20 @@ public final class ArchiveCatalog {
      */
     public long countTieredRecords(String observationTable) {
         String observations = safeIdentifier(observationTable);
+        String overlap = resourceConfig.isParquetPrimary()
+                ? "overlap AS (SELECT count(*)::bigint count FROM " + observations + " o " +
+                "JOIN oscar_obs_stage_owner owner ON owner.store_key=? AND owner.id_scope=? " +
+                "AND owner.observation_id=o.id " +
+                "JOIN oscar_archive_generation g ON g.id=owner.generation_id " +
+                "WHERE g.store_key=owner.store_key AND g.id_scope=owner.id_scope " +
+                "AND g.state IN ('ACTIVE','SEALED')), "
+                : "overlap AS (SELECT count(*)::bigint count FROM " + observations + " o " +
+                "JOIN oscar_archive_generation g ON g.id=o.archivegenerationid " +
+                "WHERE g.store_key=? AND g.id_scope=? AND g.state IN ('ACTIVE','SEALED')), ";
         String sql = "WITH cold AS (" +
                 "SELECT COALESCE(sum(row_count), 0)::bigint count FROM oscar_archive_generation " +
                 "WHERE store_key=? AND id_scope=? AND state IN ('ACTIVE','SEALED')), " +
-                "overlap AS (SELECT count(*)::bigint count FROM " + observations + " o " +
-                "JOIN oscar_archive_generation g ON g.id=o.archivegenerationid " +
-                "WHERE g.store_key=? AND g.id_scope=? AND g.state IN ('ACTIVE','SEALED')), " +
+                overlap +
                 "deleted AS (SELECT count(*)::bigint count FROM oscar_tombstone t " +
                 "WHERE t.store_key=? AND t.id_scope=? AND t.subject_type='OBSERVATION' " +
                 "AND t.subject_id ~ '^[0-9]+$' " +
