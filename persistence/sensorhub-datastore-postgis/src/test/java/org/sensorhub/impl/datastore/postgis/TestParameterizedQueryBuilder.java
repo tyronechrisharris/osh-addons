@@ -429,6 +429,27 @@ public class TestParameterizedQueryBuilder {
         assertEquals(Arrays.asList(101L, 202L), query.parameters());
     }
 
+    @Test
+    public void testLatestPhenomenonPerDataStreamUsesBoundedLateralProbe() {
+        QueryBuilderObsStore builder = new QueryBuilderObsStore("obs");
+        ObsFilter filter = new ObsFilter.Builder()
+                .withDataStreams(BigId.fromLong(2, 101), BigId.fromLong(2, 202))
+                .withPhenomenonTime()
+                .withLatestTime()
+                .descendingOrder(true)
+                .done()
+                .build();
+
+        assertTrue(builder.supportsLatestResultPerDataStreamQuery(filter));
+
+        ParameterizedQuery query = builder.createParameterizedLatestResultPerDataStreamQuery(filter, null);
+        assertTrue(query.sql().contains("non_null.phenomenonTime IS NOT NULL ORDER BY non_null.phenomenonTime DESC, non_null.id DESC FETCH FIRST 1 ROW ONLY"));
+        assertTrue(query.sql().contains("null_only.phenomenonTime IS NULL ORDER BY null_only.id DESC FETCH FIRST 1 ROW ONLY"));
+        assertTrue(query.sql().contains("ORDER BY candidate.phenomenonTime DESC NULLS LAST, candidate.id DESC FETCH FIRST 1 ROW ONLY"));
+        assertTrue(query.sql().endsWith("ORDER BY latest.phenomenonTime DESC NULLS FIRST, latest.id ASC"));
+        assertEquals(Arrays.asList(101L, 202L), query.parameters());
+    }
+
     private void assertSqlDoesNotContainInjection(ParameterizedQuery query) {
         assertFalse(query.sql().contains(INJECTION));
         assertTrue(query.parameters().stream().anyMatch(parameter -> parameter.toString().contains(INJECTION)));

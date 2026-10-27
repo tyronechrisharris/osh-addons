@@ -313,6 +313,8 @@ public final class ArchiveCatalog {
                 statement.execute("CREATE TABLE IF NOT EXISTS oscar_archive_schema (" +
                         "generation_id uuid NOT NULL REFERENCES oscar_archive_generation(id) ON DELETE CASCADE, " +
                         "datastream_id bigint NOT NULL, schema_json jsonb NOT NULL, PRIMARY KEY(generation_id, datastream_id))");
+                statement.execute("CREATE INDEX IF NOT EXISTS oscar_archive_schema_datastream_idx " +
+                        "ON oscar_archive_schema (datastream_id, generation_id)");
                 statement.execute("CREATE TABLE IF NOT EXISTS oscar_event_locator (" +
                         "store_key text NOT NULL, id_scope integer NOT NULL, public_id text NOT NULL, " +
                         "observation_id bigint NOT NULL, generation_id uuid REFERENCES oscar_archive_generation(id), " +
@@ -1166,8 +1168,17 @@ public final class ArchiveCatalog {
     }
 
     public List<ArchiveGeneration> candidates(Instant start, Instant end, Long observationId) {
+        return candidates(start, end, observationId, null, null, null);
+    }
+
+    public List<ArchiveGeneration> candidates(Instant start, Instant end, Long observationId,
+                                              Long minObservationId, Long maxObservationId,
+                                              Set<Long> dataStreams) {
+        if (dataStreams != null && dataStreams.isEmpty())
+            return List.of();
         try (Connection connection = connections.open()) {
-            return candidates(connection, start, end, observationId);
+            return candidates(connection, start, end, observationId,
+                    minObservationId, maxObservationId, dataStreams);
         } catch (SQLException e) {
             throw new IllegalStateException("Cannot plan archive query", e);
         }
@@ -1181,6 +1192,19 @@ public final class ArchiveCatalog {
     public List<ArchiveGeneration> candidates(Connection connection, Instant start,
                                                Instant end, Long observationId)
             throws SQLException {
+        return candidates(connection, start, end, observationId, null, null, null);
+    }
+
+    public List<ArchiveGeneration> candidates(Connection connection, Instant start,
+                                               Instant end, Long observationId,
+                                               Long minObservationId, Long maxObservationId,
+                                               Set<Long> dataStreams)
+            throws SQLException {
+        if (dataStreams != null && dataStreams.isEmpty())
+            return List.of();
+        boolean filterIdRange = observationId == null &&
+                minObservationId != null && maxObservationId != null;
+        boolean filterDataStreams = dataStreams != null;
         String sql = "SELECT DISTINCT g.id, g.profile, g.window_start, g.window_end, g.object_path, g.sha256, " +
                 "g.row_count, g.min_id, g.max_id, g.state, g.parity_verified FROM oscar_archive_generation g ";
         if (observationId != null)
@@ -1189,16 +1213,31 @@ public final class ArchiveCatalog {
                 "AND g.window_start < ? AND g.window_end > ? ";
         if (observationId != null)
             sql += "AND ? BETWEEN b.min_id AND b.max_id ";
+        if (filterIdRange)
+            sql += "AND g.max_id >= ? AND g.min_id <= ? ";
+        if (filterDataStreams)
+            sql += "AND EXISTS (SELECT 1 FROM oscar_archive_schema s " +
+                    "WHERE s.generation_id=g.id AND s.datastream_id=ANY (?::bigint[])) ";
         sql += "ORDER BY g.window_start, g.id";
 
         List<ArchiveGeneration> generations = new ArrayList<>();
+        java.sql.Array streamArray = filterDataStreams
+                ? connection.createArrayOf("bigint", dataStreams.toArray(Long[]::new))
+                : null;
         try (PreparedStatement statement = connection.prepareStatement(sql)) {
-            statement.setString(1, storeKey);
-            statement.setInt(2, idScope);
-            UtcJdbcTime.setInstant(statement, 3, end);
-            UtcJdbcTime.setInstant(statement, 4, start);
+            int parameter = 1;
+            statement.setString(parameter++, storeKey);
+            statement.setInt(parameter++, idScope);
+            UtcJdbcTime.setInstant(statement, parameter++, end);
+            UtcJdbcTime.setInstant(statement, parameter++, start);
             if (observationId != null)
-                statement.setLong(5, observationId);
+                statement.setLong(parameter++, observationId);
+            if (filterIdRange) {
+                statement.setLong(parameter++, minObservationId);
+                statement.setLong(parameter++, maxObservationId);
+            }
+            if (streamArray != null)
+                statement.setArray(parameter, streamArray);
             try (ResultSet result = statement.executeQuery()) {
                 while (result.next()) {
                     generations.add(new ArchiveGeneration(
@@ -1207,8 +1246,30 @@ public final class ArchiveCatalog {
                             result.getLong(7), result.getLong(8), result.getLong(9), result.getString(10), result.getBoolean(11)));
                 }
             }
+        } finally {
+            if (streamArray != null)
+                streamArray.free();
         }
         return generations;
+    }
+
+    public Optional<Instant> latestWindowEnd(long dataStreamId) {
+        try (Connection connection = connections.open(); PreparedStatement statement = connection.prepareStatement(
+                "SELECT max(g.window_end) FROM oscar_archive_generation g " +
+                        "JOIN oscar_archive_schema s ON s.generation_id=g.id " +
+                        "WHERE g.store_key=? AND g.id_scope=? AND g.state IN ('ACTIVE','SEALED') " +
+                        "AND s.datastream_id=?")) {
+            statement.setString(1, storeKey);
+            statement.setInt(2, idScope);
+            statement.setLong(3, dataStreamId);
+            try (ResultSet result = statement.executeQuery()) {
+                if (!result.next()) return Optional.empty();
+                Instant value = UtcJdbcTime.getInstant(result, 1);
+                return value == null ? Optional.empty() : Optional.of(value);
+            }
+        } catch (SQLException e) {
+            throw new IllegalStateException("Cannot inspect datastream archive high-water mark", e);
+        }
     }
 
     public Optional<Instant> latestWindowEnd(String profile) {

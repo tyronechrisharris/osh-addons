@@ -28,6 +28,7 @@ import java.util.Objects;
 import java.util.Set;
 import java.util.Spliterator;
 import java.util.Spliterators;
+import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -49,6 +50,7 @@ public final class ParquetArchiveReader {
     private final Path root;
     private final TieredArchiveConfig config;
     private final Map<Path, VerificationStamp> verifiedObjects = new ConcurrentHashMap<>();
+    private final Map<String, java.util.Optional<Instant>> maxResultTimeBySha256 = new ConcurrentHashMap<>();
     private final AtomicInteger openCursors = new AtomicInteger();
 
     public ParquetArchiveReader(Path root) {
@@ -100,6 +102,10 @@ public final class ParquetArchiveReader {
                 (filter.getResultTime() != null && filter.getResultTime().isLatestTime());
         if (limit != Long.MAX_VALUE && filter.getCQLFilter() == null && !latestSelection)
             return streamWindowClusters(generations, filter, allowedDataStreams, allowedFois, limit);
+        if (latestSelection && generations.size() > 1 && filter.getCQLFilter() == null &&
+                filter.getValuePredicate() == null && filter.getPhenomenonLocation() == null &&
+                allowedDataStreams != null && !allowedDataStreams.isEmpty())
+            return streamLatestAcrossWindowClusters(generations, filter, allowedDataStreams, allowedFois, limit);
 
         AuthorizedObjects objects = authorize(generations);
         if (objects.byFilename().isEmpty())
@@ -148,6 +154,137 @@ public final class ParquetArchiveReader {
         return StreamSupport.stream(Spliterators.spliteratorUnknownSize(cursor,
                         Spliterator.ORDERED | Spliterator.NONNULL), false)
                 .onClose(cursor::close);
+    }
+
+    /**
+     * Evaluates latest-per-stream queries across disjoint window clusters from
+     * newest to oldest so that once every requested datastream has a non-null
+     * timestamp in a newer cluster, older clusters do not need to be scanned.
+     */
+    private Stream<ArchivedRow> streamLatestAcrossWindowClusters(
+            List<ArchiveGeneration> generations, ObsFilter filter,
+            Set<Long> allowedDataStreams, Set<Long> allowedFois, long limit) {
+        List<List<ArchiveGeneration>> clusters = windowClusters(generations);
+        if (clusters.size() <= 1) {
+            AuthorizedObjects objects = authorize(generations);
+            if (objects.byFilename().isEmpty())
+                return Stream.empty();
+            QueryPlan plan = queryPlan(objects, filter, allowedDataStreams, allowedFois,
+                    true, true, limit);
+            return openRowStream(objects, plan, generations.size());
+        }
+
+        boolean latestResult = filter.getResultTime() != null && filter.getResultTime().isLatestTime();
+        Map<Long, ArchivedRow> bestByStream = new HashMap<>();
+        Set<Long> remainingNonNullPhenomenonStreams = new java.util.HashSet<>(allowedDataStreams);
+
+        for (int index = clusters.size() - 1; index >= 0; index--) {
+            List<ArchiveGeneration> cluster = clusters.get(index);
+            Set<Long> clusterStreams;
+            List<ArchiveGeneration> clusterGenerations;
+            if (!latestResult) {
+                if (remainingNonNullPhenomenonStreams.isEmpty())
+                    break;
+                clusterStreams = new java.util.HashSet<>(remainingNonNullPhenomenonStreams);
+                clusterGenerations = cluster;
+            } else {
+                clusterStreams = new java.util.HashSet<>();
+                Set<UUID> neededGenerationIds = new java.util.HashSet<>();
+                for (Long dataStreamId : allowedDataStreams) {
+                    ArchivedRow best = bestByStream.get(dataStreamId);
+                    if (best == null || best.observation().resultTime() == null) {
+                        clusterStreams.add(dataStreamId);
+                        for (ArchiveGeneration generation : cluster)
+                            neededGenerationIds.add(generation.id());
+                    } else {
+                        List<ArchiveGeneration> newer = generationsPotentiallyNewerThanResultTime(
+                                cluster, best.observation().resultTime());
+                        if (!newer.isEmpty()) {
+                            clusterStreams.add(dataStreamId);
+                            for (ArchiveGeneration generation : newer)
+                                neededGenerationIds.add(generation.id());
+                        }
+                    }
+                }
+                if (clusterStreams.isEmpty() || neededGenerationIds.isEmpty())
+                    continue;
+                clusterGenerations = cluster.stream()
+                        .filter(generation -> neededGenerationIds.contains(generation.id()))
+                        .toList();
+            }
+
+            AuthorizedObjects objects = authorize(clusterGenerations);
+            if (objects.byFilename().isEmpty())
+                continue;
+            QueryPlan plan = queryPlan(objects, filter, clusterStreams, allowedFois,
+                    true, true, Long.MAX_VALUE);
+            try (Stream<ArchivedRow> clusterRows = openRowStream(objects, plan, clusterGenerations.size())) {
+                clusterRows.forEach(row -> {
+                    long streamId = row.observation().dataStreamId();
+                    bestByStream.merge(streamId, row,
+                            (previous, candidate) -> later(candidate, previous, latestResult)
+                                    ? candidate : previous);
+                    if (!latestResult && row.observation().phenomenonTime() != null)
+                        remainingNonNullPhenomenonStreams.remove(streamId);
+                });
+            }
+        }
+
+        Stream<ArchivedRow> ordered = bestByStream.values().stream().sorted(rowComparator(filter));
+        return limit == Long.MAX_VALUE ? ordered : ordered.limit(limit);
+    }
+
+    /**
+     * Returns only those generations whose maximum {@code result_time} is at
+     * least {@code minResultTime}, using cached Parquet metadata per immutable
+     * generation SHA-256 so hot-satisfied {@code resultTime=latest} queries
+     * avoid scanning historical Parquet payloads.
+     */
+    public List<ArchiveGeneration> generationsPotentiallyNewerThanResultTime(
+            List<ArchiveGeneration> generations, Instant minResultTime) {
+        if (generations.isEmpty() || minResultTime == null)
+            return generations;
+        List<ArchiveGeneration> uncached = generations.stream()
+                .filter(generation -> !maxResultTimeBySha256.containsKey(generation.sha256()))
+                .toList();
+        if (!uncached.isEmpty())
+            populateMaxResultTimes(uncached);
+        return generations.stream()
+                .filter(generation -> maxResultTimeBySha256
+                        .getOrDefault(generation.sha256(), java.util.Optional.empty())
+                        .map(maxResult -> !maxResult.isBefore(minResultTime))
+                        .orElse(false))
+                .toList();
+    }
+
+    private void populateMaxResultTimes(List<ArchiveGeneration> uncached) {
+        AuthorizedObjects objects = authorize(uncached);
+        if (objects.byFilename().isEmpty())
+            return;
+        String fileList = objects.byFilename().keySet().stream()
+                .map(path -> "'" + sqlLiteral(path) + "'")
+                .collect(Collectors.joining(","));
+        String sql = "SELECT filename, max(result_time) FROM read_parquet([" + fileList +
+                "], filename=true) GROUP BY filename";
+        Map<String, java.util.Optional<Instant>> discovered = new HashMap<>();
+        try (DuckDbResourcePolicy.Session duckSession = DuckDbResourcePolicy.open(config, "metadata-max-result");
+             PreparedStatement statement = ConnectionManager.trackCancellableStatement(
+                     duckSession.connection().prepareStatement(sql), "DuckDB max result time metadata query");
+             ResultSet result = statement.executeQuery()) {
+            while (nextCancellable(result)) {
+                ArchiveGeneration generation = generationForFilename(objects, result.getString(1));
+                Instant maxResult = UtcJdbcTime.getDuckDbInstant(result, 2);
+                discovered.put(generation.sha256(), java.util.Optional.ofNullable(maxResult));
+            }
+        } catch (Exception e) {
+            throw new IllegalStateException("Cannot inspect max result_time from " + uncached.size() +
+                    " archive generation(s)", e);
+        }
+        for (ArchiveGeneration generation : uncached) {
+            maxResultTimeBySha256.putIfAbsent(
+                    generation.sha256(),
+                    discovered.getOrDefault(generation.sha256(), java.util.Optional.empty()));
+        }
     }
 
     private static List<List<ArchiveGeneration>> windowClusters(List<ArchiveGeneration> generations) {

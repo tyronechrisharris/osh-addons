@@ -559,6 +559,35 @@ public class TestParquetArchiveReader {
                 null, null, 1));
     }
 
+    @Test
+    public void latestPhenomenonAcrossWindowClustersDoesNotAuthorizeDisjointOlderWindows() throws Exception {
+        Path root = temporary.newFolder("latest-phenomenon-window-authorization").toPath();
+        ArchiveGeneration missingEarlier = new ArchiveGeneration(UUID.randomUUID(), "RAW_GATED",
+                Instant.parse("2026-01-01T00:00:00Z"), Instant.parse("2026-01-01T01:00:00Z"),
+                Path.of("missing-earlier.parquet"), "not-read", 1, 1, 1, "ACTIVE", true);
+        ArchiveGeneration newer = writeGeneration(root, "newer.parquet", new TestRow[]{
+                new TestRow(2, 10, "2026-01-01T01:05:00Z")
+        });
+        ArchiveGeneration newerWindow = new ArchiveGeneration(
+                newer.id(), newer.profile(),
+                Instant.parse("2026-01-01T01:00:00Z"), Instant.parse("2026-01-01T02:00:00Z"),
+                newer.objectPath(), newer.sha256(), newer.rowCount(),
+                newer.minimumId(), newer.maximumId(), newer.state(), newer.parityVerified());
+        ParquetArchiveReader reader = new ParquetArchiveReader(root);
+
+        ObsFilter latestPhenomenon = new ObsFilter.Builder()
+                .withPhenomenonTime().withLatestTime().done()
+                .build();
+        var rows = reader.read(List.of(missingEarlier, newerWindow),
+                latestPhenomenon, Set.of(10L), null, Long.MAX_VALUE);
+        assertEquals(List.of(2L), rows.stream().map(row -> row.observation().id()).toList());
+        assertEquals(0, reader.getOpenCursorCount());
+        assertTrue(reader.generationsPotentiallyNewerThanResultTime(
+                List.of(newerWindow), Instant.parse("2026-01-01T01:06:00Z")).isEmpty());
+        assertEquals(List.of(newerWindow), reader.generationsPotentiallyNewerThanResultTime(
+                List.of(newerWindow), Instant.parse("2026-01-01T01:05:00Z")));
+    }
+
     private ArchiveGeneration writeGeneration(Path root, String filename, TestRow[] rows) throws Exception {
         Path object = root.resolve(filename);
         try (Connection duck = DriverManager.getConnection("jdbc:duckdb:"); Statement statement = duck.createStatement()) {

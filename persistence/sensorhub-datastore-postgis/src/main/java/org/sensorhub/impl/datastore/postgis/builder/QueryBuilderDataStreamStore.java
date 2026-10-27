@@ -113,10 +113,19 @@ public class QueryBuilderDataStreamStore extends QueryBuilder {
         // range maintenance to the first store's datastream table.
         String functionName = "update_datastream_ranges_" +
                 Integer.toUnsignedString(obsStore.getDatastoreName().hashCode(), 16);
-        return "DROP TRIGGER IF EXISTS obs_update_datastream_ranges ON " + obsStore.getDatastoreName() + ";\n" +
+        return "ALTER TABLE " + this.getStoreTableName() + " SET (" +
+                "fillfactor = 70, " +
+                "autovacuum_vacuum_scale_factor = 0.0, " +
+                "autovacuum_vacuum_threshold = 100, " +
+                "autovacuum_analyze_scale_factor = 0.0, " +
+                "autovacuum_analyze_threshold = 100);\n" +
+                "DROP TRIGGER IF EXISTS obs_update_datastream_ranges ON " + obsStore.getDatastoreName() + ";\n" +
                 "CREATE OR REPLACE FUNCTION " + functionName + "()\n" +
                 "RETURNS TRIGGER AS $$\n" +
                 "BEGIN\n" +
+                "    IF NOT EXISTS (SELECT 1 FROM inserted_observations) THEN\n" +
+                "        RETURN NULL;\n" +
+                "    END IF;\n" +
                 "    UPDATE " + this.getStoreTableName() + " target\n" +
                 "    SET \n" +
                 "        min_phenomenon_time = LEAST(COALESCE(target.min_phenomenon_time, ranges.min_phenomenon_time), ranges.min_phenomenon_time),\n" +
@@ -128,7 +137,13 @@ public class QueryBuilderDataStreamStore extends QueryBuilder {
                 "               MIN(resultTime) min_result_time, MAX(resultTime) max_result_time\n" +
                 "        FROM inserted_observations GROUP BY dataStreamID\n" +
                 "    ) ranges\n" +
-                "    WHERE target.id = ranges.dataStreamID;\n" +
+                "    WHERE target.id = ranges.dataStreamID\n" +
+                "      AND (\n" +
+                "        (ranges.min_phenomenon_time IS NOT NULL AND (target.min_phenomenon_time IS NULL OR ranges.min_phenomenon_time < target.min_phenomenon_time))\n" +
+                "        OR (ranges.max_phenomenon_time IS NOT NULL AND (target.max_phenomenon_time IS NULL OR ranges.max_phenomenon_time >= target.max_phenomenon_time + interval '60 seconds'))\n" +
+                "        OR (ranges.min_result_time IS NOT NULL AND (target.min_result_time IS NULL OR ranges.min_result_time < target.min_result_time))\n" +
+                "        OR (ranges.max_result_time IS NOT NULL AND (target.max_result_time IS NULL OR ranges.max_result_time >= target.max_result_time + interval '60 seconds'))\n" +
+                "      );\n" +
                 "    RETURN NULL;\n" +
                 "END;\n" +
                 "$$ LANGUAGE plpgsql;\n" +

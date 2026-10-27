@@ -4250,4 +4250,42 @@ public class TestDisposableTieredPostgresIntegration extends TestPostgisObsStore
     private Connection open() throws Exception {
         return DriverManager.getConnection("jdbc:postgresql://" + url + "/" + DB_NAME, login, password);
     }
+
+    @Test
+    public void nonArchivedDataStreamQueriesAndHotLatestQueriesPruneColdGenerations() throws Exception {
+        OscarTieredObsStore tiered = (OscarTieredObsStore) postgisObsStore;
+        Instant start = Instant.parse("2026-01-08T00:00:00Z");
+        BigId archivedStream = addSimpleDataStream(bigId(901), "gammaCounts");
+        BigId nonArchivedStream = addSimpleDataStream(bigId(902), "connectionStatus");
+
+        addSimpleObsWithoutResultTime(archivedStream, BigId.NONE, start, 3, 60_000L);
+        addSimpleObsWithoutResultTime(nonArchivedStream, BigId.NONE, start, 3, 60_000L);
+        forceReadBackFromStorage();
+
+        ArchiveGeneration generation = tiered.archiveWindow(
+                start, start.plus(1, ChronoUnit.HOURS), "RAW_GATED").orElseThrow();
+        assertEquals(3, generation.rowCount());
+
+        ArchiveCatalog catalog = tiered.getArchiveCatalog();
+        assertTrue("Non-archived stream must be pruned by oscar_archive_schema",
+                catalog.candidates(start, start.plus(1, ChronoUnit.HOURS), null,
+                        null, null, Set.of(nonArchivedStream.getIdAsLong())).isEmpty());
+        assertEquals(1, catalog.candidates(start, start.plus(1, ChronoUnit.HOURS), null,
+                null, null, Set.of(archivedStream.getIdAsLong())).size());
+
+        // Add a newer hot observation on the archived stream so hot supersedes cold.
+        Instant newerHotTime = start.plus(2, ChronoUnit.HOURS);
+        addSimpleObsWithoutResultTime(archivedStream, BigId.NONE, newerHotTime, 1, 1_000L);
+        forceReadBackFromStorage();
+
+        ObsFilter latestResult = new ObsFilter.Builder()
+                .withDataStreams(archivedStream)
+                .withLatestResult()
+                .build();
+        try (var rows = tiered.selectEntries(latestResult)) {
+            var selected = rows.toList();
+            assertEquals(1, selected.size());
+            assertEquals(newerHotTime, selected.get(0).getValue().getPhenomenonTime());
+        }
+    }
 }

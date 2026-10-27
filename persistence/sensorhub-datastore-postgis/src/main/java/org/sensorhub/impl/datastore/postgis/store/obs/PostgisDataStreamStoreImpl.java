@@ -52,8 +52,8 @@ import java.util.stream.Stream;
 
 public class PostgisDataStreamStoreImpl extends PostgisStore<QueryBuilderDataStreamStore> implements IDataStreamStore {
     private volatile Cache<Long, IDataStreamInfo> cache = CacheBuilder.newBuilder()
-            .maximumSize(150)
-            .expireAfterAccess(5, TimeUnit.MINUTES)
+            .maximumSize(4096)
+            .expireAfterAccess(30, TimeUnit.MINUTES)
             .build();
 
     private static final Logger logger = LoggerFactory.getLogger(PostgisDataStreamStoreImpl.class);
@@ -363,22 +363,24 @@ public class PostgisDataStreamStoreImpl extends PostgisStore<QueryBuilderDataStr
             throw new UnsupportedOperationException("Get operation is not supported with argument != DataStream key, got=" + o.getClass());
         }
         DataStreamKey key = (DataStreamKey) o;
-        IDataStreamInfo dataStreamInfo = cache.getIfPresent(key.getInternalID().getIdAsLong());
+        long id = key.getInternalID().getIdAsLong();
+        IDataStreamInfo dataStreamInfo = cache.getIfPresent(id);
         if (dataStreamInfo == null) {
             lock.lock();
             try {
                 // double lock checking + volatile
+                dataStreamInfo = cache.getIfPresent(id);
                 if (dataStreamInfo == null) {
                     try (Connection connection = connectionManager.getConnection()) {
                         try (PreparedStatement preparedStatement = connection.prepareStatement(queryBuilder.selectByIdQuery())) {
-                            preparedStatement.setLong(1, key.getInternalID().getIdAsLong());
+                            preparedStatement.setLong(1, id);
                             try (ResultSet resultSet = preparedStatement.executeQuery()) {
                                 if (resultSet.next()) {
                                     String data = resultSet.getString("data");
                                     dataStreamInfo = SerializerUtils.readIDataStreamInfoFromJson(data);
                                     // TODO Fetch result and phenomenon time intervals here to attach to wrapper
-                                    IDataStreamInfo wrapper = new DataStreamInfoWithTimeRanges(key.getInternalID().getIdAsLong(), dataStreamInfo);
-                                    cache.put(key.getInternalID().getIdAsLong(), wrapper);
+                                    IDataStreamInfo wrapper = new DataStreamInfoWithTimeRanges(id, dataStreamInfo);
+                                    cache.put(id, wrapper);
                                 }
                             }
                         }

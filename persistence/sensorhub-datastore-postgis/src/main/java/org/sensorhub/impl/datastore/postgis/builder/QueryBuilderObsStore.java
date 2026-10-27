@@ -387,15 +387,21 @@ public class QueryBuilderObsStore extends QueryBuilder {
      */
     public boolean supportsLatestResultPerDataStreamQuery(ObsFilter filter) {
         if (filter == null ||
-                filter.getResultTime() == null ||
-                !filter.getResultTime().isLatestTime() ||
                 filter.getDataStreamFilter() == null ||
                 !DataStreamFilterQuery.hasOnlyInternalIds(filter.getDataStreamFilter())) {
             return false;
         }
+        boolean latestResult = filter.getResultTime() != null &&
+                filter.getResultTime().isLatestTime() &&
+                filter.getPhenomenonTime() == null;
+        boolean latestPhenomenon = filter.getPhenomenonTime() != null &&
+                filter.getPhenomenonTime().isLatestTime() &&
+                filter.getResultTime() == null;
+        if (!latestResult && !latestPhenomenon) {
+            return false;
+        }
 
-        return filter.getPhenomenonTime() == null &&
-                filter.getPhenomenonLocation() == null &&
+        return filter.getPhenomenonLocation() == null &&
                 filter.getFoiFilter() == null &&
                 (filter.getInternalIDs() == null || filter.getInternalIDs().isEmpty()) &&
                 filter.getCQLFilter() == null &&
@@ -403,14 +409,15 @@ public class QueryBuilderObsStore extends QueryBuilder {
     }
 
     /**
-     * Builds an index-probe query for the latest result of each requested data
-     * stream. The existing {@code (dataStreamID, resultTime)} index can be
-     * scanned backwards for each fixed stream ID and stop after one row.
+     * Builds an index-probe query for the latest result or phenomenon time of
+     * each requested data stream. The existing {@code (dataStreamID, resultTime)}
+     * and {@code (dataStreamID, phenomenonTime)} indexes can be scanned backwards
+     * for each fixed stream ID and stop after one row.
      *
      * <p>The two small branches preserve the datastore's null and tie rules
      * without asking PostgreSQL to sort a stream's complete history. The first
-     * branch finds the newest non-null result time; the second supplies the
-     * greatest ID only when a stream contains no non-null result time. The
+     * branch finds the newest non-null timestamp; the second supplies the
+     * greatest ID only when a stream contains no non-null timestamp. The
      * outer two-row choice implements {@code NULLS LAST}, and the final order
      * matches the observation store's phenomenon-time order so a tiered hot/
      * cold merge receives correctly ordered inputs.</p>
@@ -421,6 +428,11 @@ public class QueryBuilderObsStore extends QueryBuilder {
         if (!supportsLatestResultPerDataStreamQuery(filter)) {
             throw new IllegalArgumentException("Filter is not eligible for the latest-result-per-stream query");
         }
+        boolean latestPhenomenon = filter.getPhenomenonTime() != null &&
+                filter.getPhenomenonTime().isLatestTime();
+        String timeColumn = latestPhenomenon ? PHENOMENON_TIME.toString() : RESULT_TIME.toString();
+        boolean descending = filter.getPhenomenonTime() != null &&
+                filter.getPhenomenonTime().descendingOrder();
 
         List<Long> dataStreamIds = filter.getDataStreamFilter().getInternalIDs().stream()
                 .map(id -> id.getIdAsLong())
@@ -457,19 +469,21 @@ public class QueryBuilderObsStore extends QueryBuilder {
                 .append(" CROSS JOIN LATERAL (SELECT candidate.* FROM ((SELECT non_null.* FROM ")
                 .append(this.getStoreTableName())
                 .append(" non_null WHERE non_null.dataStreamID = requested.dataStreamID")
-                .append(" AND non_null.resultTime IS NOT NULL")
-                .append(" ORDER BY non_null.resultTime DESC, non_null.id DESC")
+                .append(" AND non_null.").append(timeColumn).append(" IS NOT NULL")
+                .append(" ORDER BY non_null.").append(timeColumn).append(" DESC, non_null.id DESC")
                 // IteratorResultSet detects an outer LIMIT textually when it
                 // decides whether to add paging. FETCH keeps this inner bound
                 // from being mistaken for the caller's outer result limit.
                 .append(" FETCH FIRST 1 ROW ONLY) UNION ALL (SELECT null_only.* FROM ")
                 .append(this.getStoreTableName())
                 .append(" null_only WHERE null_only.dataStreamID = requested.dataStreamID")
-                .append(" AND null_only.resultTime IS NULL")
+                .append(" AND null_only.").append(timeColumn).append(" IS NULL")
                 .append(" ORDER BY null_only.id DESC FETCH FIRST 1 ROW ONLY)) candidate")
-                .append(" ORDER BY candidate.resultTime DESC NULLS LAST, candidate.id DESC")
+                .append(" ORDER BY candidate.").append(timeColumn).append(" DESC NULLS LAST, candidate.id DESC")
                 .append(" FETCH FIRST 1 ROW ONLY) latest")
-                .append(" ORDER BY latest.phenomenonTime ASC NULLS FIRST, latest.id ASC");
+                .append(" ORDER BY latest.phenomenonTime ")
+                .append(descending ? "DESC" : "ASC")
+                .append(" NULLS FIRST, latest.id ASC");
 
         if (filter.getLimit() != Long.MAX_VALUE) {
             sql.append(" LIMIT ").append(filter.getLimit());
