@@ -38,6 +38,7 @@ import org.vast.util.TimeExtent;
 
 import java.io.IOException;
 import java.sql.*;
+import java.time.Instant;
 import java.util.*;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.Lock;
@@ -107,6 +108,19 @@ public class PostgisCommandStreamStoreImpl extends PostgisStore<QueryBuilderComm
         }
     }
 
+    @Override
+    public Entry<CommandStreamKey, ICommandStreamInfo> getLatestVersionEntry(String sysUID, String controlInput) {
+        return selectEntries(new CommandStreamFilter.Builder()
+                .withSystems()
+                    .withUniqueIDs(sysUID)
+                    .done()
+                .withControlInputNames(controlInput)
+                .withValidTime(new TemporalFilter.Builder().withLatestTime().build())
+                .build())
+                .findFirst()
+                .orElse(null);
+    }
+
     public void intersectsAndUpdate(ICommandStreamInfo cmdInfo) throws DataStoreException {
         // if DS already exists, compute the time intersection
         CommandStreamFilter.Builder commandStreamFilterBuilder = new CommandStreamFilter.Builder();
@@ -135,6 +149,12 @@ public class PostgisCommandStreamStoreImpl extends PostgisStore<QueryBuilderComm
             ICommandStreamInfo currentCmdStreamInfo = entry.getValue();
 
             TimeExtent dbValidTime = currentCmdStreamInfo.getValidTime();
+            if (dbValidTime == null) {
+                Instant begin = newValidTime.begin().isBefore(Instant.EPOCH)
+                        ? newValidTime.begin()
+                        : Instant.EPOCH;
+                dbValidTime = TimeExtent.endNow(begin);
+            }
 
             TimeExtent resultIntersection;
             if(dbValidTime.endsNow() && !newValidTime.endsNow()) {

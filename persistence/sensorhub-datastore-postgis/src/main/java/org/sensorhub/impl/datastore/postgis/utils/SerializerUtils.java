@@ -116,6 +116,13 @@ public abstract class SerializerUtils {
                     JsonElement childInput = inputObj.get(name);
                     JsonElement orderedChild = reorderBySchema(childSchema, childInput);
                     orderedObj.add(name, orderedChild);
+                } else if ("rpmMessage".equals(name)) {
+                    JsonElement legacyMessage = inputObj.has("rapiscanMessage")
+                            ? inputObj.get("rapiscanMessage")
+                            : inputObj.get("aspectMessage");
+                    if (legacyMessage != null) {
+                        orderedObj.add(name, reorderBySchema(childSchema, legacyMessage));
+                    }
                 }
             }
 

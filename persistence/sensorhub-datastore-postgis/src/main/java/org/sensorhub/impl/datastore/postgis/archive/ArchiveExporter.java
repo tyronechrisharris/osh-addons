@@ -201,12 +201,18 @@ public final class ArchiveExporter {
                         "result_time TIMESTAMP, result_json VARCHAR, archive_version INTEGER, profile VARCHAR)");
             }
 
+            List<String> attachedChildren = config.isParquetPrimary()
+                    ? ArchiveCatalog.attachedStageChildTables(source, observationTable, idScope)
+                    : List.of();
+            if (config.isParquetPrimary() && attachedChildren.isEmpty()) {
+                source.rollback();
+                return new ExportStats(0, 0, 0, List.of());
+            }
             String query = config.isParquetPrimary()
                     ? "SELECT o.id, o.datastreamid, o.foiid, o.phenomenontime, o.resulttime, o.result::text " +
-                    "FROM " + observationTable + " o WHERE o.tableoid IN (" +
-                    "SELECT to_regclass(stage.child_table) FROM oscar_obs_stage_partition stage " +
-                    "WHERE stage.store_key=? AND stage.id_scope=? AND stage.state='ATTACHED') " +
-                    "AND NOT EXISTS (SELECT 1 FROM oscar_obs_stage_owner owner " +
+                    "FROM " + ArchiveCatalog.stageChildrenFromClause(
+                    attachedChildren, "id, datastreamid, foiid, phenomenontime, resulttime, result") +
+                    " WHERE NOT EXISTS (SELECT 1 FROM oscar_obs_stage_owner owner " +
                     "WHERE owner.store_key=? AND owner.id_scope=? AND owner.observation_id=o.id) " +
                     "AND o.phenomenontime >= ? AND o.phenomenontime < ? " +
                     "ORDER BY o.phenomenontime, o.id LIMIT ?"
@@ -221,8 +227,6 @@ public final class ArchiveExporter {
                 read.setFetchSize(FETCH_SIZE);
                 int parameter = 1;
                 if (config.isParquetPrimary()) {
-                    read.setString(parameter++, observationTable);
-                    read.setInt(parameter++, idScope);
                     read.setString(parameter++, observationTable);
                     read.setInt(parameter++, idScope);
                 }

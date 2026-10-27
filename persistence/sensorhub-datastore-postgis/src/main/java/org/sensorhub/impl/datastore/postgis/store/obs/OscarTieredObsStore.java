@@ -556,33 +556,36 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
 
     /** Returns the oldest unarchived eligible row, including late arrivals. */
     public java.util.Optional<Instant> nextArchiveWindowStart(Instant cutoff, String profile) {
-        String sql = archiveConfig.isParquetPrimary()
-                ? "SELECT min(o.phenomenontime) FROM " + getDatastoreName() +
-                " o WHERE o.tableoid IN (SELECT to_regclass(stage.child_table) " +
-                "FROM oscar_obs_stage_partition stage WHERE stage.store_key=? AND stage.id_scope=? " +
-                "AND stage.state='ATTACHED') AND NOT EXISTS (SELECT 1 FROM oscar_obs_stage_owner owner " +
-                "WHERE owner.store_key=? AND owner.id_scope=? AND owner.observation_id=o.id) " +
-                "AND o.phenomenontime < ?"
-                : "SELECT min(o.phenomenontime) FROM " + getDatastoreName() +
-                " o JOIN " + getDataStreams().getDatastoreName() + " d ON d.id=o.datastreamid " +
-                "WHERE o.archivegenerationid IS NULL AND o.phenomenontime < ? " +
-                "AND d.data->>'outputName' = ANY (?)";
-        try (java.sql.Connection connection = connectionManager.getConnection();
-             java.sql.PreparedStatement statement = connection.prepareStatement(sql)) {
-            int parameter = 1;
-            if (archiveConfig.isParquetPrimary()) {
-                statement.setString(parameter++, getDatastoreName());
-                statement.setInt(parameter++, idScope);
-                statement.setString(parameter++, getDatastoreName());
-                statement.setInt(parameter++, idScope);
-            }
-            UtcJdbcTime.setInstant(statement, parameter++, cutoff);
-            if (!archiveConfig.isParquetPrimary())
-                statement.setArray(parameter, connection.createArrayOf("text", archiveConfig.outputNames.toArray()));
-            try (java.sql.ResultSet result = statement.executeQuery()) {
-                if (!result.next()) return java.util.Optional.empty();
-                Instant value = UtcJdbcTime.getInstant(result, 1);
-                return value == null ? java.util.Optional.empty() : java.util.Optional.of(value);
+        try (java.sql.Connection connection = connectionManager.getConnection()) {
+            List<String> attachedChildren = archiveConfig.isParquetPrimary()
+                    ? ArchiveCatalog.attachedStageChildTables(connection, getDatastoreName(), idScope)
+                    : List.of();
+            if (archiveConfig.isParquetPrimary() && attachedChildren.isEmpty())
+                return java.util.Optional.empty();
+            String sql = archiveConfig.isParquetPrimary()
+                    ? "SELECT min(o.phenomenontime) FROM " +
+                    ArchiveCatalog.stageChildrenFromClause(attachedChildren, "id, phenomenontime") +
+                    " WHERE NOT EXISTS (SELECT 1 FROM oscar_obs_stage_owner owner " +
+                    "WHERE owner.store_key=? AND owner.id_scope=? AND owner.observation_id=o.id) " +
+                    "AND o.phenomenontime < ?"
+                    : "SELECT min(o.phenomenontime) FROM " + getDatastoreName() +
+                    " o JOIN " + getDataStreams().getDatastoreName() + " d ON d.id=o.datastreamid " +
+                    "WHERE o.archivegenerationid IS NULL AND o.phenomenontime < ? " +
+                    "AND d.data->>'outputName' = ANY (?)";
+            try (java.sql.PreparedStatement statement = connection.prepareStatement(sql)) {
+                int parameter = 1;
+                if (archiveConfig.isParquetPrimary()) {
+                    statement.setString(parameter++, getDatastoreName());
+                    statement.setInt(parameter++, idScope);
+                }
+                UtcJdbcTime.setInstant(statement, parameter++, cutoff);
+                if (!archiveConfig.isParquetPrimary())
+                    statement.setArray(parameter, connection.createArrayOf("text", archiveConfig.outputNames.toArray()));
+                try (java.sql.ResultSet result = statement.executeQuery()) {
+                    if (!result.next()) return java.util.Optional.empty();
+                    Instant value = UtcJdbcTime.getInstant(result, 1);
+                    return value == null ? java.util.Optional.empty() : java.util.Optional.of(value);
+                }
             }
         } catch (java.sql.SQLException e) {
             throw new IllegalStateException("Cannot determine next archive window", e);
@@ -607,44 +610,47 @@ public class OscarTieredObsStore extends PostgisBatchObsStoreImpl {
             throw new IllegalArgumentException("Archive candidate window must be non-empty");
         if (rowCap < 1)
             throw new IllegalArgumentException("Archive candidate row cap must be positive");
-        String candidateSource = archiveConfig.isParquetPrimary()
-                ? "FROM " + getDatastoreName() + " o WHERE o.tableoid IN (" +
-                "SELECT to_regclass(stage.child_table) FROM oscar_obs_stage_partition stage " +
-                "WHERE stage.store_key=? AND stage.id_scope=? AND stage.state='ATTACHED') " +
-                "AND NOT EXISTS (SELECT 1 FROM oscar_obs_stage_owner owner " +
-                "WHERE owner.store_key=? AND owner.id_scope=? AND owner.observation_id=o.id) " +
-                "AND o.phenomenontime >= ? AND o.phenomenontime < ? "
-                : "FROM " + getDatastoreName() + " o JOIN " + getDataStreams().getDatastoreName() +
-                " d ON d.id=o.datastreamid WHERE o.archivegenerationid IS NULL " +
-                "AND o.phenomenontime >= ? AND o.phenomenontime < ? " +
-                "AND d.data->>'outputName' = ANY (?) ";
-        String sql = "SELECT count(*), COALESCE(sum(" +
-                ArchiveExporter.ESTIMATED_FIXED_BYTES_PER_ROW + "::bigint + " +
-                "COALESCE(octet_length(convert_to(candidate.result::text, 'UTF8')), 0)), 0), " +
-                "min(candidate.phenomenontime) FROM (SELECT o.result,o.phenomenontime " +
-                candidateSource + "ORDER BY o.phenomenontime,o.id LIMIT ?) candidate";
-        try (java.sql.Connection connection = connectionManager.getConnection();
-             java.sql.PreparedStatement statement = connection.prepareStatement(sql)) {
-            int parameter = 1;
-            if (archiveConfig.isParquetPrimary()) {
-                statement.setString(parameter++, getDatastoreName());
-                statement.setInt(parameter++, idScope);
-                statement.setString(parameter++, getDatastoreName());
-                statement.setInt(parameter++, idScope);
-            }
-            UtcJdbcTime.setInstant(statement, parameter++, start);
-            UtcJdbcTime.setInstant(statement, parameter++, end);
-            if (!archiveConfig.isParquetPrimary())
-                statement.setArray(parameter++, connection.createArrayOf("text", archiveConfig.outputNames.toArray()));
-            statement.setLong(parameter, Math.addExact(rowCap, 1));
-            try (java.sql.ResultSet result = statement.executeQuery()) {
-                if (!result.next())
-                    return new ArchiveCandidateFootprint(0, 0, null);
-                BigDecimal measuredBytes = result.getBigDecimal(2);
-                long bytes = measuredBytes.compareTo(BigDecimal.valueOf(Long.MAX_VALUE)) >= 0
-                        ? Long.MAX_VALUE : measuredBytes.longValueExact();
-                return new ArchiveCandidateFootprint(result.getLong(1), bytes,
-                        UtcJdbcTime.getInstant(result, 3));
+        try (java.sql.Connection connection = connectionManager.getConnection()) {
+            List<String> attachedChildren = archiveConfig.isParquetPrimary()
+                    ? ArchiveCatalog.attachedStageChildTables(connection, getDatastoreName(), idScope)
+                    : List.of();
+            if (archiveConfig.isParquetPrimary() && attachedChildren.isEmpty())
+                return new ArchiveCandidateFootprint(0, 0, null);
+            String candidateSource = archiveConfig.isParquetPrimary()
+                    ? "FROM " + ArchiveCatalog.stageChildrenFromClause(
+                    attachedChildren, "id, phenomenontime, result") +
+                    " WHERE NOT EXISTS (SELECT 1 FROM oscar_obs_stage_owner owner " +
+                    "WHERE owner.store_key=? AND owner.id_scope=? AND owner.observation_id=o.id) " +
+                    "AND o.phenomenontime >= ? AND o.phenomenontime < ? "
+                    : "FROM " + getDatastoreName() + " o JOIN " + getDataStreams().getDatastoreName() +
+                    " d ON d.id=o.datastreamid WHERE o.archivegenerationid IS NULL " +
+                    "AND o.phenomenontime >= ? AND o.phenomenontime < ? " +
+                    "AND d.data->>'outputName' = ANY (?) ";
+            String sql = "SELECT count(*), COALESCE(sum(" +
+                    ArchiveExporter.ESTIMATED_FIXED_BYTES_PER_ROW + "::bigint + " +
+                    "COALESCE(octet_length(convert_to(candidate.result::text, 'UTF8')), 0)), 0), " +
+                    "min(candidate.phenomenontime) FROM (SELECT o.result,o.phenomenontime " +
+                    candidateSource + "ORDER BY o.phenomenontime,o.id LIMIT ?) candidate";
+            try (java.sql.PreparedStatement statement = connection.prepareStatement(sql)) {
+                int parameter = 1;
+                if (archiveConfig.isParquetPrimary()) {
+                    statement.setString(parameter++, getDatastoreName());
+                    statement.setInt(parameter++, idScope);
+                }
+                UtcJdbcTime.setInstant(statement, parameter++, start);
+                UtcJdbcTime.setInstant(statement, parameter++, end);
+                if (!archiveConfig.isParquetPrimary())
+                    statement.setArray(parameter++, connection.createArrayOf("text", archiveConfig.outputNames.toArray()));
+                statement.setLong(parameter, Math.addExact(rowCap, 1));
+                try (java.sql.ResultSet result = statement.executeQuery()) {
+                    if (!result.next())
+                        return new ArchiveCandidateFootprint(0, 0, null);
+                    BigDecimal measuredBytes = result.getBigDecimal(2);
+                    long bytes = measuredBytes.compareTo(BigDecimal.valueOf(Long.MAX_VALUE)) >= 0
+                            ? Long.MAX_VALUE : measuredBytes.longValueExact();
+                    return new ArchiveCandidateFootprint(result.getLong(1), bytes,
+                            UtcJdbcTime.getInstant(result, 3));
+                }
             }
         } catch (java.sql.SQLException | ArithmeticException e) {
             throw new IllegalStateException("Cannot size next archive window", e);

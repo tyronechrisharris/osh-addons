@@ -831,32 +831,7 @@ public final class ArchiveCatalog {
                 lockForActivation(connection);
                 int marked;
                 if (resourceConfig.isParquetPrimary()) {
-                    String ownSql = "INSERT INTO oscar_obs_stage_owner(" +
-                            "store_key,id_scope,child_table,observation_id,generation_id) " +
-                            "SELECT ?,?,stage.child_table,o.id,? FROM " + observations + " o " +
-                            "JOIN oscar_archive_activation_row exported ON o.id=exported.observation_id " +
-                            "JOIN oscar_obs_stage_partition stage ON o.tableoid=to_regclass(stage.child_table) " +
-                            "WHERE stage.store_key=? AND stage.id_scope=? AND stage.state='ATTACHED' " +
-                            "AND NOT EXISTS (SELECT 1 FROM oscar_obs_stage_owner owner " +
-                            "WHERE owner.store_key=stage.store_key AND owner.id_scope=stage.id_scope " +
-                            "AND owner.observation_id=o.id) " +
-                            "AND o.datastreamid=exported.datastream_id " +
-                            "AND o.foiid IS NOT DISTINCT FROM exported.foi_id " +
-                            "AND o.phenomenontime IS NOT DISTINCT FROM exported.phenomenon_time " +
-                            "AND o.resulttime IS NOT DISTINCT FROM exported.result_time " +
-                            "AND o.result IS NOT DISTINCT FROM exported.result_json " +
-                            "AND o.phenomenontime>=? AND o.phenomenontime<? " +
-                            "ON CONFLICT(store_key,id_scope,observation_id) DO NOTHING";
-                    try (PreparedStatement own = connection.prepareStatement(ownSql)) {
-                        own.setString(1, observations);
-                        own.setInt(2, idScope);
-                        own.setObject(3, generation.id());
-                        own.setString(4, observations);
-                        own.setInt(5, idScope);
-                        UtcJdbcTime.setInstant(own, 6, generation.start());
-                        UtcJdbcTime.setInstant(own, 7, generation.end());
-                        marked = own.executeUpdate();
-                    }
+                    marked = markParquetPrimaryStageOwners(connection, observations, generation);
                 } else {
                     String markSql = "UPDATE " + observations + " o SET archivegenerationid=? " +
                             "FROM oscar_archive_activation_row exported, " + dataStreams + " d " +
@@ -952,9 +927,94 @@ public final class ArchiveCatalog {
             } finally {
                 connection.setAutoCommit(oldAutoCommit);
             }
+            if (resourceConfig.isParquetPrimary()) {
+                try (Statement analyze = connection.createStatement()) {
+                    analyze.execute("ANALYZE oscar_obs_stage_owner");
+                }
+            }
         } catch (Exception e) {
             throw new IllegalStateException("Cannot activate archive generation", e);
         }
+    }
+
+    /**
+     * Marks staged rows in each attached child partition directly rather than
+     * scanning the parent inheritance tree or joining {@code oscar_obs_stage_owner}
+     * against itself during {@code INSERT}. The primary-key {@code ON CONFLICT DO NOTHING}
+     * clause enforces exact single-owner assignment in O(n log n) via B-tree index
+     * lookup without triggering a quadratic sequential scan when {@code relpages=0}.
+     */
+    private int markParquetPrimaryStageOwners(Connection connection, String observations,
+                                              ArchiveGeneration generation) throws SQLException {
+        List<String> attachedChildren = attachedStageChildTables(connection, observations, idScope);
+        int marked = 0;
+        for (String child : attachedChildren) {
+            String ownSql = "INSERT INTO oscar_obs_stage_owner(" +
+                    "store_key,id_scope,child_table,observation_id,generation_id) " +
+                    "SELECT ?,?,?,o.id,? FROM ONLY " + child + " o " +
+                    "JOIN oscar_archive_activation_row exported ON o.id=exported.observation_id " +
+                    "WHERE o.datastreamid=exported.datastream_id " +
+                    "AND o.foiid IS NOT DISTINCT FROM exported.foi_id " +
+                    "AND o.phenomenontime IS NOT DISTINCT FROM exported.phenomenon_time " +
+                    "AND o.resulttime IS NOT DISTINCT FROM exported.result_time " +
+                    "AND o.result IS NOT DISTINCT FROM exported.result_json " +
+                    "AND o.phenomenontime>=? AND o.phenomenontime<? " +
+                    "ON CONFLICT(store_key,id_scope,observation_id) DO NOTHING";
+            try (PreparedStatement own = connection.prepareStatement(ownSql)) {
+                own.setString(1, observations);
+                own.setInt(2, idScope);
+                own.setString(3, child);
+                own.setObject(4, generation.id());
+                UtcJdbcTime.setInstant(own, 5, generation.start());
+                UtcJdbcTime.setInstant(own, 6, generation.end());
+                marked = Math.addExact(marked, own.executeUpdate());
+            }
+        }
+        return marked;
+    }
+
+    /**
+     * Lists attached immutable staging partitions so stage-only queries can scan
+     * {@code ONLY child} relations directly instead of scanning the mutable parent
+     * observation table.
+     */
+    public static List<String> attachedStageChildTables(Connection connection, String observations,
+                                                        int idScope) throws SQLException {
+        String store = safeIdentifier(observations);
+        String sql = "SELECT child_table FROM oscar_obs_stage_partition " +
+                "WHERE store_key=? AND id_scope=? AND state='ATTACHED' " +
+                "AND to_regclass(child_table) IS NOT NULL " +
+                "ORDER BY window_start, child_table";
+        List<String> children = new ArrayList<>();
+        try (PreparedStatement statement = connection.prepareStatement(sql)) {
+            statement.setString(1, store);
+            statement.setInt(2, idScope);
+            try (ResultSet result = statement.executeQuery()) {
+                while (result.next())
+                    children.add(safeIdentifier(result.getString(1)));
+            }
+        }
+        return children;
+    }
+
+    /**
+     * Builds a {@code FROM}-clause relation over attached stage child partitions
+     * aliased as {@code o}, avoiding a parent inheritance scan across mutable
+     * base-table rows.
+     */
+    public static String stageChildrenFromClause(List<String> attachedChildren, String columns) {
+        if (attachedChildren.isEmpty())
+            throw new IllegalArgumentException("At least one attached stage child is required");
+        if (attachedChildren.size() == 1)
+            return "ONLY " + safeIdentifier(attachedChildren.get(0)) + " o";
+        StringBuilder union = new StringBuilder("(");
+        for (int i = 0; i < attachedChildren.size(); i++) {
+            if (i > 0)
+                union.append(" UNION ALL ");
+            union.append("SELECT ").append(columns)
+                    .append(" FROM ONLY ").append(safeIdentifier(attachedChildren.get(i)));
+        }
+        return union.append(") o").toString();
     }
 
     /**
@@ -1035,6 +1095,9 @@ public final class ArchiveCatalog {
         if (count != generation.rowCount() || minimumId != generation.minimumId() ||
                 maximumId != generation.maximumId())
             throw new IllegalStateException("Archive activation ledger count/range does not match its generation");
+        try (Statement analyze = postgres.createStatement()) {
+            analyze.execute("ANALYZE oscar_archive_activation_row");
+        }
     }
 
     public void failJob(UUID jobId, Throwable error) {

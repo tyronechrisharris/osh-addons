@@ -466,6 +466,9 @@ public final class ImmutableObservationStageManager {
                 }
                 connection.commit();
                 connection.setAutoCommit(oldAutoCommit);
+                try (Statement analyze = connection.createStatement()) {
+                    analyze.execute("ANALYZE " + OWNER_TABLE);
+                }
                 return true;
             } catch (Exception error) {
                 connection.rollback();

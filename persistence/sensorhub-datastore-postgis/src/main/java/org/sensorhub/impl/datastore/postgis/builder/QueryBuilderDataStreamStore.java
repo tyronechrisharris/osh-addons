@@ -145,6 +145,22 @@ public class QueryBuilderDataStreamStore extends QueryBuilder {
                 this.getStoreTableName() + "(id)";
     }
 
+    public String migrateLegacyDailyFileDataStreamSchemaQuery() {
+        return "UPDATE " + this.getStoreTableName() + "\n" +
+                "SET data = jsonb_set(\n" +
+                "    jsonb_set(\n" +
+                "        jsonb_set(\n" +
+                "            data - 'validTime',\n" +
+                "            '{recordSchema,fields,1,name}', '\"rpmMessage\"'::jsonb, false\n" +
+                "        ),\n" +
+                "        '{recordSchema,fields,1,label}', '\"RPM Message\"'::jsonb, false\n" +
+                "    ),\n" +
+                "    '{recordSchema,fields,1,definition}', '\"http://www.opengis.net/def/RPMMessage\"'::jsonb, false\n" +
+                ")\n" +
+                "WHERE data->>'outputName' = 'dailyFile'\n" +
+                "  AND (data->'recordSchema'->'fields'->1->>'name') IN ('rapiscanMessage', 'aspectMessage')";
+    }
+
     public String createSelectEntriesQuery(DataStreamFilter filter, Set<IDataStreamStore.DataStreamInfoField> fields) {
         return createParameterizedSelectEntriesQuery(filter, fields).sql();
     }

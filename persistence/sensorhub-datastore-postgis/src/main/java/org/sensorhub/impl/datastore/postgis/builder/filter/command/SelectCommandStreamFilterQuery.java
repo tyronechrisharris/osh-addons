@@ -58,7 +58,8 @@ public class SelectCommandStreamFilterQuery extends FilterQuery<SelectFilterQuer
                 filterQueryGenerator.addDistinct("(" + tableName + ".data->'system@id'->'internalID'->'id')::bigint");
                 filterQueryGenerator.addOrderBy(tableName + ".data->>'name'");
                 filterQueryGenerator.addOrderBy("(" + tableName + ".data->'system@id'->'internalID'->'id')::bigint");
-                filterQueryGenerator.addOrderBy("(" + tableName + ".data->'validTime'->>'end')::timestamp DESC ");
+                filterQueryGenerator.addOrderBy("COALESCE((" + tableName + ".data->'validTime'->>'end')::timestamp, 'infinity'::timestamp) DESC");
+                filterQueryGenerator.addOrderBy(tableName + ".id DESC");
             }
             else if (temporalFilter.isCurrentTime()) {
                 filterQueryGenerator.addDistinct("(" + tableName + ".data->>'name')");

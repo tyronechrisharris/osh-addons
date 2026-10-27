@@ -87,7 +87,10 @@ public class PostgisDataStreamStoreImpl extends PostgisStore<QueryBuilderDataStr
         // is first created.  Re-apply this idempotent trigger definition so an
         // upgrade replaces the legacy FOR EACH ROW trigger as well.
         try (Connection connection = this.connectionManager.getConnection()) {
-            PostgisUtils.executeQueries(connection, new String[]{queryBuilder.createMinMaxTimeTriggerQuery()});
+            PostgisUtils.executeQueries(connection, new String[]{
+                    queryBuilder.createMinMaxTimeTriggerQuery(),
+                    queryBuilder.migrateLegacyDailyFileDataStreamSchemaQuery()
+            });
         } catch (SQLException e) {
             throw new IllegalStateException("Cannot install batched datastream range maintenance", e);
         }
@@ -173,7 +176,7 @@ public class PostgisDataStreamStoreImpl extends PostgisStore<QueryBuilderDataStr
         // build request
         ParameterizedQuery query = queryBuilder.createParameterizedSelectEntriesQuery(filter, fields);
 
-        Map<DataStreamKey, IDataStreamInfo> results = new HashMap<>();
+        Map<DataStreamKey, IDataStreamInfo> results = new LinkedHashMap<>();
 
         try (Connection connection = this.connectionManager.getConnection()) {
             try (PreparedStatement statement = connection.prepareStatement(query.sql())) {
@@ -223,6 +226,19 @@ public class PostgisDataStreamStoreImpl extends PostgisStore<QueryBuilderDataStr
         }
     }
 
+    @Override
+    public Entry<DataStreamKey, IDataStreamInfo> getLatestVersionEntry(String sysUID, String outputName) {
+        return selectEntries(new DataStreamFilter.Builder()
+                .withSystems()
+                    .withUniqueIDs(sysUID)
+                    .done()
+                .withOutputNames(outputName)
+                .withValidTime(new TemporalFilter.Builder().withLatestTime().build())
+                .build())
+                .findFirst()
+                .orElse(null);
+    }
+
     public void intersectsAndUpdate(IDataStreamInfo dsInfo) throws DataStoreException {
         // if DS already exists, compute the time intersection
         DataStreamFilter.Builder dataStreamFilterBuilder = new DataStreamFilter.Builder();
@@ -251,6 +267,18 @@ public class PostgisDataStreamStoreImpl extends PostgisStore<QueryBuilderDataStr
             IDataStreamInfo currentDataStreamInfo = entry.getValue();
 
             TimeExtent dbValidTime = currentDataStreamInfo.getValidTime();
+            if (dbValidTime == null) {
+                Instant begin = Instant.EPOCH;
+                TimeExtent phenRange = currentDataStreamInfo.getPhenomenonTimeRange();
+                if (phenRange != null && phenRange.begin() != null
+                        && !phenRange.begin().equals(Instant.MIN)
+                        && !phenRange.begin().isAfter(newValidTime.begin())) {
+                    begin = phenRange.begin();
+                } else if (newValidTime.begin().isBefore(begin)) {
+                    begin = newValidTime.begin();
+                }
+                dbValidTime = TimeExtent.endNow(begin);
+            }
 
             TimeExtent resultIntersection;
             if (dbValidTime.endsNow() && !newValidTime.endsNow()) {

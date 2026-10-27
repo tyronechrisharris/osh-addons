@@ -22,6 +22,7 @@ import org.sensorhub.impl.datastore.postgis.builder.generator.FilterQueryGenerat
 import java.util.SortedSet;
 
 public abstract class BaseSystemWithDescFilterQuery<F extends FilterQueryGenerator> extends BaseFeatureFilterQuery<ISystemWithDesc, SystemFilter, F> {
+    private boolean includeMembers;
 
     public BaseSystemWithDescFilterQuery(String tableName, F filterQueryGenerator) {
         super(tableName, filterQueryGenerator);
@@ -30,6 +31,7 @@ public abstract class BaseSystemWithDescFilterQuery<F extends FilterQueryGenerat
 
     @Override
     public F build(SystemFilter filter) {
+        this.includeMembers = filter != null && filter.includeMembers();
         this.filterQueryGenerator = super.build(filter);
 //        filter.getDataStreamFilter()
 //        filter.getProcedureFilter()
@@ -41,7 +43,7 @@ public abstract class BaseSystemWithDescFilterQuery<F extends FilterQueryGenerat
     }
 
     protected void handleIncludeMembers() {
-        // TODO: Implement
+        // Handled in handleUniqueIds
     }
 
     @Override
@@ -62,8 +64,14 @@ public abstract class BaseSystemWithDescFilterQuery<F extends FilterQueryGenerat
             for(String uid: uniqueIds) {
                 // ILIKE use % OPERATOR
                 currentId = uid.replaceAll("\\*","%");
-                sb.append("(").append(tableName).append(".data->>'uniqueId') ILIKE ?");
+                sb.append("((").append(tableName).append(".data->>'uniqueId') ILIKE ?");
                 addParameter("%" + currentId);
+                if (this.includeMembers) {
+                    sb.append(" OR ").append(tableName).append(".parentId IN (SELECT id FROM ")
+                            .append(tableName).append(" WHERE (data->>'uniqueId') ILIKE ?)");
+                    addParameter("%" + currentId);
+                }
+                sb.append(")");
                 if(++i < uniqueIds.size()) {
                     sb.append(" OR ");
                 }
