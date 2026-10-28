@@ -450,6 +450,19 @@ public class TestParameterizedQueryBuilder {
         assertEquals(Arrays.asList(101L, 202L), query.parameters());
     }
 
+    @Test
+    public void testDataStreamSelectKeysQueryProjectsOnlyId() {
+        QueryBuilderDataStreamStore builder = new QueryBuilderDataStreamStore("obs_datastreams");
+        DataStreamFilter filter = new DataStreamFilter.Builder()
+                .withOutputNames("gammaCount")
+                .build();
+
+        ParameterizedQuery query = builder.createParameterizedSelectKeysQuery(filter);
+        assertTrue(query.sql().startsWith("SELECT obs_datastreams.id FROM obs_datastreams"));
+        assertFalse(query.sql().contains("obs_datastreams.*"));
+        assertEquals(Arrays.asList("gammaCount"), query.parameters());
+    }
+
     private void assertSqlDoesNotContainInjection(ParameterizedQuery query) {
         assertFalse(query.sql().contains(INJECTION));
         assertTrue(query.parameters().stream().anyMatch(parameter -> parameter.toString().contains(INJECTION)));

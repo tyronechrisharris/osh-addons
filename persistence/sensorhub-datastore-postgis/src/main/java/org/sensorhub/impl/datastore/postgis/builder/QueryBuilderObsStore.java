@@ -125,8 +125,38 @@ public class QueryBuilderObsStore extends QueryBuilder {
                 createResultPathOpsIndexQuery(),
                 createOccupancyCountIndexQuery(),
                 createMaxGammaIndexQuery(),
-                createMaxNeutronIndexQuery()
+                createMaxNeutronIndexQuery(),
+                createKeysetPhenomenonTimeAscIndexQuery(),
+                createKeysetPhenomenonTimeDescIndexQuery(),
+                createKeysetDataStreamPhenomenonTimeAscIndexQuery(),
+                createKeysetDataStreamPhenomenonTimeDescIndexQuery(),
+                createKeysetDataStreamResultTimeIndexQuery()
         };
+    }
+
+    public String createKeysetPhenomenonTimeAscIndexQuery() {
+        return "CREATE INDEX IF NOT EXISTS " + this.getStoreTableName() + "_phenomenon_time_id_nulls_first_idx on " +
+                this.getStoreTableName() + " (" + PHENOMENON_TIME + " ASC NULLS FIRST, id ASC)";
+    }
+
+    public String createKeysetPhenomenonTimeDescIndexQuery() {
+        return "CREATE INDEX IF NOT EXISTS " + this.getStoreTableName() + "_phenomenon_time_desc_id_nulls_first_idx on " +
+                this.getStoreTableName() + " (" + PHENOMENON_TIME + " DESC NULLS FIRST, id ASC)";
+    }
+
+    public String createKeysetDataStreamPhenomenonTimeAscIndexQuery() {
+        return "CREATE INDEX IF NOT EXISTS " + this.getStoreTableName() + "_datastream_phenomenon_time_id_nulls_first_idx on " +
+                this.getStoreTableName() + " (" + DATASTREAM_ID + " ASC, " + PHENOMENON_TIME + " ASC NULLS FIRST, id ASC)";
+    }
+
+    public String createKeysetDataStreamPhenomenonTimeDescIndexQuery() {
+        return "CREATE INDEX IF NOT EXISTS " + this.getStoreTableName() + "_datastream_phenomenon_time_desc_id_nulls_first_idx on " +
+                this.getStoreTableName() + " (" + DATASTREAM_ID + " ASC, " + PHENOMENON_TIME + " DESC NULLS FIRST, id ASC)";
+    }
+
+    public String createKeysetDataStreamResultTimeIndexQuery() {
+        return "CREATE INDEX IF NOT EXISTS " + this.getStoreTableName() + "_datastream_result_time_id_idx on " +
+                this.getStoreTableName() + " (" + DATASTREAM_ID + " ASC, " + RESULT_TIME + " ASC, id ASC)";
     }
 
     private String createNumericResultIndexQuery(String propertyName, String indexName) {

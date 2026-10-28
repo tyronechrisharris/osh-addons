@@ -190,4 +190,14 @@ public class QueryBuilderDataStreamStore extends QueryBuilder {
         return selectEntriesDataStreamQuery.toParameterizedQuery();
     }
 
+    public ParameterizedQuery createParameterizedSelectKeysQuery(DataStreamFilter filter) {
+        SelectEntriesDataStreamQuery selectEntriesDataStreamQuery = new SelectEntriesDataStreamQuery.Builder()
+                .tableName(this.getStoreTableName())
+                .linkTo(this.systemStore)
+                .withOnlyId()
+                .withDataStreamFilter(filter)
+                .build();
+        return selectEntriesDataStreamQuery.toParameterizedQuery();
+    }
+
 }

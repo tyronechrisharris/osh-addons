@@ -26,6 +26,11 @@ public class SelectEntriesQuery extends EntriesQuery<SelectFilterQueryGenerator>
             return self();
         }
 
+        public T withOnlyId() {
+            filterQueryGenerator.addSelectField("id");
+            return self();
+        }
+
         public T withLimit(long limit) {
             if(limit != Long.MAX_VALUE) {
                 filterQueryGenerator.setLimit(limit);

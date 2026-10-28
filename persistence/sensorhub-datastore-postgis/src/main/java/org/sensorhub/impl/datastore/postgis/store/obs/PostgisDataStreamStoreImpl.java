@@ -104,14 +104,16 @@ public class PostgisDataStreamStoreImpl extends PostgisStore<QueryBuilderDataStr
     protected class DataStreamInfoWithTimeRanges extends DataStreamInfoWrapper
     {
         Long dsID;
+        final IDataStreamInfo baseInfo;
         TimeExtent validTime;
         TimeExtent phenomenonTimeRange;
         TimeExtent resultTimeRange;
 
         DataStreamInfoWithTimeRanges(Long internalID, IDataStreamInfo dsInfo)
         {
-            super(dsInfo);
+            super(dsInfo instanceof DataStreamInfoWithTimeRanges existing ? existing.baseInfo : dsInfo);
             this.dsID = internalID;
+            this.baseInfo = dsInfo instanceof DataStreamInfoWithTimeRanges existing ? existing.baseInfo : dsInfo;
         }
 
         @Override
@@ -172,6 +174,24 @@ public class PostgisDataStreamStoreImpl extends PostgisStore<QueryBuilderDataStr
     }
 
     @Override
+    public Stream<DataStreamKey> selectKeys(DataStreamFilter filter) {
+        ParameterizedQuery query = queryBuilder.createParameterizedSelectKeysQuery(filter);
+        List<DataStreamKey> results = new ArrayList<>();
+        try (Connection connection = this.connectionManager.getConnection();
+             PreparedStatement statement = connection.prepareStatement(query.sql())) {
+            query.bind(statement);
+            try (ResultSet resultSet = statement.executeQuery()) {
+                while (resultSet.next()) {
+                    results.add(new DataStreamKey(idScope, resultSet.getLong("id")));
+                }
+            }
+        } catch (SQLException e) {
+            throw new RuntimeException(e);
+        }
+        return results.stream();
+    }
+
+    @Override
     public Stream<Entry<DataStreamKey, IDataStreamInfo>> selectEntries(DataStreamFilter filter, Set<DataStreamInfoField> fields) {
         // build request
         ParameterizedQuery query = queryBuilder.createParameterizedSelectEntriesQuery(filter, fields);
@@ -184,8 +204,16 @@ public class PostgisDataStreamStoreImpl extends PostgisStore<QueryBuilderDataStr
                 try (ResultSet resultSet = statement.executeQuery()) {
                     while (resultSet.next()) {
                         long id = resultSet.getLong("id");
-                        String data = resultSet.getString("data");
-                        IDataStreamInfo dataStreamInfo = SerializerUtils.readIDataStreamInfoFromJson(data);
+                        IDataStreamInfo cached = cache.getIfPresent(id);
+                        IDataStreamInfo dataStreamInfo;
+                        if (cached instanceof DataStreamInfoWithTimeRanges cachedWrapper) {
+                            dataStreamInfo = cachedWrapper.baseInfo;
+                        } else if (cached != null) {
+                            dataStreamInfo = cached;
+                        } else {
+                            String data = resultSet.getString("data");
+                            dataStreamInfo = SerializerUtils.readIDataStreamInfoFromJson(data);
+                        }
                         DataStreamInfoWithTimeRanges wrapper = new DataStreamInfoWithTimeRanges(id, dataStreamInfo);
 
                         Instant minPhenomenonTime = UtcJdbcTime.getInstant(resultSet, "min_phenomenon_time");
@@ -203,6 +231,7 @@ public class PostgisDataStreamStoreImpl extends PostgisStore<QueryBuilderDataStr
                                 maxResultTime != null ? maxResultTime : Instant.MAX
                         ));
 
+                        cache.put(id, wrapper);
                         results.put(new DataStreamKey(idScope, id), wrapper);
                     }
                 } catch (IOException e) {

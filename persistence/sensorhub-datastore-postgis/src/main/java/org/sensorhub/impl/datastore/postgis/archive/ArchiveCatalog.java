@@ -278,7 +278,7 @@ public final class ArchiveCatalog {
                         "window_start timestamptz NOT NULL, window_end timestamptz NOT NULL, state text NOT NULL, " +
                         "object_path text NOT NULL, manifest_path text NOT NULL, sha256 text NOT NULL, row_count bigint NOT NULL, " +
                         "min_id bigint NOT NULL, max_id bigint NOT NULL, parity_verified boolean NOT NULL DEFAULT false, " +
-                        "activated_at timestamptz NOT NULL DEFAULT now(), sealed_at timestamptz)");
+                        "activated_at timestamptz NOT NULL DEFAULT now(), sealed_at timestamptz, max_result_time timestamptz)");
                 statement.execute("ALTER TABLE oscar_archive_job ADD COLUMN IF NOT EXISTS revision integer NOT NULL DEFAULT 1");
                 statement.execute("ALTER TABLE oscar_archive_job ADD COLUMN IF NOT EXISTS store_key text NOT NULL DEFAULT 'legacy'");
                 statement.execute("ALTER TABLE oscar_archive_job ADD COLUMN IF NOT EXISTS id_scope integer NOT NULL DEFAULT -1");
@@ -286,6 +286,7 @@ public final class ArchiveCatalog {
                 statement.execute("ALTER TABLE oscar_archive_job ALTER COLUMN id_scope DROP DEFAULT");
                 statement.execute("ALTER TABLE oscar_archive_generation ADD COLUMN IF NOT EXISTS store_key text NOT NULL DEFAULT 'legacy'");
                 statement.execute("ALTER TABLE oscar_archive_generation ADD COLUMN IF NOT EXISTS id_scope integer NOT NULL DEFAULT -1");
+                statement.execute("ALTER TABLE oscar_archive_generation ADD COLUMN IF NOT EXISTS max_result_time timestamptz");
                 statement.execute("ALTER TABLE oscar_archive_generation ALTER COLUMN store_key DROP DEFAULT");
                 statement.execute("ALTER TABLE oscar_archive_generation ALTER COLUMN id_scope DROP DEFAULT");
                 statement.execute("ALTER TABLE oscar_archive_job DROP CONSTRAINT IF EXISTS oscar_archive_job_profile_window_start_window_end_key");
@@ -297,6 +298,10 @@ public final class ArchiveCatalog {
                 statement.execute("DROP INDEX IF EXISTS oscar_archive_generation_time_idx");
                 statement.execute("CREATE INDEX IF NOT EXISTS oscar_archive_generation_time_idx ON oscar_archive_generation " +
                         "(store_key, id_scope, profile, window_start, window_end) WHERE state IN ('ACTIVE','SEALED')");
+                statement.execute("CREATE INDEX IF NOT EXISTS oscar_archive_generation_window_idx ON oscar_archive_generation " +
+                        "(store_key, id_scope, window_start, window_end) WHERE state IN ('ACTIVE','SEALED')");
+                statement.execute("CREATE INDEX IF NOT EXISTS oscar_archive_generation_result_time_idx ON oscar_archive_generation " +
+                        "(store_key, id_scope, max_result_time) WHERE state IN ('ACTIVE','SEALED')");
                 statement.execute("CREATE TABLE IF NOT EXISTS oscar_archive_object (" +
                         "generation_id uuid NOT NULL REFERENCES oscar_archive_generation(id) ON DELETE CASCADE, " +
                         "relative_path text NOT NULL, kind text NOT NULL, sha256 text NOT NULL, bytes bigint NOT NULL, " +
@@ -824,7 +829,7 @@ public final class ArchiveCatalog {
             try {
                 String observations = safeIdentifier(observationTable);
                 String dataStreams = safeIdentifier(dataStreamTable);
-                stageExportedRows(connection, parquetPath, generation);
+                Instant maxResultTime = stageExportedRows(connection, parquetPath, generation);
                 // Staging does not touch mutable PostgreSQL rows.  Acquire the
                 // exclusive store lock only for the activation transaction's
                 // critical section so ordinary ingestion is not blocked by
@@ -859,8 +864,8 @@ public final class ArchiveCatalog {
                             generation.rowCount() + " exact rows but marked " + marked);
                 try (PreparedStatement statement = connection.prepareStatement(
                         "INSERT INTO oscar_archive_generation(id, job_id, store_key, id_scope, profile, window_start, window_end, state, " +
-                                "object_path, manifest_path, sha256, row_count, min_id, max_id) " +
-                                "VALUES (?, ?, ?, ?, ?, ?, ?, 'ACTIVE', ?, ?, ?, ?, ?, ?)")) {
+                                "object_path, manifest_path, sha256, row_count, min_id, max_id, max_result_time) " +
+                                "VALUES (?, ?, ?, ?, ?, ?, ?, 'ACTIVE', ?, ?, ?, ?, ?, ?, ?)")) {
                     statement.setObject(1, generation.id());
                     statement.setObject(2, jobId);
                     statement.setString(3, storeKey);
@@ -874,6 +879,10 @@ public final class ArchiveCatalog {
                     statement.setLong(11, generation.rowCount());
                     statement.setLong(12, generation.minimumId());
                     statement.setLong(13, generation.maximumId());
+                    if (maxResultTime == null)
+                        statement.setNull(14, Types.TIMESTAMP_WITH_TIMEZONE);
+                    else
+                        UtcJdbcTime.setInstant(statement, 14, maxResultTime);
                     statement.executeUpdate();
                 }
                 try (PreparedStatement statement = connection.prepareStatement(
@@ -1026,8 +1035,8 @@ public final class ArchiveCatalog {
      * Keeping the ledger in PostgreSQL also lets the final UPDATE lock and
      * recheck each live tuple atomically under normal READ COMMITTED rules.
      */
-    private void stageExportedRows(Connection postgres, Path parquetPath,
-                                   ArchiveGeneration generation) throws Exception {
+    private Instant stageExportedRows(Connection postgres, Path parquetPath,
+                                      ArchiveGeneration generation) throws Exception {
         try (Statement create = postgres.createStatement()) {
             create.execute("CREATE TEMP TABLE oscar_archive_activation_row (" +
                     "observation_id bigint PRIMARY KEY, datastream_id bigint NOT NULL, foi_id bigint, " +
@@ -1044,6 +1053,7 @@ public final class ArchiveCatalog {
         long count = 0;
         long minimumId = Long.MAX_VALUE;
         long maximumId = Long.MIN_VALUE;
+        Instant maxResultTime = generation.maxResultTime();
         try (DuckDbResourcePolicy.Session duckSession = DuckDbResourcePolicy.open(
                 resourceConfig, "activation-stage");
              Statement read = duckSession.connection().createStatement();
@@ -1079,6 +1089,9 @@ public final class ArchiveCatalog {
                     stage.setNull(5, Types.TIMESTAMP);
                 else
                     UtcJdbcTime.setInstant(stage, 5, resultTime);
+                Instant candidateResultTime = resultTime != null ? resultTime : phenomenonTime;
+                if (candidateResultTime != null && (maxResultTime == null || candidateResultTime.isAfter(maxResultTime)))
+                    maxResultTime = candidateResultTime;
                 String resultJson = rows.getString(9);
                 if (resultJson == null)
                     stage.setNull(6, Types.VARCHAR);
@@ -1100,6 +1113,7 @@ public final class ArchiveCatalog {
         try (Statement analyze = postgres.createStatement()) {
             analyze.execute("ANALYZE oscar_archive_activation_row");
         }
+        return maxResultTime;
     }
 
     public void failJob(UUID jobId, Throwable error) {
@@ -1205,8 +1219,10 @@ public final class ArchiveCatalog {
         boolean filterIdRange = observationId == null &&
                 minObservationId != null && maxObservationId != null;
         boolean filterDataStreams = dataStreams != null;
-        String sql = "SELECT DISTINCT g.id, g.profile, g.window_start, g.window_end, g.object_path, g.sha256, " +
-                "g.row_count, g.min_id, g.max_id, g.state, g.parity_verified FROM oscar_archive_generation g ";
+        String sql = (observationId != null ? "SELECT DISTINCT " : "SELECT ") +
+                "g.id, g.profile, g.window_start, g.window_end, g.object_path, g.sha256, " +
+                "g.row_count, g.min_id, g.max_id, g.state, g.parity_verified, g.max_result_time " +
+                "FROM oscar_archive_generation g ";
         if (observationId != null)
             sql += "JOIN oscar_archive_id_block b ON b.generation_id=g.id ";
         sql += "WHERE g.store_key=? AND g.id_scope=? AND g.state IN ('ACTIVE','SEALED') " +
@@ -1240,10 +1256,7 @@ public final class ArchiveCatalog {
                 statement.setArray(parameter, streamArray);
             try (ResultSet result = statement.executeQuery()) {
                 while (result.next()) {
-                    generations.add(new ArchiveGeneration(
-                            result.getObject(1, UUID.class), result.getString(2), UtcJdbcTime.getInstant(result, 3),
-                            UtcJdbcTime.getInstant(result, 4), Path.of(result.getString(5)), result.getString(6),
-                            result.getLong(7), result.getLong(8), result.getLong(9), result.getString(10), result.getBoolean(11)));
+                    generations.add(readGeneration(result));
                 }
             }
         } finally {
@@ -1251,6 +1264,248 @@ public final class ArchiveCatalog {
                 streamArray.free();
         }
         return generations;
+    }
+
+    /**
+     * Pushes {@code resultTime=latest} high-water filtering into PostgreSQL so
+     * multi-year archives do not materialize tens of thousands of historical
+     * generations whose {@code max_result_time} is older than the hot tier.
+     */
+    public List<ArchiveGeneration> candidatesPotentiallyNewerThanResultTime(
+            Instant start, Instant end, Set<Long> dataStreams, Instant minResultTime) {
+        if (dataStreams != null && dataStreams.isEmpty())
+            return List.of();
+        if (minResultTime == null)
+            return candidates(start, end, null, null, null, dataStreams);
+        boolean filterDataStreams = dataStreams != null;
+        String sql = "SELECT g.id, g.profile, g.window_start, g.window_end, g.object_path, g.sha256, " +
+                "g.row_count, g.min_id, g.max_id, g.state, g.parity_verified, g.max_result_time " +
+                "FROM oscar_archive_generation g " +
+                "WHERE g.store_key=? AND g.id_scope=? AND g.state IN ('ACTIVE','SEALED') " +
+                "AND g.window_start < ? AND g.window_end > ? " +
+                "AND (g.max_result_time IS NULL OR g.max_result_time >= ?) ";
+        if (filterDataStreams)
+            sql += "AND EXISTS (SELECT 1 FROM oscar_archive_schema s " +
+                    "WHERE s.generation_id=g.id AND s.datastream_id=ANY (?::bigint[])) ";
+        sql += "ORDER BY g.window_start, g.id";
+
+        List<ArchiveGeneration> generations = new ArrayList<>();
+        try (Connection connection = connections.open()) {
+            java.sql.Array streamArray = filterDataStreams
+                    ? connection.createArrayOf("bigint", dataStreams.toArray(Long[]::new))
+                    : null;
+            try (PreparedStatement statement = connection.prepareStatement(sql)) {
+                int parameter = 1;
+                statement.setString(parameter++, storeKey);
+                statement.setInt(parameter++, idScope);
+                UtcJdbcTime.setInstant(statement, parameter++, end);
+                UtcJdbcTime.setInstant(statement, parameter++, start);
+                UtcJdbcTime.setInstant(statement, parameter++, minResultTime);
+                if (streamArray != null)
+                    statement.setArray(parameter, streamArray);
+                try (ResultSet result = statement.executeQuery()) {
+                    while (result.next())
+                        generations.add(readGeneration(result));
+                }
+            } finally {
+                if (streamArray != null)
+                    streamArray.free();
+            }
+            return generations;
+        } catch (SQLException e) {
+            throw new IllegalStateException("Cannot plan result-time archive query", e);
+        }
+    }
+
+    /**
+     * Backfills {@code max_result_time} on a pre-upgrade generation row once its
+     * Parquet metadata has been inspected so future queries filter it in SQL.
+     */
+    public void backfillMaxResultTime(UUID generationId, Instant maxResultTime) {
+        if (generationId == null || maxResultTime == null)
+            return;
+        try (Connection connection = connections.open();
+             PreparedStatement statement = connection.prepareStatement(
+                     "UPDATE oscar_archive_generation SET max_result_time=? " +
+                             "WHERE id=? AND store_key=? AND id_scope=? AND max_result_time IS NULL")) {
+            UtcJdbcTime.setInstant(statement, 1, maxResultTime);
+            statement.setObject(2, generationId);
+            statement.setString(3, storeKey);
+            statement.setInt(4, idScope);
+            statement.executeUpdate();
+        } catch (SQLException ignored) {
+            // Best-effort metadata cache persistence; in-memory SHA-256 cache remains authoritative.
+        }
+    }
+
+    public record InitialCandidateBatch(List<ArchiveGeneration> generations, boolean complete) {
+    }
+
+    /**
+     * Fetches a bounded initial window-cluster prefix for {@code LIMIT}-bounded
+     * queries so time-unbounded queries over multi-year archives do not load
+     * all {@code 87,600+} catalog rows when the first window cluster already
+     * satisfies the caller's limit.
+     */
+    public InitialCandidateBatch candidatesInitialClusters(
+            Instant start, Instant end, Set<Long> dataStreams,
+            boolean descending, int batchLimit) {
+        if (batchLimit < 2)
+            throw new IllegalArgumentException("Candidate batch limit must be at least 2");
+        if (dataStreams != null && dataStreams.isEmpty())
+            return new InitialCandidateBatch(List.of(), true);
+        boolean filterDataStreams = dataStreams != null;
+        String orderBy = descending
+                ? "ORDER BY g.window_end DESC, g.window_start DESC, g.id ASC LIMIT ?"
+                : "ORDER BY g.window_start ASC, g.window_end ASC, g.id ASC LIMIT ?";
+        String sql = "SELECT g.id, g.profile, g.window_start, g.window_end, g.object_path, g.sha256, " +
+                "g.row_count, g.min_id, g.max_id, g.state, g.parity_verified, g.max_result_time " +
+                "FROM oscar_archive_generation g " +
+                "WHERE g.store_key=? AND g.id_scope=? AND g.state IN ('ACTIVE','SEALED') " +
+                "AND g.window_start < ? AND g.window_end > ? ";
+        if (filterDataStreams)
+            sql += "AND EXISTS (SELECT 1 FROM oscar_archive_schema s " +
+                    "WHERE s.generation_id=g.id AND s.datastream_id=ANY (?::bigint[])) ";
+        sql += orderBy;
+
+        List<ArchiveGeneration> fetched = new ArrayList<>();
+        try (Connection connection = connections.open()) {
+            java.sql.Array streamArray = filterDataStreams
+                    ? connection.createArrayOf("bigint", dataStreams.toArray(Long[]::new))
+                    : null;
+            try (PreparedStatement statement = connection.prepareStatement(sql)) {
+                int parameter = 1;
+                statement.setString(parameter++, storeKey);
+                statement.setInt(parameter++, idScope);
+                UtcJdbcTime.setInstant(statement, parameter++, end);
+                UtcJdbcTime.setInstant(statement, parameter++, start);
+                if (streamArray != null)
+                    statement.setArray(parameter++, streamArray);
+                statement.setInt(parameter, Math.addExact(batchLimit, 1));
+                try (ResultSet result = statement.executeQuery()) {
+                    while (result.next())
+                        fetched.add(readGeneration(result));
+                }
+            } finally {
+                if (streamArray != null)
+                    streamArray.free();
+            }
+        } catch (SQLException e) {
+            throw new IllegalStateException("Cannot plan bounded archive query", e);
+        }
+
+        if (fetched.size() <= batchLimit) {
+            fetched.sort(java.util.Comparator.comparing(ArchiveGeneration::start)
+                    .thenComparing(ArchiveGeneration::id));
+            return new InitialCandidateBatch(fetched, true);
+        }
+
+        List<ArchiveGeneration> sample = new ArrayList<>(fetched.subList(0, batchLimit));
+        sample.sort(java.util.Comparator.comparing(ArchiveGeneration::start)
+                .thenComparing(ArchiveGeneration::end)
+                .thenComparing(ArchiveGeneration::id));
+        List<List<ArchiveGeneration>> clusters = new ArrayList<>();
+        Instant clusterEnd = null;
+        for (ArchiveGeneration generation : sample) {
+            if (clusters.isEmpty() || !generation.start().isBefore(clusterEnd)) {
+                clusters.add(new ArrayList<>());
+                clusterEnd = generation.end();
+            } else if (generation.end().isAfter(clusterEnd)) {
+                clusterEnd = generation.end();
+            }
+            clusters.get(clusters.size() - 1).add(generation);
+        }
+        if (clusters.size() < 2) {
+            List<ArchiveGeneration> all = candidates(start, end, null, null, null, dataStreams);
+            return new InitialCandidateBatch(all, true);
+        }
+        List<List<ArchiveGeneration>> completeClusters = descending
+                ? clusters.subList(1, clusters.size())
+                : clusters.subList(0, clusters.size() - 1);
+        List<ArchiveGeneration> completePrefix = new ArrayList<>();
+        for (List<ArchiveGeneration> cluster : completeClusters)
+            completePrefix.addAll(cluster);
+        completePrefix.sort(java.util.Comparator.comparing(ArchiveGeneration::start)
+                .thenComparing(ArchiveGeneration::id));
+        return new InitialCandidateBatch(completePrefix, false);
+    }
+
+    /**
+     * Rebuilds B-tree indexes online on the mutable observation parent table
+     * and its companion datastream metadata table so multi-year DELETE/UPDATE
+     * churn cannot accumulate unbounded dead index pages.
+     */
+    public void reindexMutableTables(String observationTable, String dataStreamTable) {
+        String observations = safeIdentifier(observationTable);
+        String dataStreams = safeIdentifier(dataStreamTable);
+        try (Connection connection = connections.open()) {
+            boolean oldAutoCommit = connection.getAutoCommit();
+            if (!oldAutoCommit)
+                connection.setAutoCommit(true);
+            try (Statement statement = connection.createStatement()) {
+                if (resourceConfig.isParquetPrimary())
+                    statement.execute("REINDEX TABLE CONCURRENTLY " + observations);
+                statement.execute("REINDEX TABLE CONCURRENTLY " + dataStreams);
+            } finally {
+                if (!oldAutoCommit)
+                    connection.setAutoCommit(false);
+            }
+        } catch (SQLException e) {
+            throw new IllegalStateException("Cannot reindex mutable observation tables", e);
+        }
+    }
+
+    /**
+     * Returns the subset of {@code dataStreams} that appear in at least one
+     * active or sealed archive generation overlapping {@code [start, end)}.
+     * Uses {@code oscar_archive_schema_datastream_idx} so datastreams with no
+     * archived observations are excluded without scanning Parquet files.
+     */
+    public Set<Long> filterPresentDataStreams(Instant start, Instant end, Collection<Long> dataStreams) {
+        if (dataStreams == null || dataStreams.isEmpty() || !start.isBefore(end))
+            return Set.of();
+        String sql = "SELECT DISTINCT s.datastream_id " +
+                "FROM oscar_archive_schema s " +
+                "JOIN oscar_archive_generation g ON g.id = s.generation_id " +
+                "WHERE g.store_key=? AND g.id_scope=? AND g.state IN ('ACTIVE','SEALED') " +
+                "AND g.window_start < ? AND g.window_end > ? " +
+                "AND s.datastream_id = ANY (?::bigint[])";
+        Set<Long> present = new HashSet<>();
+        try (Connection connection = connections.open()) {
+            java.sql.Array streamArray = connection.createArrayOf("bigint", dataStreams.toArray(Long[]::new));
+            try (PreparedStatement statement = connection.prepareStatement(sql)) {
+                statement.setString(1, storeKey);
+                statement.setInt(2, idScope);
+                UtcJdbcTime.setInstant(statement, 3, end);
+                UtcJdbcTime.setInstant(statement, 4, start);
+                statement.setArray(5, streamArray);
+                try (ResultSet result = statement.executeQuery()) {
+                    while (result.next())
+                        present.add(result.getLong(1));
+                }
+            } finally {
+                streamArray.free();
+            }
+        } catch (SQLException e) {
+            throw new IllegalStateException("Cannot inspect archived datastreams", e);
+        }
+        return present;
+    }
+
+    private static ArchiveGeneration readGeneration(ResultSet result) throws SQLException {
+        return new ArchiveGeneration(
+                result.getObject(1, UUID.class),
+                result.getString(2),
+                UtcJdbcTime.getInstant(result, 3),
+                UtcJdbcTime.getInstant(result, 4),
+                Path.of(result.getString(5)),
+                result.getString(6),
+                result.getLong(7),
+                result.getLong(8),
+                result.getLong(9),
+                result.getString(10),
+                result.getBoolean(11),
+                UtcJdbcTime.getInstant(result, 12));
     }
 
     public Optional<Instant> latestWindowEnd(long dataStreamId) {
@@ -1383,7 +1638,7 @@ public final class ArchiveCatalog {
             throw new IllegalArgumentException("Hot-deletion generation limit must be positive");
         List<ArchiveGeneration> generations = new ArrayList<>();
         String sql = "SELECT g.id, g.profile, g.window_start, g.window_end, g.object_path, g.sha256, " +
-                "g.row_count, g.min_id, g.max_id, g.state, g.parity_verified " +
+                "g.row_count, g.min_id, g.max_id, g.state, g.parity_verified, g.max_result_time " +
                 "FROM oscar_archive_generation g WHERE g.store_key=? AND g.id_scope=? " +
                 "AND g.state='ACTIVE' AND g.parity_verified=true " +
                 "AND g.activated_at <= ? AND NOT EXISTS (SELECT 1 FROM oscar_retention_hold h " +
@@ -1397,10 +1652,7 @@ public final class ArchiveCatalog {
             statement.setInt(4, limit);
             try (ResultSet result = statement.executeQuery()) {
                 while (result.next()) {
-                    generations.add(new ArchiveGeneration(result.getObject(1, UUID.class), result.getString(2),
-                            UtcJdbcTime.getInstant(result, 3), UtcJdbcTime.getInstant(result, 4),
-                            Path.of(result.getString(5)), result.getString(6), result.getLong(7), result.getLong(8),
-                            result.getLong(9), result.getString(10), result.getBoolean(11)));
+                    generations.add(readGeneration(result));
                 }
             }
         } catch (SQLException e) {
@@ -1411,7 +1663,7 @@ public final class ArchiveCatalog {
 
     public List<ArchiveGeneration> unverifiedGenerations(int limit) {
         List<ArchiveGeneration> generations = new ArrayList<>();
-        String sql = "SELECT id, profile, window_start, window_end, object_path, sha256, row_count, min_id, max_id, state, parity_verified " +
+        String sql = "SELECT id, profile, window_start, window_end, object_path, sha256, row_count, min_id, max_id, state, parity_verified, max_result_time " +
                 "FROM oscar_archive_generation WHERE store_key=? AND id_scope=? " +
                         "AND state='ACTIVE' AND parity_verified=false ORDER BY activated_at LIMIT ?";
         try (Connection connection = connections.open(); PreparedStatement statement = connection.prepareStatement(sql)) {
@@ -1420,10 +1672,7 @@ public final class ArchiveCatalog {
             statement.setInt(3, limit);
             try (ResultSet result = statement.executeQuery()) {
                 while (result.next()) {
-                    generations.add(new ArchiveGeneration(result.getObject(1, UUID.class), result.getString(2),
-                            UtcJdbcTime.getInstant(result, 3), UtcJdbcTime.getInstant(result, 4), Path.of(result.getString(5)),
-                            result.getString(6), result.getLong(7), result.getLong(8), result.getLong(9),
-                            result.getString(10), result.getBoolean(11)));
+                    generations.add(readGeneration(result));
                 }
             }
         } catch (SQLException e) {

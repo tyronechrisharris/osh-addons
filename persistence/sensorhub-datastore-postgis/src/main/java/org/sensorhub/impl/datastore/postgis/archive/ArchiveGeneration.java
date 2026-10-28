@@ -16,5 +16,22 @@ public record ArchiveGeneration(
         long minimumId,
         long maximumId,
         String state,
-        boolean parityVerified) {
+        boolean parityVerified,
+        Instant maxResultTime) {
+
+    public ArchiveGeneration(
+            UUID id,
+            String profile,
+            Instant start,
+            Instant end,
+            Path objectPath,
+            String sha256,
+            long rowCount,
+            long minimumId,
+            long maximumId,
+            String state,
+            boolean parityVerified) {
+        this(id, profile, start, end, objectPath, sha256, rowCount,
+                minimumId, maximumId, state, parityVerified, null);
+    }
 }

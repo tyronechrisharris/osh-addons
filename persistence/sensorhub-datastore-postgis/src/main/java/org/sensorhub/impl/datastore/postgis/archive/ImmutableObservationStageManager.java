@@ -297,6 +297,16 @@ public final class ImmutableObservationStageManager {
                     "phenomenontime,COALESCE(resulttime,'-infinity'::timestamp))");
             ddl.execute("CREATE INDEX " + safeIdentifier(child + "_stream_time_idx") +
                     " ON " + child + "(datastreamid,phenomenontime,id)");
+            ddl.execute("CREATE INDEX " + safeIdentifier(child + "_stream_rtime_idx") +
+                    " ON " + child + "(datastreamid,resulttime,id)");
+            ddl.execute("CREATE INDEX " + safeIdentifier(child + "_time_id_asc_idx") +
+                    " ON " + child + "(phenomenontime ASC NULLS FIRST,id ASC)");
+            ddl.execute("CREATE INDEX " + safeIdentifier(child + "_time_id_desc_idx") +
+                    " ON " + child + "(phenomenontime DESC NULLS FIRST,id ASC)");
+            ddl.execute("CREATE INDEX " + safeIdentifier(child + "_st_asc_idx") +
+                    " ON " + child + "(datastreamid ASC,phenomenontime ASC NULLS FIRST,id ASC)");
+            ddl.execute("CREATE INDEX " + safeIdentifier(child + "_st_desc_idx") +
+                    " ON " + child + "(datastreamid ASC,phenomenontime DESC NULLS FIRST,id ASC)");
         }
         try (PreparedStatement insert = connection.prepareStatement(
                 "INSERT INTO " + PARTITION_TABLE +
@@ -603,6 +613,25 @@ public final class ImmutableObservationStageManager {
                         throw new SQLException("Cataloged attached staging partition is missing/detached: " + child);
                     if ("DETACHED".equals(state) && (!exists || inherited))
                         throw new SQLException("Cataloged detached staging partition has inconsistent DDL state: " + child);
+                    if ("ATTACHED".equals(state)) {
+                        try (Statement indexDdl = connection.createStatement()) {
+                            indexDdl.execute("CREATE INDEX IF NOT EXISTS " +
+                                    safeIdentifier(child + "_stream_rtime_idx") +
+                                    " ON " + child + "(datastreamid,resulttime,id)");
+                            indexDdl.execute("CREATE INDEX IF NOT EXISTS " +
+                                    safeIdentifier(child + "_time_id_asc_idx") +
+                                    " ON " + child + "(phenomenontime ASC NULLS FIRST,id ASC)");
+                            indexDdl.execute("CREATE INDEX IF NOT EXISTS " +
+                                    safeIdentifier(child + "_time_id_desc_idx") +
+                                    " ON " + child + "(phenomenontime DESC NULLS FIRST,id ASC)");
+                            indexDdl.execute("CREATE INDEX IF NOT EXISTS " +
+                                    safeIdentifier(child + "_st_asc_idx") +
+                                    " ON " + child + "(datastreamid ASC,phenomenontime ASC NULLS FIRST,id ASC)");
+                            indexDdl.execute("CREATE INDEX IF NOT EXISTS " +
+                                    safeIdentifier(child + "_st_desc_idx") +
+                                    " ON " + child + "(datastreamid ASC,phenomenontime DESC NULLS FIRST,id ASC)");
+                        }
+                    }
                 }
             }
         }

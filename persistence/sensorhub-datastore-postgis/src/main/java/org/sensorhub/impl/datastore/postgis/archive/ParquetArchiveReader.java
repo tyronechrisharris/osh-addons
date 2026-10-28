@@ -100,27 +100,28 @@ public final class ParquetArchiveReader {
 
         boolean latestSelection = (filter.getPhenomenonTime() != null && filter.getPhenomenonTime().isLatestTime()) ||
                 (filter.getResultTime() != null && filter.getResultTime().isLatestTime());
-        if (limit != Long.MAX_VALUE && filter.getCQLFilter() == null && !latestSelection)
+        boolean javaCql = filter.getCQLFilter() != null;
+        if (!latestSelection && !javaCql && (limit != Long.MAX_VALUE || generations.size() > 1))
             return streamWindowClusters(generations, filter, allowedDataStreams, allowedFois, limit);
-        if (latestSelection && generations.size() > 1 && filter.getCQLFilter() == null &&
-                filter.getValuePredicate() == null && filter.getPhenomenonLocation() == null &&
-                allowedDataStreams != null && !allowedDataStreams.isEmpty())
+        if (latestSelection && generations.size() > 1 && !javaCql &&
+                filter.getValuePredicate() == null && filter.getPhenomenonLocation() == null)
             return streamLatestAcrossWindowClusters(generations, filter, allowedDataStreams, allowedFois, limit);
-
-        AuthorizedObjects objects = authorize(generations);
-        if (objects.byFilename().isEmpty())
-            return Stream.empty();
 
         // CQL is evaluated against the decoded JSON map. It must run before
         // latest-per-stream selection and before LIMIT or matching rows can be
         // silently lost. Structured predicates remain pushed into Parquet.
-        boolean javaCql = filter.getCQLFilter() != null;
-        boolean javaLatest = javaCql &&
-                ((filter.getPhenomenonTime() != null && filter.getPhenomenonTime().isLatestTime()) ||
-                        (filter.getResultTime() != null && filter.getResultTime().isLatestTime()));
-        QueryPlan plan = queryPlan(objects, filter, allowedDataStreams, allowedFois,
-                true, !javaCql, javaCql ? Long.MAX_VALUE : limit);
-        Stream<ArchivedRow> rows = openRowStream(objects, plan, generations.size());
+        boolean javaLatest = javaCql && latestSelection;
+        Stream<ArchivedRow> rows;
+        if (generations.size() > 1) {
+            rows = streamWindowClusters(generations, filter, allowedDataStreams, allowedFois, Long.MAX_VALUE);
+        } else {
+            AuthorizedObjects objects = authorize(generations);
+            if (objects.byFilename().isEmpty())
+                return Stream.empty();
+            QueryPlan plan = queryPlan(objects, filter, allowedDataStreams, allowedFois,
+                    true, !javaCql, javaCql ? Long.MAX_VALUE : limit);
+            rows = openRowStream(objects, plan, generations.size());
+        }
         if (javaCql)
             rows = rows.filter(row -> matchesCql(filter, row.observation().resultJson()));
 
@@ -135,13 +136,14 @@ public final class ParquetArchiveReader {
             Stream<ArchivedRow> reduced = latest.values().stream().sorted(rowComparator(filter));
             return limit == Long.MAX_VALUE ? reduced : reduced.limit(limit);
         }
-        return javaCql && limit != Long.MAX_VALUE ? limitAndClose(rows, limit) : rows;
+        return (javaCql || generations.size() > 1) && limit != Long.MAX_VALUE ? limitAndClose(rows, limit) : rows;
     }
 
     /**
-     * Opens and verifies only the time-window cluster needed by a bounded
-     * query. Revisions and genuinely overlapping windows stay in one DuckDB
-     * query; disjoint later windows are untouched when LIMIT is satisfied.
+     * Opens and verifies only the time-window cluster needed by a query.
+     * Revisions and genuinely overlapping windows stay in one DuckDB query;
+     * disjoint windows are streamed sequentially so DuckDB memory stays bounded
+     * by a single window cluster regardless of multi-year archive depth.
      */
     private Stream<ArchivedRow> streamWindowClusters(
             List<ArchiveGeneration> generations, ObsFilter filter,
@@ -176,13 +178,18 @@ public final class ParquetArchiveReader {
 
         boolean latestResult = filter.getResultTime() != null && filter.getResultTime().isLatestTime();
         Map<Long, ArchivedRow> bestByStream = new HashMap<>();
-        Set<Long> remainingNonNullPhenomenonStreams = new java.util.HashSet<>(allowedDataStreams);
+        Set<Long> remainingNonNullPhenomenonStreams = allowedDataStreams != null
+                ? new java.util.HashSet<>(allowedDataStreams)
+                : null;
 
         for (int index = clusters.size() - 1; index >= 0; index--) {
             List<ArchiveGeneration> cluster = clusters.get(index);
             Set<Long> clusterStreams;
             List<ArchiveGeneration> clusterGenerations;
-            if (!latestResult) {
+            if (allowedDataStreams == null) {
+                clusterStreams = null;
+                clusterGenerations = cluster;
+            } else if (!latestResult) {
                 if (remainingNonNullPhenomenonStreams.isEmpty())
                     break;
                 clusterStreams = new java.util.HashSet<>(remainingNonNullPhenomenonStreams);
@@ -224,7 +231,8 @@ public final class ParquetArchiveReader {
                     bestByStream.merge(streamId, row,
                             (previous, candidate) -> later(candidate, previous, latestResult)
                                     ? candidate : previous);
-                    if (!latestResult && row.observation().phenomenonTime() != null)
+                    if (!latestResult && remainingNonNullPhenomenonStreams != null &&
+                            row.observation().phenomenonTime() != null)
                         remainingNonNullPhenomenonStreams.remove(streamId);
                 });
             }
@@ -234,27 +242,51 @@ public final class ParquetArchiveReader {
         return limit == Long.MAX_VALUE ? ordered : ordered.limit(limit);
     }
 
+    private static final int MAX_RESULT_TIME_METADATA_BATCH = 64;
+
     /**
      * Returns only those generations whose maximum {@code result_time} is at
-     * least {@code minResultTime}, using cached Parquet metadata per immutable
-     * generation SHA-256 so hot-satisfied {@code resultTime=latest} queries
-     * avoid scanning historical Parquet payloads.
+     * least {@code minResultTime}, using catalog-persisted {@code max_result_time}
+     * (or cached Parquet metadata per immutable generation SHA-256 for legacy
+     * generations) so hot-satisfied {@code resultTime=latest} queries avoid
+     * scanning historical Parquet payloads.
      */
     public List<ArchiveGeneration> generationsPotentiallyNewerThanResultTime(
             List<ArchiveGeneration> generations, Instant minResultTime) {
         if (generations.isEmpty() || minResultTime == null)
             return generations;
-        List<ArchiveGeneration> uncached = generations.stream()
-                .filter(generation -> !maxResultTimeBySha256.containsKey(generation.sha256()))
-                .toList();
-        if (!uncached.isEmpty())
-            populateMaxResultTimes(uncached);
+        List<ArchiveGeneration> uncached = new ArrayList<>();
+        for (ArchiveGeneration generation : generations) {
+            if (generation.maxResultTime() != null) {
+                maxResultTimeBySha256.putIfAbsent(
+                        generation.sha256(), java.util.Optional.of(generation.maxResultTime()));
+            } else if (!maxResultTimeBySha256.containsKey(generation.sha256())) {
+                uncached.add(generation);
+            }
+        }
+        for (int offset = 0; offset < uncached.size(); offset += MAX_RESULT_TIME_METADATA_BATCH) {
+            int end = Math.min(uncached.size(), offset + MAX_RESULT_TIME_METADATA_BATCH);
+            populateMaxResultTimes(uncached.subList(offset, end));
+        }
         return generations.stream()
-                .filter(generation -> maxResultTimeBySha256
-                        .getOrDefault(generation.sha256(), java.util.Optional.empty())
-                        .map(maxResult -> !maxResult.isBefore(minResultTime))
-                        .orElse(false))
+                .filter(generation -> {
+                    Instant catalogMax = generation.maxResultTime();
+                    if (catalogMax != null)
+                        return !catalogMax.isBefore(minResultTime);
+                    return maxResultTimeBySha256
+                            .getOrDefault(generation.sha256(), java.util.Optional.empty())
+                            .map(maxResult -> !maxResult.isBefore(minResultTime))
+                            .orElse(false);
+                })
                 .toList();
+    }
+
+    public java.util.Optional<Instant> cachedMaxResultTime(ArchiveGeneration generation) {
+        if (generation == null)
+            return java.util.Optional.empty();
+        if (generation.maxResultTime() != null)
+            return java.util.Optional.of(generation.maxResultTime());
+        return maxResultTimeBySha256.getOrDefault(generation.sha256(), java.util.Optional.empty());
     }
 
     private void populateMaxResultTimes(List<ArchiveGeneration> uncached) {
@@ -264,7 +296,7 @@ public final class ParquetArchiveReader {
         String fileList = objects.byFilename().keySet().stream()
                 .map(path -> "'" + sqlLiteral(path) + "'")
                 .collect(Collectors.joining(","));
-        String sql = "SELECT filename, max(result_time) FROM read_parquet([" + fileList +
+        String sql = "SELECT filename, max(COALESCE(result_time, phenomenon_time)) FROM read_parquet([" + fileList +
                 "], filename=true) GROUP BY filename";
         Map<String, java.util.Optional<Instant>> discovered = new HashMap<>();
         try (DuckDbResourcePolicy.Session duckSession = DuckDbResourcePolicy.open(config, "metadata-max-result");
@@ -346,6 +378,19 @@ public final class ParquetArchiveReader {
         if (filter.getCQLFilter() != null || filter.getValuePredicate() != null ||
                 filter.getPhenomenonLocation() != null)
             throw new IllegalArgumentException("Payload and spatial predicates require full observation decoding");
+        boolean latestSelection = (filter.getPhenomenonTime() != null && filter.getPhenomenonTime().isLatestTime()) ||
+                (filter.getResultTime() != null && filter.getResultTime().isLatestTime());
+        if (!latestSelection && limit == Long.MAX_VALUE && generations.size() > MAX_RESULT_TIME_METADATA_BATCH) {
+            for (List<ArchiveGeneration> batch : batchWindowClusters(generations, MAX_RESULT_TIME_METADATA_BATCH))
+                forEachMetadataSingleBatch(batch, filter, allowedDataStreams, allowedFois, Long.MAX_VALUE, consumer);
+            return;
+        }
+        forEachMetadataSingleBatch(generations, filter, allowedDataStreams, allowedFois, limit, consumer);
+    }
+
+    private void forEachMetadataSingleBatch(List<ArchiveGeneration> generations, ObsFilter filter,
+                                            Set<Long> allowedDataStreams, Set<Long> allowedFois,
+                                            long limit, Consumer<ArchivedMetadataRow> consumer) {
         AuthorizedObjects objects = authorize(generations);
         if (objects.byFilename().isEmpty())
             return;
@@ -381,6 +426,22 @@ public final class ParquetArchiveReader {
         if (filter.getCQLFilter() != null || filter.getValuePredicate() != null ||
                 filter.getPhenomenonLocation() != null)
             throw new IllegalArgumentException("Payload and spatial predicates require full observation decoding");
+        boolean latestSelection = (filter.getPhenomenonTime() != null && filter.getPhenomenonTime().isLatestTime()) ||
+                (filter.getResultTime() != null && filter.getResultTime().isLatestTime());
+        if (!latestSelection && generations.size() > MAX_RESULT_TIME_METADATA_BATCH) {
+            long total = 0;
+            for (List<ArchiveGeneration> batch : batchWindowClusters(generations, MAX_RESULT_TIME_METADATA_BATCH)) {
+                total += countSingleBatch(batch, filter, allowedDataStreams, allowedFois);
+                if (filter.getLimit() != Long.MAX_VALUE && total >= filter.getLimit())
+                    return filter.getLimit();
+            }
+            return total;
+        }
+        return countSingleBatch(generations, filter, allowedDataStreams, allowedFois);
+    }
+
+    private long countSingleBatch(List<ArchiveGeneration> generations, ObsFilter filter,
+                                  Set<Long> allowedDataStreams, Set<Long> allowedFois) {
         AuthorizedObjects objects = authorize(generations);
         if (objects.byFilename().isEmpty())
             return 0;
@@ -400,6 +461,22 @@ public final class ParquetArchiveReader {
         } catch (Exception e) {
             throw new IllegalStateException("Cannot count " + generations.size() + " archive generation(s)", e);
         }
+    }
+
+    private static List<List<ArchiveGeneration>> batchWindowClusters(
+            List<ArchiveGeneration> generations, int targetBatchSize) {
+        List<List<ArchiveGeneration>> batches = new ArrayList<>();
+        List<ArchiveGeneration> current = new ArrayList<>();
+        for (List<ArchiveGeneration> cluster : windowClusters(generations)) {
+            if (!current.isEmpty() && current.size() + cluster.size() > targetBatchSize) {
+                batches.add(current);
+                current = new ArrayList<>();
+            }
+            current.addAll(cluster);
+        }
+        if (!current.isEmpty())
+            batches.add(current);
+        return batches;
     }
 
     private AuthorizedObjects authorize(List<ArchiveGeneration> generations) {
@@ -766,8 +843,9 @@ public final class ParquetArchiveReader {
                     }
                     List<ArchiveGeneration> cluster = clusters.next();
                     AuthorizedObjects objects = authorize(cluster);
+                    boolean javaCql = filter.getCQLFilter() != null;
                     QueryPlan plan = queryPlan(objects, filter, allowedDataStreams, allowedFois,
-                            true, true, remaining);
+                            true, !javaCql, javaCql ? Long.MAX_VALUE : remaining);
                     currentStream = openRowStream(objects, plan, cluster.size());
                     currentRows = currentStream.iterator();
                 }
@@ -782,9 +860,11 @@ public final class ParquetArchiveReader {
             if (!hasNext())
                 throw new NoSuchElementException();
             ArchivedRow value = currentRows.next();
-            remaining--;
-            if (remaining == 0)
-                close();
+            if (remaining != Long.MAX_VALUE) {
+                remaining--;
+                if (remaining == 0)
+                    close();
+            }
             return value;
         }
 

@@ -646,6 +646,35 @@ public class TestParquetArchiveReader {
         return (String) sql.invoke(plan);
     }
 
+    @Test
+    public void testCatalogMaxResultTimeSkipsParquetInspection() throws Exception {
+        Path root = temporary.newFolder("catalog-max-result").toPath();
+        ParquetArchiveReader reader = new ParquetArchiveReader(root);
+        ArchiveGeneration older = new ArchiveGeneration(
+                UUID.randomUUID(), "RAW_GATED",
+                Instant.parse("2026-01-01T00:00:00Z"),
+                Instant.parse("2026-01-01T01:00:00Z"),
+                Path.of("RAW_GATED/2026/01/01/nonexistent-older.parquet"),
+                "0".repeat(64), 10L, 1L, 10L, "SEALED", true,
+                Instant.parse("2026-01-01T00:59:59Z"));
+        ArchiveGeneration newer = new ArchiveGeneration(
+                UUID.randomUUID(), "RAW_GATED",
+                Instant.parse("2026-01-01T01:00:00Z"),
+                Instant.parse("2026-01-01T02:00:00Z"),
+                Path.of("RAW_GATED/2026/01/01/nonexistent-newer.parquet"),
+                "1".repeat(64), 10L, 11L, 20L, "SEALED", true,
+                Instant.parse("2026-01-01T01:59:59Z"));
+
+        List<ArchiveGeneration> filtered = reader.generationsPotentiallyNewerThanResultTime(
+                List.of(older, newer),
+                Instant.parse("2026-01-01T01:30:00Z"));
+        assertEquals(List.of(newer), filtered);
+        assertEquals(java.util.Optional.of(Instant.parse("2026-01-01T00:59:59Z")),
+                reader.cachedMaxResultTime(older));
+        assertEquals(java.util.Optional.of(Instant.parse("2026-01-01T01:59:59Z")),
+                reader.cachedMaxResultTime(newer));
+    }
+
     private record TestRow(long id, long dataStreamId, String time, String resultJson) {
         private TestRow(long id, long dataStreamId, String time) {
             this(id, dataStreamId, time, "{\"value\":" + id + "}");
