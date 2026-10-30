@@ -148,7 +148,11 @@ public final class ParquetArchiveReader {
     private Stream<ArchivedRow> streamWindowClusters(
             List<ArchiveGeneration> generations, ObsFilter filter,
             Set<Long> allowedDataStreams, Set<Long> allowedFois, long limit) {
-        List<List<ArchiveGeneration>> clusters = windowClusters(generations);
+        boolean batchSelectiveCql = limit == Long.MAX_VALUE && filter.getCQLFilter() != null &&
+                JsonCqlEvaluator.hasSelectiveDuckDbPrefilter(filter.getCQLFilter());
+        List<List<ArchiveGeneration>> clusters = batchSelectiveCql
+                ? batchWindowClusters(generations, MAX_RESULT_TIME_METADATA_BATCH)
+                : windowClusters(generations);
         if (filter.getPhenomenonTime() != null && filter.getPhenomenonTime().descendingOrder())
             java.util.Collections.reverse(clusters);
         WindowClusterCursor cursor = new WindowClusterCursor(
@@ -531,6 +535,8 @@ public final class ParquetArchiveReader {
         }
         appendTime(source, "phenomenon_time", filter.getPhenomenonTime(), parameters);
         appendTime(source, "result_time", filter.getResultTime(), parameters);
+        if (includeResult && filter.getCQLFilter() != null)
+            JsonCqlEvaluator.appendDuckDbPrefilter(filter.getCQLFilter(), "result_json", source, parameters);
 
         boolean latestPhenomenon = applyLatest && filter.getPhenomenonTime() != null &&
                 filter.getPhenomenonTime().isLatestTime();

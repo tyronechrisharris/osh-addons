@@ -23,10 +23,15 @@ import java.math.BigDecimal;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeParseException;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Locale;
 import java.util.regex.Pattern;
 
 /** Evaluates the supported OSCAR CQL subset directly against archived JSON. */
 public final class JsonCqlEvaluator {
+    private static final Pattern SAFE_JSON_KEY = Pattern.compile("^[A-Za-z0-9_-]+$");
+    private static final Pattern SAFE_JSON_STRING_LITERAL = Pattern.compile("^[A-Za-z0-9 _.:-]+$");
     private static final Pattern RFC3339_INSTANT = Pattern.compile(
             "^[0-9]{4}-(0[1-9]|1[0-2])-([0-2][0-9]|3[01])T" +
             "([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](\\.[0-9]{1,9})?" +
@@ -44,6 +49,131 @@ public final class JsonCqlEvaluator {
         if (!value.isJsonObject())
             return false;
         return evaluate(filter, value.getAsJsonObject());
+    }
+
+    /**
+     * Appends a sound (zero-false-negative) DuckDB SQL prefilter over {@code column} when possible.
+     * Callers must still run {@link #matches(Filter, String)} on surviving candidate rows.
+     */
+    public static boolean appendDuckDbPrefilter(
+            Filter filter, String column, StringBuilder sql, List<Object> parameters) {
+        PrefilterClause clause = buildDuckDbPrefilter(filter, column);
+        if (clause == null)
+            return false;
+        sql.append(" AND (").append(clause.sql()).append(')');
+        parameters.addAll(clause.parameters());
+        return true;
+    }
+
+    public static boolean hasSelectiveDuckDbPrefilter(Filter filter) {
+        PrefilterClause clause = buildDuckDbPrefilter(filter, "result_json");
+        return clause != null && clause.selective();
+    }
+
+    private record PrefilterClause(String sql, List<Object> parameters, boolean selective) {}
+
+    private static PrefilterClause buildDuckDbPrefilter(Filter filter, String column) {
+        if (filter == null || filter == Filter.INCLUDE)
+            return null;
+        if (filter == Filter.EXCLUDE)
+            return new PrefilterClause("FALSE", List.of(), true);
+        if (filter instanceof And and) {
+            List<String> clauses = new ArrayList<>();
+            List<Object> params = new ArrayList<>();
+            boolean selective = false;
+            for (Filter child : and.getChildren()) {
+                PrefilterClause sub = buildDuckDbPrefilter(child, column);
+                if (sub != null) {
+                    clauses.add("(" + sub.sql() + ")");
+                    params.addAll(sub.parameters());
+                    selective |= sub.selective();
+                }
+            }
+            return clauses.isEmpty() ? null :
+                    new PrefilterClause(String.join(" AND ", clauses), params, selective);
+        }
+        if (filter instanceof Or or) {
+            if (or.getChildren().isEmpty())
+                return null;
+            List<String> clauses = new ArrayList<>();
+            List<Object> params = new ArrayList<>();
+            boolean selective = true;
+            for (Filter child : or.getChildren()) {
+                PrefilterClause sub = buildDuckDbPrefilter(child, column);
+                if (sub == null)
+                    return null;
+                clauses.add("(" + sub.sql() + ")");
+                params.addAll(sub.parameters());
+                selective &= sub.selective();
+            }
+            return new PrefilterClause(String.join(" OR ", clauses), params, selective);
+        }
+        if (filter instanceof PropertyIsLike like) {
+            if (like.getExpression() instanceof PropertyName property)
+                return leafKeyPrefilter(property.getPropertyName(), column);
+            return null;
+        }
+        if (filter instanceof BinaryComparisonOperator comparison) {
+            if (!(comparison.getExpression1() instanceof PropertyName property) ||
+                    !(comparison.getExpression2() instanceof Literal literal))
+                return null;
+            Object expected = literal.getValue();
+            if (expected == null)
+                return null;
+            String leafKey = extractSafeLeafKey(property.getPropertyName());
+            if (comparison instanceof PropertyIsEqualTo) {
+                if (expected instanceof String text && !text.isEmpty() &&
+                        SAFE_JSON_STRING_LITERAL.matcher(text).matches()) {
+                    List<Object> params = new ArrayList<>();
+                    StringBuilder expr = new StringBuilder("(");
+                    if (leafKey != null) {
+                        expr.append("strpos(").append(column).append(", ?) > 0 AND ");
+                        params.add(leafKey);
+                    }
+                    if (comparison.isMatchingCase()) {
+                        expr.append("strpos(").append(column).append(", ?) > 0");
+                        params.add(text);
+                    } else {
+                        expr.append("strpos(lower(").append(column).append("), ?) > 0");
+                        params.add(text.toLowerCase(Locale.ROOT));
+                    }
+                    expr.append(") OR strpos(").append(column).append(", '\\u') > 0");
+                    return new PrefilterClause(expr.toString(), params, true);
+                }
+                if (expected instanceof Boolean boolVal) {
+                    List<Object> params = new ArrayList<>();
+                    StringBuilder expr = new StringBuilder();
+                    if (leafKey != null) {
+                        expr.append("(strpos(").append(column).append(", ?) > 0 OR strpos(")
+                                .append(column).append(", '\\u') > 0) AND ");
+                        params.add(leafKey);
+                    }
+                    expr.append("strpos(lower(").append(column).append("), ?) > 0");
+                    params.add(boolVal ? "true" : "false");
+                    return new PrefilterClause(expr.toString(), params, false);
+                }
+            }
+            return leafKey == null ? null : leafKeyPrefilter(property.getPropertyName(), column);
+        }
+        return null;
+    }
+
+    private static PrefilterClause leafKeyPrefilter(String propertyPath, String column) {
+        String leafKey = extractSafeLeafKey(propertyPath);
+        if (leafKey == null)
+            return null;
+        return new PrefilterClause(
+                "strpos(" + column + ", ?) > 0 OR strpos(" + column + ", '\\u') > 0",
+                List.of(leafKey),
+                false);
+    }
+
+    private static String extractSafeLeafKey(String propertyPath) {
+        if (propertyPath == null || propertyPath.isEmpty())
+            return null;
+        String[] parts = propertyPath.split("\\.");
+        String leaf = parts[parts.length - 1];
+        return SAFE_JSON_KEY.matcher(leaf).matches() ? leaf : null;
     }
 
     private static boolean evaluate(Filter filter, JsonObject json) {

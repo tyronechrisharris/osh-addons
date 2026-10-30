@@ -13,6 +13,7 @@ import org.sensorhub.impl.datastore.postgis.archive.ArchiveGeneration;
 import org.sensorhub.impl.datastore.postgis.archive.ParquetArchiveReader;
 import org.sensorhub.impl.datastore.postgis.archive.TieredArchiveConfig;
 import org.sensorhub.impl.datastore.postgis.archive.UtcJdbcTime;
+import org.sensorhub.impl.datastore.postgis.builder.filter.JsonCqlEvaluator;
 import org.sensorhub.impl.datastore.postgis.connection.ConnectionManager;
 
 import java.nio.file.Path;
@@ -673,6 +674,59 @@ public class TestParquetArchiveReader {
                 reader.cachedMaxResultTime(older));
         assertEquals(java.util.Optional.of(Instant.parse("2026-01-01T01:59:59Z")),
                 reader.cachedMaxResultTime(newer));
+    }
+
+    @Test
+    public void cqlDuckDbPrefilterPreservesEscapedJsonAndBatchesDisjointWindows() throws Exception {
+        Path root = temporary.newFolder("cql-prefilter-batches").toPath();
+        ArchiveGeneration first = new ArchiveGeneration(
+                UUID.randomUUID(), "PARQUET_PRIMARY",
+                Instant.parse("2026-01-01T00:00:00Z"),
+                Instant.parse("2026-01-01T00:30:00Z"),
+                writeGeneration(root, "w1.parquet", new TestRow[]{
+                        new TestRow(1, 10, "2026-01-01T00:01:00Z",
+                                "{\"alarmState\":\"Background\",\"note\":\"Fault - Gamma Low\"}"),
+                        new TestRow(2, 10, "2026-01-01T00:02:00Z",
+                                "{\"alarmState\":\"\\u0046ault - Gamma Low\"}"),
+                        new TestRow(3, 10, "2026-01-01T00:03:00Z",
+                                "{\"gammaAlarm\":true,\"neutronAlarm\":false}")
+                }).objectPath(),
+                ArchiveExporter.sha256(root.resolve("w1.parquet")), 3, 1, 3, "SEALED", true);
+        ArchiveGeneration second = new ArchiveGeneration(
+                UUID.randomUUID(), "PARQUET_PRIMARY",
+                Instant.parse("2026-01-01T00:30:00Z"),
+                Instant.parse("2026-01-01T01:00:00Z"),
+                writeGeneration(root, "w2.parquet", new TestRow[]{
+                        new TestRow(4, 10, "2026-01-01T00:31:00Z",
+                                "{\"alarmState\":\"Fault - Gamma High\"}"),
+                        new TestRow(5, 10, "2026-01-01T00:32:00Z",
+                                "{\"alarmState\":\"Background\"}")
+                }).objectPath(),
+                ArchiveExporter.sha256(root.resolve("w2.parquet")), 2, 4, 5, "SEALED", true);
+        ParquetArchiveReader reader = new ParquetArchiveReader(root);
+
+        ObsFilter faultFilter = new ObsFilter.Builder()
+                .withCQLFilter("alarmState = 'Fault - Gamma Low' OR alarmState = 'Fault - Gamma High'")
+                .build();
+        assertTrue(JsonCqlEvaluator.hasSelectiveDuckDbPrefilter(faultFilter.getCQLFilter()));
+        assertEquals(List.of(2L, 4L),
+                reader.read(List.of(first, second), faultFilter, null, null, Long.MAX_VALUE)
+                        .stream().map(row -> row.observation().id()).toList());
+
+        ObsFilter faultDesc = new ObsFilter.Builder().withPhenomenonTime()
+                .withAllTimes().descendingOrder(true).done()
+                .withCQLFilter("alarmState = 'Fault - Gamma Low' OR alarmState = 'Fault - Gamma High'")
+                .build();
+        assertEquals(List.of(4L, 2L),
+                reader.read(List.of(first, second), faultDesc, null, null, Long.MAX_VALUE)
+                        .stream().map(row -> row.observation().id()).toList());
+
+        ObsFilter boolFilter = new ObsFilter.Builder()
+                .withCQLFilter("gammaAlarm = true AND neutronAlarm = false")
+                .build();
+        assertEquals(List.of(3L),
+                reader.read(List.of(first, second), boolFilter, null, null, Long.MAX_VALUE)
+                        .stream().map(row -> row.observation().id()).toList());
     }
 
     private record TestRow(long id, long dataStreamId, String time, String resultJson) {
